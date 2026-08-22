@@ -38,7 +38,7 @@ sources), all behind protocols so business logic never depends on a vendor.
 ## Quick start (Docker — recommended)
 
 ```bash
-cp .env.example .env          # fill GEMINI_API_KEY + Google OAuth creds
+touch .env                    # see the Configuration section; not templated, fill by hand
 docker compose up --build     # db, redis, migrate, api, worker
 ```
 

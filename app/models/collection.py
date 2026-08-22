@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Optional
 
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, func, text
+from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, String, func
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Field, SQLModel
 
@@ -20,16 +20,21 @@ class Collection(SQLModel, table=True):
         sa_column=Column(ForeignKey("users.id", ondelete="CASCADE"), index=True, nullable=False)
     )
     name: str = Field(max_length=255)
-    slug: str = Field(sa_column=Column("slug", nullable=False, unique=True), max_length=300)
+    slug: str = Field(sa_column=Column("slug", String(300), nullable=False, unique=True))
     description: Optional[str] = None
     visibility: Visibility = Field(default=Visibility.private)
 
-    created_at: datetime = Field(default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")})
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     updated_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),
     )
-    deleted_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
 
 
 class CollectionItem(SQLModel, table=True):
@@ -51,4 +56,7 @@ class CollectionItem(SQLModel, table=True):
         )
     )
     position: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
-    added_at: datetime = Field(default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")})
+    added_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )

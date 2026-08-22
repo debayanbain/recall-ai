@@ -11,11 +11,13 @@ from app.models.base import Visibility
 from app.models.collection import Collection
 from app.models.vault import VaultItem
 from app.repositories.collection import CollectionRepository
+from app.repositories.vault import VaultRepository
 
 
 class CollectionService:
-    def __init__(self, repo: CollectionRepository) -> None:
+    def __init__(self, repo: CollectionRepository, vault_repo: VaultRepository) -> None:
         self.repo = repo
+        self.vault_repo = vault_repo
 
     async def create(
         self,
@@ -42,6 +44,11 @@ class CollectionService:
     ) -> bool:
         collection = await self.repo.get(collection_id, user_id)
         if collection is None:
+            return False
+        # Owning the container must not grant access to someone else's content: the
+        # collection's items are echoed back by the detail route and, once the
+        # collection is public, by the unauthenticated share route as well.
+        if await self.vault_repo.get(vault_item_id, user_id) is None:
             return False
         await self.repo.add_item(collection_id, vault_item_id)
         return True

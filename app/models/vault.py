@@ -49,14 +49,21 @@ class VaultItem(SQLModel, table=True):
     processing_status: ProcessingStatus = Field(default=ProcessingStatus.pending, index=True)
     processing_error: Optional[str] = None
     retry_count: int = Field(default=0, sa_column=Column(Integer, nullable=False, server_default="0"))
-    processed_at: Optional[datetime] = None
+    processed_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
 
-    created_at: datetime = Field(default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")})
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     updated_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),
     )
-    deleted_at: Optional[datetime] = None
+    deleted_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
 
 
 class VaultChunk(SQLModel, table=True):
@@ -79,4 +86,7 @@ class VaultChunk(SQLModel, table=True):
     content: str = Field(sa_column=Column(Text, nullable=False))
     embedding: Optional[Any] = Field(default=None, sa_column=Column(Vector(settings.EMBEDDING_DIM)))
     token_count: Optional[int] = None
-    created_at: datetime = Field(default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")})
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )

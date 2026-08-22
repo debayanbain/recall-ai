@@ -13,10 +13,13 @@ from app.core.security import decode_session_token
 from app.db.session import get_session
 from app.models.user import User
 from app.repositories.collection import CollectionRepository
+from app.repositories.instagram_account import InstagramAccountRepository
+from app.repositories.oauth_account import OAuthAccountRepository
 from app.repositories.user import UserRepository
 from app.repositories.vault import VaultRepository
 from app.services.auth_service import AuthService
 from app.services.collection_service import CollectionService
+from app.services.instagram_service import InstagramService
 from app.services.vault_service import VaultService
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
@@ -48,13 +51,18 @@ def get_vault_service(session: SessionDep) -> VaultService:
 
 
 def get_collection_service(session: SessionDep) -> CollectionService:
-    return CollectionService(CollectionRepository(session))
+    return CollectionService(CollectionRepository(session), VaultRepository(session))
+
+
+def get_instagram_service(session: SessionDep) -> InstagramService:
+    return InstagramService(InstagramAccountRepository(session))
 
 
 def get_auth_service(session: SessionDep) -> AuthService:
-    return AuthService(UserRepository(session))
+    return AuthService(UserRepository(session), OAuthAccountRepository(session))
 
 
 VaultServiceDep = Annotated[VaultService, Depends(get_vault_service)]
 CollectionServiceDep = Annotated[CollectionService, Depends(get_collection_service)]
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
+InstagramServiceDep = Annotated[InstagramService, Depends(get_instagram_service)]

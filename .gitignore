@@ -14,7 +14,7 @@ wheels/
 .ruff_cache/
 .mypy_cache/
 
-# Env / secrets
+# Env / secrets. There is no committed template -- .env is the only env file.
 .env
 .env.*
 

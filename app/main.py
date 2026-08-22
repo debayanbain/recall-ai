@@ -27,7 +27,14 @@ log = get_logger("app")
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging()
-    log.info("startup", env=settings.ENV)
+    startup: dict[str, str] = {"env": settings.ENV}
+    if app.docs_url and app.openapi_url:
+        base = settings.BACKEND_URL.rstrip("/")
+        startup["docs"] = f"{base}{app.docs_url}"
+        startup["openapi"] = f"{base}{app.openapi_url}"
+    else:
+        startup["docs"] = f"disabled (ENV={settings.ENV})"
+    log.info("startup", **startup)
     yield
     await close_pool()
     log.info("shutdown")
@@ -37,8 +44,11 @@ def create_app() -> FastAPI:
     app = FastAPI(
         title=settings.APP_NAME,
         version="0.1.0",
-        docs_url="/docs",
-        openapi_url="/openapi.json",
+        # Interactive docs and the raw schema map the entire API surface, so they are
+        # withheld in production. `app.openapi()` still works for offline export.
+        docs_url="/docs" if settings.docs_enabled else None,
+        redoc_url="/redoc" if settings.docs_enabled else None,
+        openapi_url="/openapi.json" if settings.docs_enabled else None,
         lifespan=lifespan,
     )
 

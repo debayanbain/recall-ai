@@ -33,14 +33,21 @@ class Subscription(SQLModel, table=True):
         default="active",
         sa_column=Column(Text, nullable=False, server_default="active"),
     )
-    current_period_start: Optional[datetime] = None
-    current_period_end: Optional[datetime] = None
+    current_period_start: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    current_period_end: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
     cancel_at_period_end: bool = Field(
         default=False,
         sa_column=Column(Boolean, nullable=False, server_default=text("false")),
     )
 
-    created_at: datetime = Field(default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")})
+    created_at: datetime = Field(
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
+    )
     updated_at: datetime = Field(
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),

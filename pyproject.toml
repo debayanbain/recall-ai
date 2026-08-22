@@ -18,6 +18,7 @@ dependencies = [
     "arq>=0.26",
     "httpx>=0.28",
     "authlib>=1.3",
+    "cryptography>=43.0",
     "pyjwt>=2.10",
     "python-slugify>=8.0",
     "structlog>=24.4",
@@ -51,6 +52,11 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+# Session-scoped event loop so the session-scoped async engine fixture in
+# tests/conftest.py is usable from function-scoped tests; asyncpg connections are
+# bound to the loop that created them.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 
 [tool.hatch.build.targets.wheel]
 packages = ["app"]

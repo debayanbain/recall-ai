@@ -5,7 +5,7 @@ import uuid
 from datetime import datetime
 from typing import Any, Optional
 
-from sqlalchemy import BigInteger, Column, ForeignKey, Index, Text, text
+from sqlalchemy import BigInteger, Column, DateTime, ForeignKey, Index, Text, func, text
 from sqlalchemy.dialects.postgresql import INET, JSONB
 from sqlalchemy.dialects.postgresql import UUID as PGUUID
 from sqlmodel import Field, SQLModel
@@ -40,5 +40,6 @@ class AuditLog(SQLModel, table=True):
         sa_column=Column("metadata", JSONB, nullable=False, server_default=text("'{}'::jsonb")),
     )
     created_at: datetime = Field(
-        default_factory=utcnow, sa_column_kwargs={"server_default": text("now()")}
+        default_factory=utcnow,
+        sa_column=Column(DateTime(timezone=True), nullable=False, server_default=func.now()),
     )
