@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 
+from app.core.net import assert_safe_url
 from app.extractors.base import ExtractedContent, Extractor
 from app.models.base import ContentType
 
@@ -22,6 +23,9 @@ class YouTubeExtractor(Extractor):
 
     async def extract(self, url: str) -> ExtractedContent:
         oembed = "https://www.youtube.com/oembed"
+        # oembed is a fixed YouTube endpoint, but the `url` parameter is user-supplied
+        # and YouTube echoes/redirects on it, so validate before handing it over.
+        assert_safe_url(url)
         async with httpx.AsyncClient(timeout=15.0, follow_redirects=True) as client:
             resp = await client.get(oembed, params={"url": url, "format": "json"})
             resp.raise_for_status()

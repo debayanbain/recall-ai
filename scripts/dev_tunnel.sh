@@ -120,6 +120,10 @@ cb() { printf '%s%s/auth/%s/callback' "$URL" "$API_PREFIX" "$1"; }
 # Overrides. These outrank .env for this process only.
 export FRONTEND_URL="$URL"
 export BACKEND_URL="$URL"
+# Apify is told to call this exact host. Exporting it here rather than trusting
+# .env means a tunnel whose URL changed cannot silently register a callback that
+# points at yesterday's hostname.
+export PUBLIC_BASE_URL="$URL"
 export CORS_ORIGINS="[\"$URL\"]"
 export GOOGLE_REDIRECT_URI="$(cb google)"
 export FACEBOOK_REDIRECT_URI="$(cb facebook)"
@@ -140,6 +144,9 @@ cat <<EOF
     Facebook    $FACEBOOK_REDIRECT_URI
     Instagram   $INSTAGRAM_LOGIN_REDIRECT_URI
     IG connect  $INSTAGRAM_CONNECT_REDIRECT_URI
+
+  Apify callbacks go to $URL$API_PREFIX/webhooks/apify/<APIFY_WEBHOOK_SECRET>
+  (registered per run, so nothing to configure in the Apify console).
 
     cd ../realll-ai-frontend && NEXT_PUBLIC_API_URL= pnpm dev
 

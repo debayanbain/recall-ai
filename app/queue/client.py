@@ -1,37 +1,27 @@
-"""Producer side of the queue: enqueue jobs from API/request context.
+"""Producer side of the queue: enqueue jobs from request context.
 
-A single lazily-created ARQ Redis pool is reused across requests.
+Celery's `.delay()` is synchronous Redis I/O. It is a millisecond, but this runs inside
+FastAPI's event loop, so it is pushed to a thread rather than blocking every other
+request served by the same worker.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
-
-from arq import create_pool
-from arq.connections import ArqRedis, RedisSettings
-
-from app.core.config import settings
-
-_pool: ArqRedis | None = None
-
-
-def _redis_settings() -> RedisSettings:
-    return RedisSettings.from_dsn(settings.redis_url_str)
-
-
-async def get_pool() -> ArqRedis:
-    global _pool
-    if _pool is None:
-        _pool = await create_pool(_redis_settings())
-    return _pool
-
-
-async def close_pool() -> None:
-    global _pool
-    if _pool is not None:
-        await _pool.aclose()
-        _pool = None
 
 
 async def enqueue_process_item(item_id: uuid.UUID) -> None:
-    pool = await get_pool()
-    await pool.enqueue_job("process_item", str(item_id))
+    from app.queue.tasks import process_item
+
+    await asyncio.to_thread(process_item.delay, str(item_id))
+
+
+async def enqueue_finalize_run(provider_run_id: str) -> None:
+    from app.queue.tasks import finalize_run
+
+    await asyncio.to_thread(finalize_run.delay, provider_run_id)
+
+
+async def close_pool() -> None:
+    """Kept for the app lifespan hook. Celery holds no connection to close here."""
+    return None

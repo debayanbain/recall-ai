@@ -1,4 +1,10 @@
-"""Gemini implementation of AIProvider using google-genai SDK."""
+"""OpenAI implementation of AIProvider.
+
+Mirrors `GeminiProvider` deliberately: same prompts, same defensive parsing, same retry
+policy. The only structural difference is embeddings — `text-embedding-3-small` emits
+1536 dimensions natively, matching the `Vector(1536)` column exactly, so nothing is
+zero-padded the way Gemini's 768-dim output has to be.
+"""
 from __future__ import annotations
 
 import json
@@ -10,7 +16,7 @@ from app.ai.base import AIProvider
 from app.core.config import settings
 from app.core.logging import get_logger
 
-log = get_logger("ai.gemini")
+log = get_logger("ai.openai")
 
 _CATEGORIES = [
     "Technology", "Business", "Science", "Health", "Education",
@@ -18,8 +24,8 @@ _CATEGORIES = [
 ]
 
 
-class GeminiProvider(AIProvider):
-    """Calls Gemini Flash for text tasks and text-embedding-004 for vectors.
+class OpenAIProvider(AIProvider):
+    """Chat Completions for text tasks, embeddings for vectors.
 
     The client is created lazily so importing this module never requires a key.
     """
@@ -29,24 +35,27 @@ class GeminiProvider(AIProvider):
 
     def _get_client(self) -> Any:
         if self._client is None:
-            from google import genai  # lazy import
+            from openai import AsyncOpenAI  # lazy import
 
-            if not settings.GEMINI_API_KEY:
-                raise RuntimeError("GEMINI_API_KEY is not configured")
-            self._client = genai.Client(api_key=settings.GEMINI_API_KEY)
+            if not settings.OPENAI_API_KEY:
+                raise RuntimeError("OPENAI_API_KEY is not configured")
+            self._client = AsyncOpenAI(api_key=settings.OPENAI_API_KEY)
         return self._client
 
-    # reraise=True: without it tenacity swallows the provider's error and raises its own
-    # RetryError, so the failure recorded on the item reads
-    # "RetryError[<Future ... raised ClientError>]" instead of the actual cause
-    # ("API key not valid"), which is the one thing that makes it fixable.
+    # reraise=True so the recorded failure is the provider's own message (e.g. an invalid
+    # key or a rate limit) rather than tenacity's opaque RetryError wrapper.
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
-    async def _generate(self, prompt: str) -> str:
+    async def _generate(self, prompt: str, max_tokens: int = 400) -> str:
         client = self._get_client()
-        resp = await client.aio.models.generate_content(
-            model=settings.GEMINI_TEXT_MODEL, contents=prompt
+        resp = await client.chat.completions.create(
+            model=settings.OPENAI_TEXT_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            # Low but non-zero: tag extraction benefits from a little variety, and
+            # summaries should not drift between runs of the same content.
+            temperature=0.2,
+            max_tokens=max_tokens,
         )
-        return (resp.text or "").strip()
+        return (resp.choices[0].message.content or "").strip()
 
     async def generate_summary(self, text: str) -> str:
         prompt = (
@@ -61,7 +70,7 @@ class GeminiProvider(AIProvider):
             'Respond ONLY with a JSON array of lowercase strings, e.g. ["ai","startups"].'
             "\n\nCONTENT:\n" + text[:12000]
         )
-        raw = await self._generate(prompt)
+        raw = await self._generate(prompt, max_tokens=120)
         return self._parse_tags(raw)
 
     async def generate_category(self, text: str) -> str:
@@ -71,24 +80,21 @@ class GeminiProvider(AIProvider):
             + ". Respond with ONLY the category word.\n\nCONTENT:\n"
             + text[:8000]
         )
-        raw = (await self._generate(prompt)).strip().strip(".")
+        raw = (await self._generate(prompt, max_tokens=10)).strip().strip(".")
         return raw if raw in _CATEGORIES else "Other"
 
-    # reraise=True: without it tenacity swallows the provider's error and raises its own
-    # RetryError, so the failure recorded on the item reads
-    # "RetryError[<Future ... raised ClientError>]" instead of the actual cause
-    # ("API key not valid"), which is the one thing that makes it fixable.
     @retry(stop=stop_after_attempt(3), wait=wait_exponential(min=1, max=10), reraise=True)
     async def generate_embedding(self, text: str) -> list[float]:
         client = self._get_client()
-        resp = await client.aio.models.embed_content(
-            model=settings.GEMINI_EMBED_MODEL, contents=text[:12000]
+        resp = await client.embeddings.create(
+            model=settings.OPENAI_EMBED_MODEL,
+            input=text[:12000],
         )
-        vec = list(resp.embeddings[0].values)
-        return self._fit_dim(vec)
+        return self._fit_dim(list(resp.data[0].embedding))
 
     @staticmethod
     def _parse_tags(raw: str) -> list[str]:
+        """Models return prose and code fences even when told not to. Strip both."""
         cleaned = raw.strip().removeprefix("```json").removeprefix("```").removesuffix("```")
         try:
             data = json.loads(cleaned)
@@ -96,11 +102,17 @@ class GeminiProvider(AIProvider):
                 return [str(t).lower().strip() for t in data if str(t).strip()][:7]
         except json.JSONDecodeError:
             log.warning("tag_parse_failed", raw=raw[:200])
-        return []
+        # Fall back to comma-splitting rather than losing the tags entirely.
+        parts = [p.strip().strip('"[]').lower() for p in cleaned.split(",")]
+        return [p for p in parts if p and len(p) < 40][:7]
 
     @staticmethod
     def _fit_dim(vec: list[float]) -> list[float]:
-        """Pad/truncate embedding to the configured column dimension."""
+        """Pad/truncate to the column width.
+
+        A no-op for text-embedding-3-small (1536 = EMBEDDING_DIM), but kept so swapping
+        OPENAI_EMBED_MODEL cannot silently write vectors the column will reject.
+        """
         target = settings.EMBEDDING_DIM
         if len(vec) == target:
             return vec

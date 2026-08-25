@@ -10,6 +10,7 @@ from html.parser import HTMLParser
 
 import httpx
 
+from app.core.net import MAX_REDIRECTS, assert_safe_url
 from app.extractors.base import ExtractedContent, Extractor
 from app.models.base import ContentType
 
@@ -66,8 +67,20 @@ class ArticleExtractor(Extractor):
 
     async def extract(self, url: str) -> ExtractedContent:
         headers = {"User-Agent": "RecallAIBot/1.0 (+https://recall.ai)"}
-        async with httpx.AsyncClient(timeout=20.0, follow_redirects=True, headers=headers) as c:
+        # follow_redirects=False on purpose: an allowed external URL is free to redirect
+        # to an internal one, so every hop is re-validated rather than trusted.
+        assert_safe_url(url)
+        async with httpx.AsyncClient(timeout=20.0, follow_redirects=False, headers=headers) as c:
             resp = await c.get(url)
+            for _ in range(MAX_REDIRECTS):
+                if resp.status_code not in (301, 302, 303, 307, 308):
+                    break
+                location = resp.headers.get("location")
+                if not location:
+                    break
+                url = str(httpx.URL(url).join(location))
+                assert_safe_url(url)
+                resp = await c.get(url)
             resp.raise_for_status()
             html = resp.text
 

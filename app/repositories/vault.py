@@ -26,6 +26,19 @@ class VaultRepository:
             return None
         return item
 
+    async def get_by_source_url(
+        self, user_id: uuid.UUID, source_url: str
+    ) -> VaultItem | None:
+        """Find a live item for this user with the same canonical URL."""
+        result = await self.session.exec(
+            select(VaultItem)
+            .where(VaultItem.user_id == user_id)
+            .where(VaultItem.source_url == source_url)
+            .where(col(VaultItem.deleted_at).is_(None))
+            .limit(1)
+        )
+        return result.first()
+
     async def get_unscoped(self, item_id: uuid.UUID) -> VaultItem | None:
         """For workers: fetch without user scoping."""
         return await self.session.get(VaultItem, item_id)

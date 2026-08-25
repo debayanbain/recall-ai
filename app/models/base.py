@@ -20,6 +20,7 @@ class ContentType(StrEnum):
     pdf = "pdf"
     note = "note"
     instagram = "instagram"
+    facebook = "facebook"
     tiktok = "tiktok"
     linkedin = "linkedin"
     voice = "voice"

@@ -7,8 +7,8 @@ which keeps ``pytest -q`` green on a machine with nothing running.
 
 Bring one up with::
 
-    docker compose up -d db
-    createdb -h localhost -U recall recall_test    # or let the fixture use `recall`
+    # any Postgres with pgvector -- a Neon branch, or a second local database
+    export TEST_DATABASE_URL=postgresql+asyncpg://USER:PASS@HOST/recall_test?ssl=require
 
 Override the target with ``TEST_DATABASE_URL``.
 """
@@ -17,6 +17,7 @@ from __future__ import annotations
 import os
 import uuid
 from collections.abc import AsyncGenerator
+from urllib.parse import urlsplit
 
 import pytest
 import pytest_asyncio
@@ -52,6 +53,32 @@ _TABLES = [
     "audit_log",
     "users",
 ]
+
+def _assert_not_the_live_database() -> None:
+    """Refuse to run against the database the app itself uses.
+
+    The engine fixture below runs `drop_all` and every test truncates. That was harmless
+    when the default target was a throwaway local container, but the project now points at
+    a hosted Postgres, where a copy-pasted URL would destroy real data.
+
+    This raises rather than skipping: a silent skip is exactly how someone concludes "the
+    tests just don't run here" and later points the variable at production to fix it.
+    """
+    from app.core.config import settings
+
+    def identity(url: str) -> tuple[str, str]:
+        parts = urlsplit(url)
+        return (parts.hostname or "", parts.path)
+
+    if identity(TEST_DATABASE_URL) == identity(settings.database_url_str):
+        raise RuntimeError(
+            "TEST_DATABASE_URL points at the same host and database as DATABASE_URL. "
+            "The test suite drops every table -- point it at a separate database "
+            "(a Neon branch, or a second database on the same instance)."
+        )
+
+
+_assert_not_the_live_database()
 
 _REQUIRED_EXTENSIONS = ("vector", "pg_trgm", "pgcrypto", "citext")
 

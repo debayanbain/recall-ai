@@ -13,5 +13,9 @@ def get_ai_provider() -> AIProvider:
         from app.ai.gemini import GeminiProvider
 
         return GeminiProvider()
-    # Future: openai, claude
+    if settings.AI_PROVIDER == "openai":
+        from app.ai.openai import OpenAIProvider
+
+        return OpenAIProvider()
+    # Future: claude
     raise ValueError(f"Unsupported AI provider: {settings.AI_PROVIDER}")

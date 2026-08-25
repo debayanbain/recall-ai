@@ -6,15 +6,16 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ```bash
 uv sync --extra dev                          # install deps (Python >=3.11)
-docker compose up --build                    # db + redis + migrate + api + worker
 ```
 
-Without Docker, the API and worker are two separate processes and both are needed for saves to complete:
+There is no docker-compose — the database is hosted (Neon), set via `DATABASE_URL` in `.env`.
+The API and worker are two separate processes; the worker is only needed for AI processing:
 
 ```bash
 uv run alembic upgrade head                         # migrate (needs Postgres w/ pgvector)
 uv run uvicorn app.main:app --reload                # API   -> :8000, docs at /docs
-uv run arq app.queue.worker.WorkerSettings          # worker -- without it items stay `pending`
+uv run celery -A app.queue.celery_app.celery_app worker   # worker -- needs Redis
+uv run celery -A app.queue.celery_app.celery_app beat     # sweeper for lost callbacks
 ```
 
 Quality gates (CI is not wired up — `.github/workflows/` is empty, so run these by hand):
@@ -36,14 +37,16 @@ indexes rule out SQLite). It skips every DB test when none is reachable, so `pyt
 green without Docker -- **a green run does not mean the authz suite ran**. To run it for real:
 
 ```bash
-docker compose up -d db
-docker exec recall-ai-db-1 psql -U recall -d postgres -c "CREATE DATABASE recall_test OWNER recall;"
-make test          # 64 passed
+# Any Postgres with pgvector. A Neon branch is the cheapest separate target.
+export TEST_DATABASE_URL='postgresql+asyncpg://USER:PASS@HOST/recall_test?ssl=require'
+make test
 ```
 
-Point elsewhere with `TEST_DATABASE_URL`. Note `docker compose exec` fails without a `.env`
-(other services declare `env_file`), hence `docker exec` above. Fixtures seed rows directly
-rather than through capture endpoints, because those enqueue ARQ jobs and would need Redis.
+**`TEST_DATABASE_URL` must not be the live database.** The engine fixture runs `drop_all` and
+every test truncates, so `conftest` raises at import if its host and database match
+`DATABASE_URL` — it raises rather than skips, because a silent skip is how someone ends up
+pointing it at production to "make the tests run". Fixtures seed rows directly rather than
+through capture endpoints, because those enqueue Celery jobs and would need Redis.
 
 `pytest` runs with `asyncio_mode = "auto"` — do not add `@pytest.mark.asyncio`. There is no
 `conftest.py` and no DB/Redis fixtures: the existing tests are pure and offline (extractor
@@ -74,9 +77,30 @@ POST /vault/save -> VaultItem(status=pending) -> enqueue "process_item" -> 201
    worker: get_extractor(url) -> extract -> summary -> tags -> category -> embedding -> completed
 ```
 
+**Long extractions are fire-and-forget.** An Apify crawl can run for minutes, so
+`ProcessingService` is two-phase: `process` calls `DeferredExtractor.start`, writes an
+`extraction_runs` correlation row and *returns* — the worker is free while the provider works.
+Apify then POSTs `/webhooks/apify/{secret}`, which queues `finalize_run`; that re-reads the run's
+real status and dataset from Apify with our own token (the callback body is a signal, never data)
+and finishes the item. A Celery beat task sweeps runs that never called back, so a lost webhook
+degrades to a delay rather than an item stuck in `processing` forever. Fast extractors
+(article, YouTube) stay single-phase — deferring a 300ms fetch would buy nothing.
+`processing_status` deliberately does not gain a `scraping` value: it is a PG enum, and reusing
+`processing` keeps the frontend's polling contract unchanged.
+
 `ProcessingService.process` (`app/services/processing_service.py`) is the whole pipeline and the
 only place that mutates `processing_status`. On any exception it records `processing_error`,
-increments `retry_count`, and **re-raises** so ARQ retries (`max_tries = 4`, `job_timeout = 120`).
+increments `retry_count`, and **re-raises** so Celery retries (`max_retries = 3`,
+`task_time_limit = CELERY_TASK_TIME_LIMIT`).
+`queue/tasks.py` must commit on that path too — it previously only committed on success, so the
+failure bookkeeping rolled back and a permanently failing item sat at `pending` forever while the
+UI polled it. It also re-raises a plain `RuntimeError`: provider SDK errors carry a live HTTP
+client and Celery's result serialization chokes on them. Celery runs prefork workers with an
+`asyncio.run` bridge per task, which is why DB work goes through `db.session.task_session()` and
+its NullPool — the shared module-level pool would hand the next task a connection whose event
+loop is already closed.
+Tenacity retries in `ai/gemini.py` use `reraise=True` so the stored error is the provider's own
+message rather than an opaque `RetryError[<Future ...>]`.
 
 Layering is strict and dependency-inverted — `api -> services -> repositories -> models`:
 
@@ -88,7 +112,8 @@ Layering is strict and dependency-inverted — `api -> services -> repositories 
 | `extractors/` | Per-source logic lives ONLY here — never in routes or the worker. |
 | `ai/` | `AIProvider` Protocol; business code never imports `GeminiProvider` directly. |
 
-Swap points: `ai/factory.py` chooses the provider from `settings.AI_PROVIDER`;
+Swap points: `ai/factory.py` chooses the provider from `settings.AI_PROVIDER` (`gemini` and
+`openai` are implemented; `claude` is declared in the Literal but not built);
 `extractors/registry.py` picks by URL. **`_EXTRACTORS` order matters** — `ArticleExtractor` is the
 catch-all and must stay last, so new extractors get appended *before* it.
 
@@ -131,6 +156,20 @@ catch-all and must stay last, so new extractors get appended *before* it.
   those users get a synthetic address on `users.noreply.recall.invalid` — `is_placeholder_email`
   recognises it, and the frontend shows the provider name instead. With X parked, the only
   live case is a phone-only Facebook account.
+- **Not every failure should be retried.** Celery retries a task three times, which is right for a
+  timeout and wrong for a deleted post or a rejected API key — those spend four paid actor runs to
+  reach the same answer. Extractors raise `PermanentExtractionError` (`extractors/base.py`) for
+  those, and `ProcessingService` records the failure and *returns* instead of re-raising, so Celery
+  stops. Anything unrecognised stays retryable on purpose.
+- **Pasted Instagram links are scraped by Apify, making three Instagram paths in total.**
+  `extractors/instagram.py` reads any *public* post or reel someone pastes and needs no user
+  connection — Instagram serves a login wall to server-side fetches, so the generic article
+  fetcher returns a page titled "Instagram" with zero characters. The extractor claims the URL
+  even when `APIFY_TOKEN` is unset and fails naming the setting, because falling through to that
+  empty page looks like success. It only assembles text and metadata; the summary, category and
+  memory tags still come from `ProcessingService` via the `AIProvider`. Profile and story URLs are
+  deliberately not claimed. Reels contribute caption, hashtags, mentions, audio and top comments —
+  the *video itself* is not watched; `metadata.video_url` is stored for whenever that is added.
 - **There are TWO Instagram integrations and they are not the same thing.** Sign-in
   (`services/oauth/instagram.py`, Instagram Login) establishes identity and uses the
   **Instagram** App ID/Secret; the connection (`services/instagram_service.py`, Facebook Login)
@@ -174,11 +213,23 @@ catch-all and must stay last, so new extractors get appended *before* it.
   The post-login `next` target passes through
   `_safe_next`, which only lets same-origin relative paths through — everything else becomes
   `/vault`.
+- **Every user-supplied URL the worker fetches goes through `app/core/net.py` first.** The
+  extractors fetch whatever someone pastes, so without `assert_safe_url` that is an SSRF
+  primitive: `http://169.254.169.254/latest/meta-data/` would put cloud IAM credentials into the
+  pasting user's own vault, and internal services are reachable the same way. The guard resolves
+  the hostname and requires every resulting address to be publicly routable (checking the literal
+  string is useless — plenty of names resolve inward), and `ArticleExtractor` follows redirects
+  manually so each hop is re-validated. Residual risk is DNS rebinding; close it with egress
+  rules, not more string checks. `tests/test_ssrf_guard.py` pins the cases.
 - **`item_metadata` maps to a DB column literally named `metadata`** (renamed because `metadata` is
   reserved on SQLModel classes). Raw SQL must use `metadata`; Python must use `item_metadata`.
-- **`EMBEDDING_DIM = 1536` is a padded lie.** `text-embedding-004` emits 768 dims and
-  `GeminiProvider._fit_dim` pads to fit the `Vector(1536)` column. Changing the setting requires a
-  migration *and* a full re-embed, since the HNSW index is built on the column width.
+- **`EMBEDDING_DIM = 1536` is a padded lie under Gemini, exact under OpenAI.** `text-embedding-004`
+  emits 768 dims and `GeminiProvider._fit_dim` zero-pads to fit the `Vector(1536)` column;
+  OpenAI's `text-embedding-3-small` is 1536 natively, so nothing is padded. Both keep `_fit_dim`
+  so swapping the model cannot silently write a vector the column rejects. **Vectors from the two
+  providers are not comparable** — switching provider means a full re-embed, not just a config
+  change. Changing the setting itself also needs a migration, since the HNSW index is built on
+  the column width.
 - Gemini returns prose, not guaranteed JSON — `_parse_tags` strips ``` fences and falls back to
   comma-splitting. Keep new AI outputs equally defensive; `tests/test_gemini_parsing.py` covers this.
 
@@ -186,7 +237,10 @@ catch-all and must stay last, so new extractors get appended *before* it.
 
 - `enqueue_process_item` fires inside `VaultService.save_url` *before* the request session commits.
   A fast worker can dequeue the job before the row is visible, log `process_missing_item`, and leave
-  the item stuck at `pending`. Enqueue after commit if you touch this path.
+  the item stuck at `pending`. Enqueue after commit if you touch this path. The hand-off itself is
+  now fail-soft (`VaultService._enqueue`): the row is already persisted, so an unreachable Redis
+  logs `vault_enqueue_failed` and leaves the item `pending` rather than 500ing the save. That does
+  not fix the commit race — it only stops a missing queue from breaking capture.
 - `VaultItem.deleted_at` exists and every read filters on it, but `VaultRepository.delete()` does a
   hard `session.delete()`. Reads assume soft delete; writes do not implement it.
 - Rate limiting (`core/middleware.py`) is per-process in-memory — correct only for a single API

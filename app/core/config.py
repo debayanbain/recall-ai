@@ -55,6 +55,12 @@ class Settings(BaseSettings):
 
     # --- Redis / Queue ---
     REDIS_URL: RedisDsn = "redis://localhost:6379/0"  # type: ignore[assignment]
+    # Prefork: one OS process per concurrent task. Kept modest because tasks are I/O
+    # bound and the slow part now happens on Apify's servers, not in ours.
+    CELERY_CONCURRENCY: int = 4
+    # Hard ceiling per task. Only the *trigger* and the *finalize* run here now — the
+    # scrape itself is fire-and-forget — so this no longer has to cover a 5-minute crawl.
+    CELERY_TASK_TIME_LIMIT: int = 300
 
     # --- OAuth (identity providers) ---
     # A provider is "enabled" only when both id and secret are non-empty; /auth/providers
@@ -101,8 +107,43 @@ class Settings(BaseSettings):
     # rest. Empty in dev -> tokens are simply not stored. Required outside dev.
     TOKEN_ENCRYPTION_KEY: str = ""
 
+    # --- Apify (Instagram scraping) ---
+    # Instagram serves a login wall to server-side fetches, so a generic HTML fetch gets
+    # nothing. Apify runs a real browser and returns the caption, hashtags, media URLs and
+    # engagement counts, which is what the AI pipeline then summarizes and tags.
+    APIFY_TOKEN: str = ""
+    # Actor ids use `~` in the API path, not `/`.
+    APIFY_INSTAGRAM_ACTOR: str = "apify~instagram-scraper"
+    # Configurable because the first-party actor documents `startUrls` as *page*
+    # URLs; a store actor that resolves a single reel can be swapped in here.
+    APIFY_FACEBOOK_ACTOR: str = "apify~facebook-reels-scraper"
+    # Kept under the worker's job_timeout (120s) so a slow scrape fails as a scrape rather
+    # than as an opaque job timeout.
+    APIFY_TIMEOUT_SECONDS: float = 90.0
+    # Instagram blocks datacenter IPs, so real-world success needs Apify's RESIDENTIAL
+    # proxy group — a paid feature. Off by default so a free account is not billed for
+    # a proxy it cannot use.
+    APIFY_USE_PROXY: bool = False
+    # Apify POSTs here when a run finishes. Must be publicly reachable — in development
+    # that is the tunnel, which is why it defaults to empty rather than to localhost:
+    # registering an unreachable webhook silently strands every run.
+    PUBLIC_BASE_URL: str = ""
+    # Shared secret in the webhook path. The payload itself is never trusted for data —
+    # it only names a run id, which the worker then re-fetches from Apify with our own
+    # token — but the endpoint still must not be an open trigger for background work.
+    APIFY_WEBHOOK_SECRET: str = ""
+    # A run that has neither called back nor finished by now is swept by the beat task.
+    EXTRACTION_RUN_TIMEOUT_MINUTES: int = 20
+
     # --- AI (Gemini) ---
     AI_PROVIDER: Literal["gemini", "openai", "claude"] = "gemini"
+
+    # --- OpenAI ---
+    # text-embedding-3-small emits 1536 dims natively, which matches EMBEDDING_DIM exactly
+    # — unlike Gemini's 768, which has to be zero-padded to fit the Vector(1536) column.
+    OPENAI_API_KEY: str = ""
+    OPENAI_TEXT_MODEL: str = "gpt-4o-mini"
+    OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
     GEMINI_API_KEY: str = ""
     GEMINI_TEXT_MODEL: str = "gemini-2.0-flash"
     GEMINI_EMBED_MODEL: str = "text-embedding-004"

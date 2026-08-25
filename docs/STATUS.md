@@ -7,12 +7,12 @@ Verified by reading the code, not by trusting the planner checkboxes.
 
 | Phase | State | Evidence |
 |---|---|---|
-| 0 — Foundation | **Done except CI** | FastAPI, SQLModel, Alembic, pgvector + pg_trgm + pgcrypto + citext extensions, ARQ, structlog, request IDs, `/health` + `/ready`, docker-compose (db/redis/migrate/api/worker), pytest. `.github/workflows/` is **empty** — the CI task is unticked in reality. |
+| 0 — Foundation | **Done except CI** | FastAPI, SQLModel, Alembic, pgvector + pg_trgm + pgcrypto + citext extensions, Celery, structlog, request IDs, `/health` + `/ready`, hosted Postgres (Neon) via `DATABASE_URL`, pytest. `.github/workflows/` is **empty** — the CI task is unticked in reality. |
 | 1 — Identity & core data | **Mostly done** | All 7 entities exist (`User`, `VaultItem`, `VaultChunk`, `Collection`, `CollectionItem`, `Subscription`, `AuditLog`). Google OAuth with CSRF state cookie + JWT session. Tenant scoping enforced in repositories. Pagination returns `total`. **Gaps:** no common API error format (no `exception_handler` anywhere), soft delete only half-built, zero authorization tests. |
 | 2 — Universal Capture | **Partial** | `POST /vault/save` and `/vault/note` persist immediately and return `pending`. **Gaps:** no idempotency key, URL validated only by `HttpUrl` (no SSRF/private-IP guard), no PDF/image/voice capture path, no tests. |
 | 3 — Extraction | **Partial** | `Extractor` Protocol + registry + YouTube (oEmbed) + Article (stdlib HTML parser) with timeouts and fallback ordering. **Gaps:** Apify adapter, Instagram, TikTok, provider usage/cost logging. |
 | 4 — AI Enrichment | **Partial** | `AIProvider` Protocol, `GeminiProvider` with `tenacity` retry, defensive tag parsing. **Gaps:** prompts are inline strings (no templates or versioning), category vocabulary is uncontrolled free text, no user-override endpoint. |
-| 5 — Background pipeline | **Mostly done** | ARQ worker, `max_tries=4`, `job_timeout=120`, status persisted at every stage, failures recorded and re-raised for retry. **Gaps:** one monolithic job instead of extract/enrich/embed stages, no job table, no dead-letter queue, **and a capture race (see below)**. |
+| 5 — Background pipeline | **Mostly done** | Celery prefork workers, `max_retries=3`, status persisted at every stage, failures recorded and re-raised for retry. Long extractions are fire-and-forget: `DeferredExtractor.start` + `extraction_runs` + Apify webhook, with a beat sweeper for lost callbacks. **Gaps:** no dead-letter queue, **and a capture race (see below)**. |
 | 6 — Memory Cards & Vault | **Not started** | No frontend exists in this repo. `R2Storage` is written but **never imported** — no PDF, no voice, no chunking, no editor. |
 | 7 — Search foundation | **Partial** | Embeddings generated and stored; HNSW index on `vault_chunks.embedding`; trgm GIN indexes on `vault_items.title` and `.summary` already migrated. **Gap: none of it is queried.** `/search` is plain `ILIKE`. No vector search, no fuzzy search, no ranking, no filters. |
 | 8–15 | **Not started** | Ask Recall, connections, Spaces UI, sharing, Telegram, digests, billing, hardening. |
@@ -24,7 +24,7 @@ Verified by reading the code, not by trusting the planner checkboxes.
 - **`alembic upgrade head` failed on any fresh database.** `User.auth_provider` and
   `Collection.slug` passed `sa_column=Column(...)` with no type, so SQLModel stored `NullType`
   and `0001_initial`'s `create_all` raised `CompileError`. Nobody could provision the project;
-  `docker compose up` died at the `migrate` service. Fixed with explicit `Text` / `String(300)`.
+  the `migrate` step died. Fixed with explicit `Text` / `String(300)`.
 - **No row could be inserted through the ORM.** `utcnow()` returns aware datetimes but only
   `updated_at` declared `DateTime(timezone=True)`; the other 13 timestamp columns compiled to
   `TIMESTAMP WITHOUT TIME ZONE` and asyncpg rejected every insert. Models fixed and migration

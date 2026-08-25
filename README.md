@@ -4,7 +4,7 @@ AI-powered memory vault. Save YouTube videos, articles, PDFs and notes; AI
 summarizes, tags, categorizes and embeds them; search and share collections.
 
 > Built for 10 users, designed to grow to 100k. FastAPI + Postgres(pgvector) +
-> Redis/ARQ workers + Gemini Flash.
+> Redis/Celery workers + OpenAI.
 
 ## Architecture
 
@@ -27,7 +27,7 @@ repositories/ async data access (SQLModel)
 models/       SQLModel tables
 extractors/   Strategy pattern per source (YouTube, Article, …)
 ai/           AIProvider protocol + GeminiProvider
-queue/        ARQ producer + worker
+queue/        Celery app, tasks, producer
 storage/      Cloudflare R2 (S3-compatible)
 core/         config, logging, security, middleware
 ```
@@ -39,7 +39,7 @@ sources), all behind protocols so business logic never depends on a vendor.
 
 ```bash
 touch .env                    # see the Configuration section; not templated, fill by hand
-docker compose up --build     # db, redis, migrate, api, worker
+make dev                      # API (Neon via DATABASE_URL); `make worker` needs Redis
 ```
 
 API: http://localhost:8000  ·  Docs: http://localhost:8000/docs
@@ -51,7 +51,8 @@ uv sync --extra dev                       # install deps
 # start Postgres (pgvector) + Redis yourself, then:
 alembic upgrade head                      # migrate
 uvicorn app.main:app --reload             # API
-arq app.queue.worker.WorkerSettings       # worker (separate terminal)
+celery -A app.queue.celery_app.celery_app worker   # worker (separate terminal)
+celery -A app.queue.celery_app.celery_app beat     # sweeper (separate terminal)
 ```
 
 ## Quality gates

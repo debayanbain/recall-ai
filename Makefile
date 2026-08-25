@@ -1,4 +1,4 @@
-.PHONY: install migrate revision dev dev-tunnel tunnel worker api openapi lint typecheck test check up down logs
+.PHONY: install migrate revision dev dev-tunnel tunnel worker beat api openapi lint typecheck test check
 
 install:            ## sync deps incl. dev extras
 	uv sync --extra dev
@@ -55,8 +55,14 @@ dev-tunnel:         ## API + https tunnel, OAuth config auto-pointed at it
 tunnel:             ## https tunnel on its own, without the API
 	@D=$$(./scripts/ngrok_domain.sh); ngrok http 8000 $${D:+--domain=$$D}
 
-worker:             ## background worker -- without it saves stay `pending`
-	uv run arq app.queue.worker.WorkerSettings
+worker:             ## Celery prefork worker -- needs Redis; saves work without it
+	uv run celery -A app.queue.celery_app.celery_app worker \
+		--loglevel=info --concurrency=$${CELERY_CONCURRENCY:-4}
+
+# Own terminal. Runs the sweeper that rescues Apify runs whose webhook never arrived;
+# without it a lost callback leaves an item stuck in `processing` indefinitely.
+beat:               ## Celery beat scheduler (stale-run sweeper)
+	uv run celery -A app.queue.celery_app.celery_app beat --loglevel=info
 
 api:                ## production-style API: no reload, bound to all interfaces
 	uv run uvicorn app.main:app --host 0.0.0.0 --port 8000 \
@@ -75,12 +81,3 @@ test:
 	uv run pytest -q
 
 check: lint typecheck test   ## all gates
-
-up:                 ## full stack in Docker (db, redis, migrate, api, worker)
-	docker compose up --build
-
-down:
-	docker compose down
-
-logs:
-	docker compose logs -f api worker
