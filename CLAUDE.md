@@ -24,13 +24,14 @@ Quality gates (CI is not wired up — `.github/workflows/` is empty, so run thes
 uv run ruff check app tests                         # line-length 100, rules E,F,I,UP,B,ASYNC
 uv run mypy app                                     # strict = true
 uv run pytest -q
-uv run pytest tests/test_extractors.py::test_generic_url_falls_back_to_article   # single test
+uv run pytest tests/extractors/test_extractors.py::test_generic_url_falls_back_to_article   # single test
 ```
 
-Baseline as of this file: `mypy` is clean (53 files) and all 9 tests pass, but `ruff check` reports
-**38 pre-existing errors** — 28 `UP045` (`Optional[X]` instead of `X | None`, mostly in
-`app/models/vault.py`), 9 `E501`, 1 `I001`. 29 are `--fix`-able. Do not read a red ruff run as
-damage you caused; check whether your files are among the offenders.
+Baseline as of this file: `mypy` is clean (85 files) and `pytest -q` is 190 passed / 54 skipped
+(the skips are every DB-backed test — see below), but `ruff check` reports **30 pre-existing
+errors** — 28 `UP045` (`Optional[X]` instead of `X | None`, mostly in `app/models/vault.py`) and
+2 `E501`, all `--fix`-able. Do not read a red ruff run as damage you caused; check whether your
+files are among the offenders.
 
 `tests/conftest.py` needs a real PostgreSQL (pgvector `Vector`, JSONB, `PGUUID`, GIN/HNSW
 indexes rule out SQLite). It skips every DB test when none is reachable, so `pytest -q` stays
@@ -48,6 +49,14 @@ every test truncates, so `conftest` raises at import if its host and database ma
 pointing it at production to "make the tests run". Fixtures seed rows directly rather than
 through capture endpoints, because those enqueue Celery jobs and would need Redis.
 
+Tests mirror the `app/` package tree -- `tests/auth`, `tests/vault`, `tests/extractors`,
+`tests/processing`, `tests/ai`, `tests/integrations`, `tests/core` -- so a new test's home is
+never a judgment call. Each folder needs an `__init__.py` (`tests` is a package; without one,
+two same-named test modules in different folders collide on import). **There is exactly one
+`conftest.py`, at `tests/`**, and it should stay that way: a fixture buried in
+`tests/vault/conftest.py` is invisible from the test that inherits it, which is how a suite
+becomes unreadable. `pytest tests/auth` runs one domain.
+
 `pytest` runs with `asyncio_mode = "auto"` — do not add `@pytest.mark.asyncio`. There is no
 `conftest.py` and no DB/Redis fixtures: the existing tests are pure and offline (extractor
 routing, Gemini response parsing). Anything needing a database has no harness yet.
@@ -57,12 +66,29 @@ routing, Gemini response parsing). Anything needing a database has no harness ye
 frozen snapshot: on a fresh database it already creates whatever the latest models declare, and an
 unguarded `ADD COLUMN` / `CREATE TABLE` in a later revision then aborts the entire upgrade (Alembic
 wraps it in one transaction, so the DB rolls back to empty). Guard with
-`sa.inspect(op.get_bind())` — see `0004_oauth_accounts` and `0005_instagram_accounts`.
+`sa.inspect(op.get_bind())` — see `auth/0004_oauth_accounts` and
+`integrations/0005_instagram_accounts`.
 
-New migration: `alembic revision --autogenerate -m "..."`. `alembic.ini` leaves `sqlalchemy.url`
-empty on purpose — `migrations/env.py` injects it from `settings.database_url_str` and imports
-`app.models` so `SQLModel.metadata` is populated. A model that is not re-exported from
-`app/models/__init__.py` is invisible to autogenerate.
+**Revision files sit in per-domain folders, but they are still ONE linear chain.**
+`migrations/versions/{core,auth,vault,integrations,processing}/` groups them for reading only —
+order comes from each file's `down_revision`, never from the folder, and `alembic history` is the
+only authority on it. The numeric filename prefix is kept so a sorted listing still shows the
+sequence. That layout works because `alembic.ini` sets **`recursive_version_locations = true`**;
+without it Alembic scans `versions/` one level deep, finds **zero** revisions, and `alembic
+upgrade head` reports nothing to do — a silent no-op that looks exactly like an up-to-date
+database. If migrations ever appear to vanish, check that flag first.
+
+New migration: `alembic revision --autogenerate -m "..."` writes to `migrations/versions/` (the
+root), then **move the file into the domain folder it belongs to** — the chain follows it, since a
+revision is identified by its `revision` id and not by its path. Do not pass `--version-path`: it
+only accepts a directory listed in `version_locations`, and listing the folders there while
+recursion is on makes Alembic load every file twice. Do not list the domain folders in
+`version_locations` either — a folder added later but not registered would be skipped in silence,
+which is the one failure mode worth engineering against here.
+
+`alembic.ini` leaves `sqlalchemy.url` empty on purpose — `migrations/env.py` injects it from
+`settings.database_url_str` and imports `app.models` so `SQLModel.metadata` is populated. A model
+that is not re-exported from `app/models/__init__.py` is invisible to autogenerate.
 
 ## Architecture
 
@@ -144,6 +170,34 @@ catch-all and must stay last, so new extractors get appended *before* it.
   There are no passwords — identity comes from OAuth (Google, Facebook, Instagram). X/Twitter is
   parked in `docs/parked/twitter_oauth.py`, deliberately outside `app/` so it stays out of
   `mypy app`; its docstring lists the five edits that re-enable it.
+- **A login is TWO cookies, and only one of them is a JWT.** `recall_session` is a 15-minute
+  access token (`Path=/`, verified by signature alone — nothing queries the database); the
+  session itself is a `user_sessions` row addressed by `recall_refresh`, a 7-day opaque token
+  scoped to `Path=/api/v1/auth`. `POST /auth/refresh` is what makes a user who returns days
+  later skip the provider. Consequences worth knowing before editing:
+  - **Only the digest is stored** (`token_hash`, SHA-256). A fast hash is correct here because
+    the input is 48 random bytes, not a password — there is no dictionary to run, and the
+    lookup has to be one indexed equality match.
+  - **Refresh tokens are single-use.** Each refresh writes a new row in the same `family_id`
+    and retires the old one (`revoked_reason="rotated"`). Retired rows are kept on purpose:
+    a token presented after rotation means two parties hold it, so the whole family is revoked
+    (`reuse_detected`). Never "fix" a double-refresh 401 by making rotation idempotent — that
+    deletes the only theft signal the system has.
+  - **The window slides, the chain does not.** Every rotation extends expiry by
+    `REFRESH_TOKEN_EXPIRE_DAYS`, but `family_started_at` is copied forward and
+    `REFRESH_TOKEN_ABSOLUTE_DAYS` (90) ends the chain regardless of activity.
+  - **Revocation is not instant.** Nothing checks the database while an access token is valid,
+    so `logout-all` takes effect within `ACCESS_TOKEN_EXPIRE_MINUTES`. That is why the boot
+    guard caps it at 60 outside dev — raising it widens the hole, it does not "reduce load".
+  - `get_current_user` answers `"Session expired"` for an expired signature and
+    `"Invalid session"` for everything else; the SPA uses that to decide whether to try
+    `/auth/refresh` before giving up. `/auth/refresh` itself collapses every rejection into one
+    opaque 401 — a distinguishing error tells a token holder whether their token was ever real.
+  - State-changing auth routes call `_assert_same_site`. SameSite=lax covers the default
+    deployment; the Origin allowlist is what still covers a cross-site one that must set
+    `SESSION_COOKIE_SAMESITE=none`.
+  - `purge_expired_sessions` (beat, daily) deletes rows strictly by `expires_at` — never by
+    `revoked_at`, since a revoked-but-unexpired row is exactly the replay evidence.
 - **Adding an OAuth provider means adding a module, never a route.** `app/api/v1/auth.py` has
   exactly one `/{provider}/login` + `/{provider}/callback` pair; `services/oauth/registry.py`
   resolves the name. A provider is only offered when both its client id and secret are set, and
@@ -201,7 +255,7 @@ catch-all and must stay last, so new extractors get appended *before* it.
 - **The Instagram callback's state cookie is bound to the user id that started the flow**
   (`{user_id}.{nonce}`). Without that, an attacker could complete their own consent and lure a
   victim to the callback URL, grafting their Instagram onto the victim's account. Every branch —
-  no cookie, no state, wrong nonce, different user — fails closed; `tests/test_integrations_instagram.py`
+  no cookie, no state, wrong nonce, different user — fails closed; `tests/integrations/test_integrations_instagram.py`
   pins each one.
 - **Provider tokens are Fernet-encrypted** (`app/core/crypto.py`) in `oauth_accounts`, keyed by
   `TOKEN_ENCRYPTION_KEY`. With no key set (dev) they are dropped, not stored in the clear; the
@@ -220,7 +274,61 @@ catch-all and must stay last, so new extractors get appended *before* it.
   the hostname and requires every resulting address to be publicly routable (checking the literal
   string is useless — plenty of names resolve inward), and `ArticleExtractor` follows redirects
   manually so each hop is re-validated. Residual risk is DNS rebinding; close it with egress
-  rules, not more string checks. `tests/test_ssrf_guard.py` pins the cases.
+  rules, not more string checks. `tests/core/test_ssrf_guard.py` pins the cases.
+- **Logs are files in dev and stdout everywhere else -- never a database table.** Every
+  structlog event from the API, the worker and beat is appended as a JSON line to
+  `LOG_DIR/<source>-<date>.jsonl` (`logs/api-2026-08-25.jsonl`, ...) by
+  `app/core/log_sink.py`, so three processes share one greppable folder and `request_id`
+  correlates a request across all of them:
+  `jq -c 'select(.request_id=="abc")' logs/*.jsonl`. `settings.file_logging_enabled` is
+  hard-gated on `ENV == "dev"`, not merely defaulted off: a deployed container's
+  filesystem is ephemeral and unmonitored, so files there would be a PII spill nobody
+  reads. Writes are one `os.write` to an `O_APPEND` fd, which is why the prefork worker's
+  children can share a file without a lock between processes. The sink is opened per
+  process -- `start_log_sink()` in the API lifespan, `worker_process_init` / `beat_init`
+  in `queue/celery_app.py` -- because an fd inherited across fork shares its offset.
+- **Credential-looking keys are redacted before the line is built**, not before it is
+  displayed (`_SENSITIVE_KEY_PARTS` in `log_sink.py`). A log file gets copied, pasted into
+  an issue and archived, so a token that reaches the disk has already leaked. New logging
+  helpers must go through `redact` / `build_record`.
+- **Log retention is 15 days and the sink enforces it itself.** `prune_expired` runs when
+  the sink rolls over to a new day (and on the first write of a process), deleting only
+  files matching `<source>-<date>.jsonl` and dating them from the *filename*, not mtime --
+  so retention holds with no cron, no worker and no beat running, and a stray note in the
+  folder is never touched. A retention below 1 day is refused at boot.
+- **There is no log API and no `app_logs` table.** Reading the trail in dev is
+  `tail -f logs/*.jsonl`; in staging/prod it is the platform's stdout drain. Do not add an
+  HTTP endpoint that serves log files -- it is a path-traversal surface guarding data that
+  spans every user.
+- **Uploaded files live in a private Backblaze B2 bucket; Postgres stores only the key.**
+  `POST /vault/upload` accepts any allowlisted document, `services/documents.py` decides
+  what it is **from the bytes** (never the filename or the browser's Content-Type), the
+  object goes to B2 *before* the row is inserted (a failed upload then leaves no item
+  pointing at a file that is not there), and `GET /vault/{id}/file` mints a presigned GET
+  that expires in `DOWNLOAD_LINK_TTL_SECONDS`. There is no public-URL setting and no
+  static file route: ownership is re-checked in the repository on every download, so the
+  signed URL is the only way in and it is minted per request. `storage_key` is never
+  serialized to the browser. `get_storage()` returns None when the bucket is unconfigured
+  and uploads degrade to text-only rather than the API failing to boot.
+- **The upload allowlist is closed, and SVG/HTML are refused on purpose.** They are
+  executable in a browser context, so storing them makes any future render path a stored
+  XSS. Defence in depth on top of that: every presigned URL forces
+  `Content-Disposition: attachment` with the name sanitized for the header, so nothing
+  from the bucket is ever rendered by an origin. The object key is
+  `users/<user>/<item>/<uuid>.<ext>` -- entirely server-generated, so `../` in a filename
+  is a character the display name loses, never a path. `tests/vault/test_documents.py` pins it.
+- **Deleting an object means deleting every version of it.** The bucket's lifecycle is
+  "Keep all versions", so a plain S3 `DELETE` writes a *delete marker* and leaves the
+  bytes -- verified against the live bucket: one delete left `live versions: 1`. A user
+  who asked for their document to be removed would still have it stored, and still be
+  billed for it. `B2Storage.delete` therefore lists the versions for exactly that key
+  (prefix listing also returns neighbours like `a.png.bak`, which are skipped) and removes
+  each by id, falling back to a plain delete when versioning is off. Do not "simplify"
+  this back to one `delete_object`.
+- **An upload that carries no readable text is `skipped`, not `failed`.** A PDF's or a
+  .txt's text goes through the normal AI pipeline; an image or a .docx is stored and
+  downloadable but never sent to the model -- there is no OCR and no OOXML parser, and
+  calling the model on an empty string spends tokens to hallucinate about a filename.
 - **`item_metadata` maps to a DB column literally named `metadata`** (renamed because `metadata` is
   reserved on SQLModel classes). Raw SQL must use `metadata`; Python must use `item_metadata`.
 - **`EMBEDDING_DIM = 1536` is a padded lie under Gemini, exact under OpenAI.** `text-embedding-004`
@@ -231,7 +339,7 @@ catch-all and must stay last, so new extractors get appended *before* it.
   change. Changing the setting itself also needs a migration, since the HNSW index is built on
   the column width.
 - Gemini returns prose, not guaranteed JSON — `_parse_tags` strips ``` fences and falls back to
-  comma-splitting. Keep new AI outputs equally defensive; `tests/test_gemini_parsing.py` covers this.
+  comma-splitting. Keep new AI outputs equally defensive; `tests/ai/test_gemini_parsing.py` covers this.
 
 ## Known rough edges (real, in the current code)
 

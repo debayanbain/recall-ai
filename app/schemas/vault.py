@@ -34,6 +34,12 @@ class VaultItemRead(BaseModel):
     processing_status: ProcessingStatus
     created_at: datetime
 
+    # Uploaded-file metadata. `storage_key` is deliberately absent: the bucket layout is
+    # not the browser's business, and the only way to reach a file is GET /vault/{id}/file.
+    file_name: str | None = None
+    file_size: int | None = None
+    mime_type: str | None = None
+
 
 class VaultItemDetail(VaultItemRead):
     content: str | None
@@ -45,3 +51,17 @@ class VaultListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class FileLinkResponse(BaseModel):
+    """A short-lived download URL for an uploaded file.
+
+    Minted per request and never stored. Treat it as a credential: it carries its own
+    signature, so anyone holding it can fetch the object until it expires.
+    """
+
+    url: str
+    expires_in: int
+    file_name: str | None = None
+    file_size: int | None = None
+    mime_type: str | None = None

@@ -30,7 +30,7 @@ from sqlmodel.ext.asyncio.session import AsyncSession
 
 import app.models  # noqa: F401  -- populates SQLModel.metadata
 from app.core.config import settings
-from app.core.security import create_session_token
+from app.core.security import create_access_token
 from app.db.session import get_session
 from app.main import create_app
 from app.models.base import ContentType, ProcessingStatus, Visibility
@@ -51,6 +51,7 @@ _TABLES = [
     "collections",
     "subscriptions",
     "audit_log",
+    "user_sessions",
     "users",
 ]
 
@@ -176,8 +177,16 @@ async def make_collection(
 
 
 def authenticate(client: AsyncClient, user: User) -> None:
-    """Attach a genuine signed session cookie, exercising the real auth path."""
-    client.cookies.set(settings.SESSION_COOKIE_NAME, create_session_token(str(user.id)))
+    """Attach a genuine signed access cookie, exercising the real auth path.
+
+    The `sid` claim points at no real `user_sessions` row: access tokens are verified by
+    signature alone, so nothing in the request path looks it up. Tests that care about
+    the server-side session (refresh, logout, the device list) create one for real.
+    """
+    client.cookies.set(
+        settings.SESSION_COOKIE_NAME,
+        create_access_token(str(user.id), str(uuid.uuid4())),
+    )
 
 
 @pytest_asyncio.fixture(loop_scope="session")

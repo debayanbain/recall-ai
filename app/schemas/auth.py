@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import uuid
+from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, EmailStr, Field
 
@@ -31,3 +32,34 @@ class OAuthProviderInfo(BaseModel):
 
 class ProvidersResponse(BaseModel):
     providers: list[OAuthProviderInfo]
+
+
+class RefreshResponse(BaseModel):
+    """Answer to POST /auth/refresh. The tokens themselves travel as HttpOnly cookies and
+    deliberately never appear in a body -- a body is readable by script, a cookie is not.
+
+    `expires_in` lets the SPA schedule a refresh slightly before the access token dies
+    instead of discovering it through a failed request.
+    """
+
+    ok: bool = True
+    expires_in: int
+    refresh_expires_at: datetime
+
+
+class SessionRead(BaseModel):
+    """One live device in the user's own session list.
+
+    Carries no credential: `id` is a row id whose only power is `DELETE /auth/sessions/
+    {id}`, and that is ownership-checked.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    current: bool = False
+    user_agent: str | None = None
+    ip_address: str | None = None
+    created_at: datetime
+    last_used_at: datetime
+    expires_at: datetime

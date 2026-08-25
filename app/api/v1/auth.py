@@ -14,25 +14,45 @@ Threat model notes for anyone editing this file:
   relative path (`/vault`), never as an absolute URL, and is re-validated on the way out.
 * **Error leakage** -- provider failures redirect to the sign-in page with a coarse error
   code. Upstream response bodies (which can contain tokens) are never echoed to the client.
+
+Sessions themselves are two cookies, not one (see `app.services.session_service`):
+
+* `recall_session` -- a minutes-long access JWT, `Path=/`, sent with every API call.
+* `recall_refresh` -- a 7-day opaque token, `Path=/api/v1/auth`, so it is never attached
+  to `/vault`, `/search` or anything else. It rotates on every use; replaying a rotated
+  one revokes the whole chain.
+
+The point of the pair: coming back three days later, the browser still holds a valid
+refresh token, `POST /auth/refresh` mints a new access token, and the user never sees the
+provider again. Only a 7-day gap -- or an explicit sign-out -- sends them back to OAuth.
 """
 from __future__ import annotations
 
 import base64
 import hashlib
 import secrets
+import uuid
 from urllib.parse import urlencode, urlsplit
 
 import httpx
+import jwt
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
 from fastapi.responses import RedirectResponse
 
-from app.api.deps import AuthServiceDep, CurrentUser
+from app.api.deps import AuthServiceDep, CurrentUser, SessionServiceDep
 from app.core.config import settings
 from app.core.logging import get_logger
-from app.core.security import create_session_token
-from app.schemas.auth import OAuthProviderInfo, ProvidersResponse, UserRead
+from app.core.security import decode_access_token
+from app.schemas.auth import (
+    OAuthProviderInfo,
+    ProvidersResponse,
+    RefreshResponse,
+    SessionRead,
+    UserRead,
+)
 from app.services.oauth import get_oauth_provider
 from app.services.oauth.registry import configured_provider_names
+from app.services.session_service import IssuedSession, SessionError
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 log = get_logger("auth")
@@ -91,6 +111,88 @@ def _clear_flow_cookies(response: Response) -> None:
     for name in (_STATE_COOKIE, _VERIFIER_COOKIE, _NEXT_COOKIE):
         response.delete_cookie(name, path="/", httponly=True, secure=settings.COOKIE_SECURE,
                                samesite="lax")
+
+
+# The refresh cookie is scoped to the auth routes and nowhere else. A cookie the browser
+# only attaches to four endpoints cannot be leaked by any other endpoint's logging,
+# caching or CORS mistake -- and no XSS payload can read it either way (HttpOnly).
+_REFRESH_COOKIE_PATH = f"{settings.API_V1_PREFIX}/auth"
+
+
+def _set_session_cookies(response: Response, issued: IssuedSession) -> None:
+    """Attach the access + refresh pair. Both HttpOnly; neither is readable from JS."""
+    response.set_cookie(
+        settings.SESSION_COOKIE_NAME,
+        issued.access_token,
+        max_age=issued.access_expires_in,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        path="/",
+    )
+    response.set_cookie(
+        settings.REFRESH_COOKIE_NAME,
+        issued.refresh_token,
+        # Max-Age matches the token's own expiry, so a browser that keeps the cookie
+        # longer than the server keeps the row is impossible.
+        max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        path=_REFRESH_COOKIE_PATH,
+    )
+
+
+def _clear_session_cookies(response: Response) -> None:
+    """Drop both cookies. Path/domain must mirror the set exactly or the browser keeps
+    the old cookie and the user appears to be signed in until it expires on its own."""
+    response.delete_cookie(
+        settings.SESSION_COOKIE_NAME,
+        path="/",
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
+    response.delete_cookie(
+        settings.REFRESH_COOKIE_NAME,
+        path=_REFRESH_COOKIE_PATH,
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
+
+
+def _client_ip(request: Request) -> str | None:
+    """The peer address, and deliberately *not* X-Forwarded-For.
+
+    XFF is caller-supplied text; trusting it lets anyone write whatever they like into
+    the device list a user is meant to audit. Behind a proxy this records the proxy --
+    fix that with `--proxy-headers` and a trusted-hosts list at the ASGI server, which is
+    the only layer that knows which hop is actually ours.
+    """
+    return request.client.host if request.client else None
+
+
+def _assert_same_site(request: Request) -> None:
+    """Reject a cross-origin state change on the session endpoints.
+
+    SameSite already blocks this for the default `lax` cookie, but a deployment whose SPA
+    and API are genuinely cross-site must set `SESSION_COOKIE_SAMESITE=none`, and that
+    hands the browser back to the attacker's page. An Origin allowlist is the check that
+    survives both settings. A request with no Origin at all (curl, a native app) is
+    allowed: no browser omits Origin on a cross-site POST, so absence is not the attack.
+    """
+    origin = request.headers.get("origin")
+    if origin is None:
+        return
+    allowed = {*settings.CORS_ORIGINS, settings.FRONTEND_URL.rstrip("/")}
+    if origin.rstrip("/") not in {a.rstrip("/") for a in allowed}:
+        log.warning("session_cross_origin_rejected", origin=origin, path=request.url.path)
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cross-origin request rejected")
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -176,6 +278,7 @@ async def oauth_login(
 async def oauth_callback(
     provider: str,
     auth: AuthServiceDep,
+    sessions: SessionServiceDep,
     request: Request,
     code: str | None = Query(None),
     state: str | None = Query(None),
@@ -228,7 +331,11 @@ async def oauth_callback(
 
     try:
         user = await auth.login(identity)
-        token = create_session_token(str(user.id))
+        issued = await sessions.start(
+            user,
+            user_agent=request.headers.get("user-agent"),
+            ip_address=_client_ip(request),
+        )
     except Exception:
         # The provider half succeeded, so the failure is ours -- an unreachable database,
         # a missing migration, a bad encryption key. Stranding the user on a bare 500 at a
@@ -238,33 +345,155 @@ async def oauth_callback(
         return fail("server_error")
 
     redirect = RedirectResponse(f"{settings.FRONTEND_URL.rstrip('/')}{target}")
-    redirect.set_cookie(
-        settings.SESSION_COOKIE_NAME,
-        token,
-        max_age=settings.JWT_EXPIRE_MINUTES * 60,
-        httponly=True,
-        secure=settings.COOKIE_SECURE,
-        samesite=settings.SESSION_COOKIE_SAMESITE,
-        domain=settings.SESSION_COOKIE_DOMAIN,
-        path="/",
-    )
+    _set_session_cookies(redirect, issued)
     _clear_flow_cookies(redirect)
     log.info("oauth_login", provider=provider, user_id=str(user.id))
     return redirect
 
 
-@router.post("/logout")
-async def logout(response: Response) -> dict[str, bool]:
-    """Drop the session cookie. Attributes must mirror the ones used to set it."""
-    response.delete_cookie(
-        settings.SESSION_COOKIE_NAME,
-        path="/",
-        domain=settings.SESSION_COOKIE_DOMAIN,
-        httponly=True,
-        secure=settings.COOKIE_SECURE,
-        samesite=settings.SESSION_COOKIE_SAMESITE,
+def _current_session_id(request: Request) -> uuid.UUID | None:
+    """Which session row the caller's access token was minted from, if it says.
+
+    Only used to flag "this device" in the session list, so a token that predates the
+    `sid` claim (or fails to parse) degrades to "none of them are current" rather than
+    to an error. The signature is still verified -- `decode_access_token` does that --
+    but the caller has already been authenticated by the time this runs.
+    """
+    token = request.cookies.get(settings.SESSION_COOKIE_NAME)
+    if not token:
+        return None
+    try:
+        return uuid.UUID(decode_access_token(token)["sid"])
+    except (jwt.PyJWTError, KeyError, ValueError, TypeError):
+        return None
+
+
+@router.post("/refresh", response_model=RefreshResponse)
+async def refresh_session(
+    request: Request,
+    response: Response,
+    sessions: SessionServiceDep,
+) -> RefreshResponse:
+    """Trade the refresh cookie for a fresh access token, and rotate the refresh token.
+
+    This is the endpoint that makes a login survive three days away: the browser still
+    holds the refresh cookie, the SPA calls this on boot (or after any 401), and the user
+    never sees the provider again.
+
+    Every rejection is the same 401 with the same message. The *reason* -- unknown token,
+    revoked, expired, deleted user -- is logged and never returned: a distinguishing
+    error would tell whoever holds a stolen token whether it was ever real.
+    """
+    _assert_same_site(request)
+    raw = request.cookies.get(settings.REFRESH_COOKIE_NAME)
+    if not raw:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+
+    try:
+        issued = await sessions.refresh(
+            raw,
+            user_agent=request.headers.get("user-agent"),
+            ip_address=_client_ip(request),
+        )
+    except SessionError as exc:
+        log.info("session_refresh_rejected", reason=exc.reason)
+        # Clear both cookies on the way out. Leaving a dead refresh cookie in place makes
+        # the SPA retry this endpoint on every navigation forever.
+        _clear_session_cookies(response)
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated") from exc
+
+    _set_session_cookies(response, issued)
+    return RefreshResponse(
+        expires_in=issued.access_expires_in,
+        refresh_expires_at=issued.refresh_expires_at,
     )
+
+
+@router.post("/logout")
+async def logout(
+    request: Request,
+    response: Response,
+    sessions: SessionServiceDep,
+) -> dict[str, bool]:
+    """Revoke this device's session server-side, then drop both cookies.
+
+    Clearing cookies alone would leave a live refresh token in the database that anyone
+    holding a copy could still redeem, which is exactly what "log out" is supposed to
+    prevent. Always answers 200: an unknown or already-dead token still ends with the
+    caller signed out, and a 401 here would only strand a client that cannot clear its
+    own HttpOnly cookies.
+    """
+    _assert_same_site(request)
+    await sessions.revoke(request.cookies.get(settings.REFRESH_COOKIE_NAME))
+    _clear_session_cookies(response)
     return {"ok": True}
+
+
+@router.post("/logout-all")
+async def logout_all(
+    request: Request,
+    response: Response,
+    user: CurrentUser,
+    sessions: SessionServiceDep,
+) -> dict[str, bool | int]:
+    """Sign out every device for the current user -- the "someone has my account" button.
+
+    Access tokens already minted stay valid until they expire (they are never checked
+    against the database), so ACCESS_TOKEN_EXPIRE_MINUTES is the true bound on how long
+    an attacker keeps read access after this. That is why it is capped at an hour.
+    """
+    _assert_same_site(request)
+    count = await sessions.revoke_all(user.id)
+    _clear_session_cookies(response)
+    return {"ok": True, "revoked": count}
+
+
+@router.get("/sessions", response_model=list[SessionRead])
+async def list_sessions(
+    request: Request,
+    user: CurrentUser,
+    sessions: SessionServiceDep,
+) -> list[SessionRead]:
+    """The current user's live sessions -- their own devices and nobody else's.
+
+    Scoped by `user.id` in the repository query, so there is no id a caller could
+    substitute. The refresh token is never part of this payload; only its row id is.
+    """
+    current_sid = _current_session_id(request)
+    return [
+        SessionRead(
+            id=row.id,
+            current=row.id == current_sid,
+            user_agent=row.user_agent,
+            ip_address=row.ip_address,
+            created_at=row.created_at,
+            last_used_at=row.last_used_at,
+            expires_at=row.expires_at,
+        )
+        for row in await sessions.list_sessions(user.id)
+    ]
+
+
+@router.delete("/sessions/{session_id}", status_code=status.HTTP_204_NO_CONTENT)
+async def revoke_session(
+    session_id: uuid.UUID,
+    request: Request,
+    user: CurrentUser,
+    sessions: SessionServiceDep,
+) -> Response:
+    """Revoke one of the caller's own sessions by id.
+
+    Ownership is enforced in the service; a session belonging to someone else is
+    reported as 404 rather than 403, so this cannot be used to test whether a given
+    session id exists.
+    """
+    _assert_same_site(request)
+    if not await sessions.revoke_one(user.id, session_id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
+    response = Response(status_code=status.HTTP_204_NO_CONTENT)
+    if session_id == _current_session_id(request):
+        _clear_session_cookies(response)
+    return response
 
 
 @router.get("/me", response_model=UserRead)

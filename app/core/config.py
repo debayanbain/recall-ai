@@ -42,7 +42,21 @@ class Settings(BaseSettings):
     SESSION_COOKIE_SAMESITE: Literal["lax", "strict", "none"] = "lax"
     SESSION_COOKIE_DOMAIN: str | None = None
     JWT_ALG: str = "HS256"
-    JWT_EXPIRE_MINUTES: int = 60 * 24 * 7  # 7 days
+    # --- Session lifetimes ---
+    # The access token is a stateless JWT: nothing checks it against the database, so a
+    # revoked session keeps working until this expires. Minutes, not days, is what keeps
+    # that window small enough to be acceptable.
+    ACCESS_TOKEN_EXPIRE_MINUTES: int = 15
+    # The refresh token is server-side and rotates on every use, so this is a *sliding*
+    # window: a user who comes back within 7 days is silently re-authenticated and gets
+    # another 7 days. Only a 7-day absence sends them back through the provider.
+    REFRESH_TOKEN_EXPIRE_DAYS: int = 7
+    # Hard ceiling on a rotation chain regardless of activity. Without it a stolen
+    # refresh token that is rotated forever is a permanent account key.
+    REFRESH_TOKEN_ABSOLUTE_DAYS: int = 90
+    # Sent only to the auth routes (Path=/api/v1/auth), never to /vault -- so an XSS on
+    # any other endpoint's response has no path that would even echo it.
+    REFRESH_COOKIE_NAME: str = "recall_refresh"
     COOKIE_SECURE: bool = False  # True behind HTTPS in prod
 
     # --- Database ---
@@ -149,15 +163,40 @@ class Settings(BaseSettings):
     GEMINI_EMBED_MODEL: str = "text-embedding-004"
     EMBEDDING_DIM: int = 1536
 
-    # --- Storage (Cloudflare R2, S3-compatible) ---
-    R2_ACCOUNT_ID: str = ""
-    R2_ACCESS_KEY_ID: str = ""
-    R2_SECRET_ACCESS_KEY: str = ""
-    R2_BUCKET: str = "recall-ai"
-    R2_PUBLIC_URL: str = ""
+    # --- Storage (Backblaze B2, S3-compatible) ---
+    # The bucket is PRIVATE. There is no public-URL setting on purpose: downloads are
+    # short-lived presigned GETs minted per request, after the row's owner is checked.
+    # Endpoint and region come from the bucket page in the B2 console and must match --
+    # the region is the `004` in `s3.us-west-004.backblazeb2.com`.
+    B2_ENDPOINT_URL: str = "https://s3.us-west-004.backblazeb2.com"
+    B2_REGION: str = "us-west-004"
+    B2_BUCKET: str = ""
+    # An *application key* scoped to this one bucket, never the master key: the master
+    # key can create and delete buckets, and it cannot be scoped or rotated per service.
+    B2_KEY_ID: str = ""
+    B2_APPLICATION_KEY: str = ""
+    # Hard ceiling on one upload. Enforced by reading one byte past it, not by trusting
+    # Content-Length, which the client writes.
+    MAX_UPLOAD_MB: int = 25
+    # Download links are minted on demand, so they only have to outlive the click.
+    DOWNLOAD_LINK_TTL_SECONDS: int = 300
 
     # --- Rate limiting ---
     RATE_LIMIT_PER_MINUTE: int = 60
+
+    # --- Centralized log files (development only) ---
+    # In dev every structlog event from the API, the worker and beat is appended as a
+    # JSON line under LOG_DIR -- one file per source per day -- so three processes share
+    # one greppable place and `request_id` correlates a request across all of them.
+    # Nothing is written outside ENV=dev (see `file_logging_enabled`): a deployed
+    # container's filesystem is ephemeral and unmonitored, so files there would be a PII
+    # spill nobody reads. stdout remains the transport everywhere.
+    LOG_DIR: str = "logs"
+    LOG_FILES_ENABLED: bool = True
+    LOG_FILE_LEVEL: Literal["debug", "info", "warning", "error", "critical"] = "info"
+    # Retention: the sink deletes `<source>-<date>.jsonl` files older than this when it
+    # rolls over to a new day, so it holds with no worker and no beat running.
+    LOG_RETENTION_DAYS: int = 15
 
     @property
     def enabled_oauth_providers(self) -> list[str]:
@@ -168,6 +207,30 @@ class Settings(BaseSettings):
             ("instagram", self.INSTAGRAM_APP_ID, self.INSTAGRAM_APP_SECRET),
         ]
         return [name for name, client_id, secret in pairs if client_id and secret]
+
+    @property
+    def storage_enabled(self) -> bool:
+        """True only when every B2 credential is present.
+
+        All-or-nothing: a half-configured bucket would fail at upload time with a provider
+        error instead of the API simply reporting that uploads are unavailable.
+        """
+        return bool(
+            self.B2_BUCKET
+            and self.B2_KEY_ID
+            and self.B2_APPLICATION_KEY
+            and self.B2_ENDPOINT_URL
+        )
+
+    @property
+    def file_logging_enabled(self) -> bool:
+        """Log files are a development affordance, gated on the environment itself.
+
+        Hard-gated rather than merely defaulted off: `LOG_FILES_ENABLED=true` in a
+        deployed environment must not start writing user request trails to a disk that
+        nobody rotates, backs up or reads.
+        """
+        return self.ENV == "dev" and self.LOG_FILES_ENABLED
 
     @property
     def docs_enabled(self) -> bool:
@@ -193,8 +256,52 @@ def validate_deployment_config(config: Settings) -> None:
     ValidationError, which would spill live secrets from the environment into crash logs.
     Nothing below interpolates the key itself -- only its length.
     """
+    # Checked in every environment: a zero or negative retention makes the purge task
+    # delete rows it has just written, which looks like "logging is broken".
+    if config.LOG_RETENTION_DAYS < 1:
+        raise RuntimeError(
+            f"LOG_RETENTION_DAYS must be >= 1 (got {config.LOG_RETENTION_DAYS})."
+        )
+
+    # A refresh window shorter than the access token makes the access cookie outlive the
+    # credential that renews it: sessions would die at random points inside their window.
+    if config.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 60 <= config.ACCESS_TOKEN_EXPIRE_MINUTES:
+        raise RuntimeError(
+            "REFRESH_TOKEN_EXPIRE_DAYS must exceed ACCESS_TOKEN_EXPIRE_MINUTES "
+            f"(got {config.REFRESH_TOKEN_EXPIRE_DAYS}d vs "
+            f"{config.ACCESS_TOKEN_EXPIRE_MINUTES}m)."
+        )
+    if config.REFRESH_TOKEN_ABSOLUTE_DAYS < config.REFRESH_TOKEN_EXPIRE_DAYS:
+        raise RuntimeError(
+            "REFRESH_TOKEN_ABSOLUTE_DAYS must be >= REFRESH_TOKEN_EXPIRE_DAYS "
+            f"(got {config.REFRESH_TOKEN_ABSOLUTE_DAYS} vs "
+            f"{config.REFRESH_TOKEN_EXPIRE_DAYS})."
+        )
+
+    # Partial storage config is refused rather than silently disabling uploads: a deploy
+    # that sets two of the three values means to have a bucket, and finding out at the
+    # first user upload is worse than finding out at boot.
+    b2_values = (config.B2_BUCKET, config.B2_KEY_ID, config.B2_APPLICATION_KEY)
+    if any(b2_values) and not all(b2_values):
+        missing = [
+            name
+            for name, value in zip(
+                ("B2_BUCKET", "B2_KEY_ID", "B2_APPLICATION_KEY"), b2_values, strict=True
+            )
+            if not value
+        ]
+        raise RuntimeError(f"Backblaze storage is partly configured; missing: {missing}")
+
     if config.ENV == "dev":
         return
+    # A long-lived access token is a revocation hole: nothing consults the database while
+    # it is valid, so "sign out everywhere" would not take effect for its whole lifetime.
+    if config.ACCESS_TOKEN_EXPIRE_MINUTES > 60:
+        raise RuntimeError(
+            f"ACCESS_TOKEN_EXPIRE_MINUTES must be <= 60 when ENV={config.ENV} (got "
+            f"{config.ACCESS_TOKEN_EXPIRE_MINUTES}); revocation only takes effect when "
+            "the access token expires."
+        )
     if config.SECRET_KEY == DEFAULT_SECRET_KEY:
         raise RuntimeError(
             f"SECRET_KEY is still the built-in placeholder but ENV={config.ENV}. "

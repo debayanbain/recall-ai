@@ -18,6 +18,9 @@ class ContentType(StrEnum):
     youtube = "youtube"
     article = "article"
     pdf = "pdf"
+    # Any uploaded file that is not a PDF: docx, xlsx, csv, txt, ... Kept distinct from
+    # `pdf` because the pipeline can read a PDF's text and cannot read a .docx's.
+    document = "document"
     note = "note"
     instagram = "instagram"
     facebook = "facebook"

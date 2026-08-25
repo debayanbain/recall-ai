@@ -5,22 +5,26 @@ import uuid
 from typing import Annotated
 
 import jwt
+import structlog
 from fastapi import Cookie, Depends, HTTPException, status
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.core.config import settings
-from app.core.security import decode_session_token
+from app.core.security import decode_access_token
 from app.db.session import get_session
 from app.models.user import User
 from app.repositories.collection import CollectionRepository
 from app.repositories.instagram_account import InstagramAccountRepository
 from app.repositories.oauth_account import OAuthAccountRepository
 from app.repositories.user import UserRepository
+from app.repositories.user_session import UserSessionRepository
 from app.repositories.vault import VaultRepository
 from app.services.auth_service import AuthService
 from app.services.collection_service import CollectionService
 from app.services.instagram_service import InstagramService
+from app.services.session_service import SessionService
 from app.services.vault_service import VaultService
+from app.storage import get_storage
 
 SessionDep = Annotated[AsyncSession, Depends(get_session)]
 
@@ -32,22 +36,40 @@ async def get_current_user(
     if not token:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
     try:
-        payload = decode_session_token(token)
+        payload = decode_access_token(token)
         user_id = uuid.UUID(payload["sub"])
+    except jwt.ExpiredSignatureError as exc:
+        # Distinguished from every other failure on purpose: this is the one case where
+        # the client should silently POST /auth/refresh and retry, and it is not a
+        # security signal (the signature was valid). Any *other* JWT failure means a
+        # forged or malformed token and gets the flat message below.
+        raise HTTPException(
+            status.HTTP_401_UNAUTHORIZED,
+            "Session expired",
+            headers={"WWW-Authenticate": 'Bearer error="invalid_token"'},
+        ) from exc
     except (jwt.PyJWTError, KeyError, ValueError) as exc:
         raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid session") from exc
 
     user = await UserRepository(session).get(user_id)
-    if user is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "User not found")
+    # A soft-deleted account keeps its row, so the deleted_at check has to happen here or
+    # a token minted before deletion would keep working until it expired.
+    if user is None or user.deleted_at is not None:
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid session")
+    # Every log line emitted for the rest of this request carries the user id, which is
+    # what makes the centralized store answerable to "what did this account do?".
+    structlog.contextvars.bind_contextvars(user_id=str(user.id))
     return user
 
 
 CurrentUser = Annotated[User, Depends(get_current_user)]
 
 
+
 def get_vault_service(session: SessionDep) -> VaultService:
-    return VaultService(VaultRepository(session))
+    # `get_storage()` returns None when no bucket is configured; the service degrades to
+    # text-only uploads rather than the API failing to start.
+    return VaultService(VaultRepository(session), get_storage())
 
 
 def get_collection_service(session: SessionDep) -> CollectionService:
@@ -62,7 +84,12 @@ def get_auth_service(session: SessionDep) -> AuthService:
     return AuthService(UserRepository(session), OAuthAccountRepository(session))
 
 
+def get_session_service(session: SessionDep) -> SessionService:
+    return SessionService(UserSessionRepository(session), UserRepository(session))
+
+
 VaultServiceDep = Annotated[VaultService, Depends(get_vault_service)]
 CollectionServiceDep = Annotated[CollectionService, Depends(get_collection_service)]
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 InstagramServiceDep = Annotated[InstagramService, Depends(get_instagram_service)]
+SessionServiceDep = Annotated[SessionService, Depends(get_session_service)]

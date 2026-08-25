@@ -50,7 +50,7 @@ Verified by reading the code, not by trusting the planner checkboxes.
    requires a consistent error envelope.
 4. ~~No deployment config guards~~ — **fixed**: `validate_deployment_config` refuses non-dev boot
    on a weak `SECRET_KEY`, `COOKIE_SECURE=false`, or wildcard/plaintext/local `CORS_ORIGINS`;
-   docs routes are withheld when `ENV=prod`. 25 tests in `tests/test_config_guards.py`.
+   docs routes are withheld when `ENV=prod`. 25 tests in `tests/core/test_config_guards.py`.
 5. **`ruff check` fails** — 38 pre-existing errors (28 `UP045`, 9 `E501`, 1 `I001`); 29 auto-fixable.
    `mypy` is clean and all 9 tests pass.
 

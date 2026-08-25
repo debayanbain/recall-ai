@@ -6,10 +6,12 @@ from app.models.instagram_account import InstagramAccount
 from app.models.oauth_account import OAuthAccount
 from app.models.subscription import Subscription
 from app.models.user import User
+from app.models.user_session import UserSession
 from app.models.vault import VaultChunk, VaultItem
 
 __all__ = [
     "User",
+    "UserSession",
     "OAuthAccount",
     "InstagramAccount",
     "ExtractionRun",

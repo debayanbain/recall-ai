@@ -6,7 +6,18 @@ from datetime import datetime
 from typing import Any, Optional
 
 from pgvector.sqlalchemy import Vector
-from sqlalchemy import Column, DateTime, ForeignKey, Index, Integer, Text, UniqueConstraint, func, text
+from sqlalchemy import (
+    BigInteger,
+    Column,
+    DateTime,
+    ForeignKey,
+    Index,
+    Integer,
+    Text,
+    UniqueConstraint,
+    func,
+    text,
+)
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlmodel import Field, SQLModel
 
@@ -35,6 +46,17 @@ class VaultItem(SQLModel, table=True):
     content: Optional[str] = None
     thumbnail_url: Optional[str] = None
     language: Optional[str] = None
+
+    # --- uploaded file (Backblaze B2) ---
+    # The object key inside the private bucket. Never returned to the browser: access is
+    # a presigned URL minted per request, so the key itself grants nothing and exposing
+    # it only advertises the bucket's layout.
+    storage_key: Optional[str] = Field(default=None, max_length=512)
+    #: Sanitized original name, for display and the download's Content-Disposition.
+    file_name: Optional[str] = Field(default=None, max_length=255)
+    file_size: Optional[int] = Field(default=None, sa_column=Column(BigInteger, nullable=True))
+    #: The type *we* determined from the bytes, not the one the browser claimed.
+    mime_type: Optional[str] = Field(default=None, max_length=128)
 
     item_metadata: dict[str, Any] = Field(
         default_factory=dict,

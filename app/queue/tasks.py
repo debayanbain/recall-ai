@@ -20,7 +20,9 @@ from app.repositories.vault import VaultRepository
 from app.services.apify import get_run
 from app.services.processing_service import ProcessingService
 
-configure_logging()
+# The worker overrides this from `worker_process_init` (see celery_app.py); this call
+# covers module import and any process that imports tasks without those signals.
+configure_logging(source="worker")
 log = get_logger("tasks")
 
 #: Apify run statuses that mean "there is a dataset to read".
@@ -169,3 +171,31 @@ async def _sweep_stale_runs() -> int:
         await session.commit()
         log.info("sweep_completed", checked=len(stale), rescued=rescued)
         return rescued
+
+
+@celery_app.task(name="app.queue.tasks.purge_expired_sessions")
+def purge_expired_sessions() -> int:
+    """Beat task: delete refresh-session rows that can no longer prove anything.
+
+    Rotation writes a row per refresh, so an active user accumulates one every
+    ACCESS_TOKEN_EXPIRE_MINUTES. Rows are kept past revocation on purpose -- that is what
+    makes a replayed token detectable -- but once a row is expired it can neither be
+    redeemed nor tell us anything, so it is only table growth.
+
+    Deletes strictly by `expires_at`, never by `revoked_at`: a revoked-but-unexpired row
+    is exactly the evidence the reuse check needs.
+    """
+    return asyncio.run(_purge_expired_sessions())
+
+
+async def _purge_expired_sessions() -> int:
+    from datetime import UTC, datetime
+
+    from app.repositories.user_session import UserSessionRepository
+
+    async with task_session() as session:
+        deleted = await UserSessionRepository(session).delete_expired(datetime.now(UTC))
+        await session.commit()
+        if deleted:
+            log.info("sessions_purged", deleted=deleted)
+        return deleted

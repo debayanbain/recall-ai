@@ -10,8 +10,9 @@ from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoin
 from starlette.types import ASGIApp
 
 from app.core.config import settings
+from app.core.logging import get_logger
 
-log = structlog.get_logger("http")
+log = get_logger("http")
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):

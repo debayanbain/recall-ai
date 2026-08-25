@@ -7,14 +7,17 @@ from typing import Annotated
 from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile, status
 
 from app.api.deps import CurrentUser, VaultServiceDep
+from app.core.config import settings
 from app.schemas.vault import (
     CreateNoteRequest,
+    FileLinkResponse,
     SaveUrlRequest,
     VaultItemDetail,
     VaultItemRead,
     VaultListResponse,
 )
-from app.services.pdf import MAX_UPLOAD_BYTES, PdfError
+from app.services.documents import DocumentError, allowed_extensions, max_upload_bytes
+from app.storage import StorageError
 
 router = APIRouter(prefix="/vault", tags=["vault"])
 
@@ -46,28 +49,43 @@ async def save_note(
 
 
 @router.post("/upload", response_model=VaultItemRead, status_code=status.HTTP_201_CREATED)
-async def upload_pdf(
+async def upload_document(
     user: CurrentUser,
     service: VaultServiceDep,
     file: Annotated[UploadFile, File()],
 ) -> VaultItemRead:
-    """Accept a PDF, keep its text, discard the file.
+    """Store an uploaded document in the bucket; index its text when it has any.
 
     Read with an explicit cap rather than trusting `file.size`: the client controls the
-    Content-Length header, so a small declared size can still stream a large body.
+    Content-Length header, so a small declared size can still stream a large body. The
+    file type is decided from the bytes inside `services/documents.py`, never from the
+    filename or the browser's Content-Type.
     """
-    data = await file.read(MAX_UPLOAD_BYTES + 1)
-    if len(data) > MAX_UPLOAD_BYTES:
+    limit = max_upload_bytes()
+    data = await file.read(limit + 1)
+    if len(data) > limit:
         raise HTTPException(
-            status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-            f"PDFs must be under {MAX_UPLOAD_BYTES // 1_048_576}MB.",
+            status.HTTP_413_CONTENT_TOO_LARGE,
+            f"Files must be under {limit // 1_048_576}MB.",
         )
     try:
-        item = await service.save_pdf(user.id, data, file.filename)
-    except PdfError as exc:
-        # These messages are written for humans and contain nothing from the file itself.
-        raise HTTPException(status.HTTP_422_UNPROCESSABLE_ENTITY, str(exc)) from None
+        item = await service.save_document(user.id, data, file.filename)
+    except DocumentError as exc:
+        # These messages are written for humans and quote nothing from the file itself.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
+    except StorageError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
     return VaultItemRead.model_validate(item)
+
+
+@router.get("/uploads/limits")
+async def upload_limits(user: CurrentUser) -> dict[str, object]:
+    """What the client may send, so the picker can filter before a 25MB round-trip."""
+    return {
+        "max_bytes": max_upload_bytes(),
+        "extensions": allowed_extensions(),
+        "storage_enabled": settings.storage_enabled,
+    }
 
 
 @router.get("", response_model=VaultListResponse)
@@ -94,6 +112,34 @@ async def get_item(
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
     return VaultItemDetail.model_validate(item)
+
+
+@router.get("/{item_id}/file", response_model=FileLinkResponse)
+async def get_item_file(
+    item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep, response: Response
+) -> FileLinkResponse:
+    """Mint a short-lived download URL for this item's stored file.
+
+    404 covers "no such item", "not yours" and "has no file" alike -- the repository
+    scopes on `user_id`, so another account's id is indistinguishable from a missing one
+    and the endpoint cannot be used to probe which ids exist.
+    """
+    try:
+        link = await service.file_link(item_id, user.id)
+    except StorageError as exc:
+        raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
+    if link is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "No file for this item")
+    url, item = link
+    # The URL is a bearer credential until it expires: keep it out of shared caches.
+    response.headers["Cache-Control"] = "no-store"
+    return FileLinkResponse(
+        url=url,
+        expires_in=settings.DOWNLOAD_LINK_TTL_SECONDS,
+        file_name=item.file_name,
+        file_size=item.file_size,
+        mime_type=item.mime_type,
+    )
 
 
 @router.delete("/{item_id}", status_code=status.HTTP_204_NO_CONTENT)

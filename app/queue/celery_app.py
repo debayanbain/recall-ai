@@ -6,10 +6,14 @@ through `task_session()` and its NullPool rather than the shared engine.
 """
 from __future__ import annotations
 
+from typing import Any
+
 from celery import Celery
 from celery.schedules import crontab
+from celery.signals import beat_init, worker_process_init, worker_process_shutdown
 
 from app.core.config import settings
+from app.core.logging import configure_logging, start_log_sink, stop_log_sink
 
 celery_app = Celery(
     "recall",
@@ -38,5 +42,32 @@ celery_app.conf.update(
             "task": "app.queue.tasks.sweep_stale_runs",
             "schedule": crontab(minute="*/5"),
         },
+        # Expired sessions are dead weight, not evidence: once a row is past its
+        # expiry it can neither be redeemed nor prove a replay. Daily is plenty --
+        # nothing depends on the cleanup being timely.
+        "purge-expired-sessions": {
+            "task": "app.queue.tasks.purge_expired_sessions",
+            "schedule": crontab(hour="4", minute="15"),
+        },
     },
 )
+
+
+# Per child process, not at import: prefork forks *after* this module loads, and an fd
+# inherited across fork would have every child appending through one shared file offset.
+# In dev this is what puts the worker's events in logs/worker-<date>.jsonl.
+@worker_process_init.connect
+def _start_worker_log_sink(**_kwargs: Any) -> None:
+    configure_logging(source="worker")
+    start_log_sink()
+
+
+@worker_process_shutdown.connect
+def _stop_worker_log_sink(**_kwargs: Any) -> None:
+    stop_log_sink()
+
+
+@beat_init.connect
+def _start_beat_log_sink(**_kwargs: Any) -> None:
+    configure_logging(source="beat")
+    start_log_sink()

@@ -56,7 +56,7 @@ ignore_missing_imports = true
 # Celery ships no type information, so every @celery_app.task is an untyped decorator.
 # Scoped to the one module that defines tasks rather than relaxing strict globally.
 [[tool.mypy.overrides]]
-module = "app.queue.tasks"
+module = ["app.queue.tasks", "app.queue.celery_app"]
 disallow_untyped_decorators = false
 
 [tool.pytest.ini_options]

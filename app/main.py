@@ -13,7 +13,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.api.health import router as health_router
 from app.api.v1.router import api_router
 from app.core.config import settings
-from app.core.logging import configure_logging, get_logger
+from app.core.logging import (
+    configure_logging,
+    get_logger,
+    start_log_sink,
+    stop_log_sink,
+)
 from app.core.middleware import (
     RateLimitMiddleware,
     RequestContextMiddleware,
@@ -26,7 +31,9 @@ log = get_logger("app")
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
-    configure_logging()
+    configure_logging(source="api")
+    # Opens logs/api-<date>.jsonl and prunes expired files. No-op outside ENV=dev.
+    start_log_sink()
     startup: dict[str, str] = {"env": settings.ENV}
     if app.docs_url and app.openapi_url:
         base = settings.BACKEND_URL.rstrip("/")
@@ -38,6 +45,8 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     yield
     await close_pool()
     log.info("shutdown")
+    # Last thing: the line above is written before the file is closed.
+    stop_log_sink()
 
 
 def create_app() -> FastAPI:
