@@ -5,6 +5,7 @@ from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.instagram_account import InstagramAccount
 from app.models.oauth_account import OAuthAccount
 from app.models.subscription import Subscription
+from app.models.telegram import TelegramAccount, TelegramLinkToken
 from app.models.user import User
 from app.models.user_session import UserSession
 from app.models.vault import VaultChunk, VaultItem
@@ -14,6 +15,8 @@ __all__ = [
     "UserSession",
     "OAuthAccount",
     "InstagramAccount",
+    "TelegramAccount",
+    "TelegramLinkToken",
     "ExtractionRun",
     "RunStatus",
     "VaultItem",

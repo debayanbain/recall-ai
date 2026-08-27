@@ -75,6 +75,14 @@ class _AI:
     async def generate_category(self, _t: str) -> str:
         return "Education"
 
+    async def generate_label(self, _t: str) -> str:
+        return "a distinctive label"
+
+    async def generate_highlights(self, t: str) -> list[str]:
+        # Verbatim on purpose: the service filters out anything not present in the text,
+        # so a stub returning invented prose would silently store nothing.
+        return [t[:60]]
+
     async def generate_embedding(self, _t: str) -> list[float]:
         return [0.0] * 1536
 

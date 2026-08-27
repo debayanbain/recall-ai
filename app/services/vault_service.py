@@ -6,15 +6,18 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
+from datetime import datetime
+from typing import Any
 
+from app.ai.spans import keep_verbatim
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.urls import canonical_url
-from app.models.base import ContentType, ProcessingStatus
+from app.models.base import ContentType, ProcessingStatus, utcnow
 from app.models.vault import VaultItem
 from app.queue.client import enqueue_process_item
 from app.repositories.vault import VaultRepository
-from app.services import documents
+from app.services import documents, editor_doc
 from app.services.documents import DocumentError
 from app.storage import ObjectStorage
 
@@ -29,9 +32,20 @@ class VaultService:
         self.storage = storage
 
     async def save_url(
-        self, user_id: uuid.UUID, url: str, title: str | None = None
+        self,
+        user_id: uuid.UUID,
+        url: str,
+        title: str | None = None,
+        *,
+        enqueue: bool = True,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> tuple[VaultItem, bool]:
         """Save a URL. Returns (item, created) — `created` is False for a duplicate.
+
+        `enqueue=False` is for callers that own their own transaction and must commit
+        before the worker can see the row -- see `_enqueue` for the race that avoids.
+        `extra_metadata` records where the save came from; a duplicate keeps the metadata
+        of the original capture rather than being relabelled by the second one.
 
         Re-saving a link someone already has is almost always an accident (a second
         share, a re-paste), and each one otherwise costs another paid scrape and another
@@ -51,15 +65,23 @@ class VaultService:
             type=ContentType.article,  # refined by worker via extractor detection
             source_url=canonical,
             title=title,
+            item_metadata=dict(extra_metadata or {}),
             processing_status=ProcessingStatus.pending,
         )
         item = await self.repo.add(item)
-        await self._enqueue(item)
+        if enqueue:
+            await self._enqueue(item)
         log.info("vault_url_saved", item_id=str(item.id), user_id=str(user_id))
         return item, True
 
     async def save_document(
-        self, user_id: uuid.UUID, data: bytes, filename: str | None
+        self,
+        user_id: uuid.UUID,
+        data: bytes,
+        filename: str | None,
+        *,
+        enqueue: bool = True,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> VaultItem:
         """Store an uploaded file in the bucket and index whatever text it carries.
 
@@ -75,6 +97,7 @@ class VaultService:
         """
         document = documents.inspect(data, filename)
         text, meta = documents.extract_text(document)
+        meta.update(extra_metadata or {})
 
         item = VaultItem(
             user_id=user_id,
@@ -104,7 +127,7 @@ class VaultService:
             )
 
         item = await self.repo.add(item)
-        if text:
+        if text and enqueue:
             await self._enqueue(item)
 
         log.info(
@@ -172,23 +195,108 @@ class VaultService:
 
 
     async def create_note(
-        self, user_id: uuid.UUID, title: str, content: str
+        self,
+        user_id: uuid.UUID,
+        title: str,
+        content: str,
+        *,
+        enqueue: bool = True,
+        extra_metadata: dict[str, Any] | None = None,
     ) -> VaultItem:
         item = VaultItem(
             user_id=user_id,
             type=ContentType.note,
             title=title,
             content=content,
+            item_metadata=dict(extra_metadata or {}),
             processing_status=ProcessingStatus.pending,
         )
         item = await self.repo.add(item)
-        await self._enqueue(item)  # AI still summarizes/tags/embeds notes
+        if enqueue:
+            await self._enqueue(item)  # AI still summarizes/tags/embeds notes
+        return item
+
+    async def update_content(
+        self,
+        item_id: uuid.UUID,
+        user_id: uuid.UUID,
+        blocks: list[dict[str, Any]],
+    ) -> VaultItem | None:
+        """Replace an item's body with what the user typed. Returns None when not theirs.
+
+        Ownership is the repository's `get` (scoped on `user_id`), so another account's
+        id is indistinguishable from one that does not exist and the route answers 404
+        either way -- the endpoint cannot be used to probe which ids are real.
+
+        Three things move together and the reasons differ:
+
+        * `content` is replaced outright. That is what the user asked for; the previous
+          extraction is not kept, since a memory with two bodies has no answer to "what
+          does this say".
+        * `ai_highlights` are re-checked against the new text. They are stored as
+          verbatim quotes of `content`; after an edit some of them are quotes of a
+          paragraph that no longer exists, and a mark that cannot be located would either
+          vanish or -- worse, if the words happen to reappear -- land somewhere the model
+          never pointed.
+        * The block document is kept in `item_metadata` so reopening the editor restores
+          headings and lists. It is *derived* from the same sanitize pass as `content`,
+          never accepted as a second source of truth.
+
+        Both JSONB fields are reassigned rather than mutated: SQLAlchemy does not track
+        in-place edits to a plain JSONB value, so a mutation would flush nothing and the
+        save would silently do nothing at all.
+
+        The embedding is deliberately NOT recomputed here. Re-running the pipeline would
+        re-fetch `source_url` and overwrite the text the user just wrote, so semantic
+        search keeps ranking this item by its pre-edit body until it is reprocessed.
+        """
+        item = await self.repo.get(item_id, user_id)
+        if item is None or item.deleted_at is not None:
+            return None
+
+        document, content = editor_doc.sanitize(blocks)
+
+        item.content = content
+        item.ai_highlights = keep_verbatim(list(item.ai_highlights), content)
+        item.item_metadata = {
+            **item.item_metadata,
+            "editor_doc": document,
+            "content_edited_at": utcnow().isoformat(),
+        }
+        await self.repo.add(item)
+
+        log.info(
+            "vault_content_edited",
+            item_id=str(item.id),
+            user_id=str(user_id),
+            blocks=len(document["blocks"]),
+            chars=len(content),
+            highlights_kept=len(item.ai_highlights),
+        )
         return item
 
     async def list(
         self, user_id: uuid.UUID, limit: int, offset: int
     ) -> tuple[Sequence[VaultItem], int]:
         return await self.repo.list_for_user(user_id, limit, offset)
+
+    async def list_recent(
+        self,
+        user_id: uuid.UUID,
+        limit: int,
+        *,
+        created_after: datetime | None = None,
+        content_types: Sequence[ContentType] | None = None,
+        category: str | None = None,
+    ) -> tuple[Sequence[VaultItem], int]:
+        """Newest-first listing with optional filters, for chat-surface queries."""
+        return await self.repo.list_filtered(
+            user_id,
+            limit=limit,
+            created_after=created_after,
+            content_types=content_types,
+            category=category,
+        )
 
     async def get(self, item_id: uuid.UUID, user_id: uuid.UUID) -> VaultItem | None:
         return await self.repo.get(item_id, user_id)

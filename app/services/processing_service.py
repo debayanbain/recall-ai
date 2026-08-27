@@ -18,6 +18,7 @@ from __future__ import annotations
 import uuid
 
 from app.ai import get_ai_provider
+from app.ai.spans import keep_verbatim
 from app.core.logging import get_logger
 from app.extractors import get_extractor
 from app.extractors.base import ExtractedContent, PermanentExtractionError
@@ -161,6 +162,17 @@ class ProcessingService:
         item.summary = await self.ai.generate_summary(text)
         item.ai_tags = await self.ai.generate_tags(text)
         item.ai_category = await self.ai.generate_category(text)
+        item.ai_label = await self.ai.generate_label(text) or None
+        # Highlights index into `content` specifically, so they are only asked for when
+        # there is content to index into -- an item enriched from its title alone has
+        # nothing for the reader to mark. Each span is then checked against that text
+        # before storage: one the model paraphrased would either vanish in the UI or be
+        # shown as words the author never wrote.
+        item.ai_highlights = (
+            keep_verbatim(await self.ai.generate_highlights(item.content), item.content)
+            if item.content
+            else []
+        )
 
         embed_input = f"{item.title or ''}\n{item.summary or ''}\n{text}"
         vector = await self.ai.generate_embedding(embed_input)

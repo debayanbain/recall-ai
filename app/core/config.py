@@ -57,6 +57,10 @@ class Settings(BaseSettings):
     # Sent only to the auth routes (Path=/api/v1/auth), never to /vault -- so an XSS on
     # any other endpoint's response has no path that would even echo it.
     REFRESH_COOKIE_NAME: str = "recall_refresh"
+    #: Non-secret marker that this browser holds a refresh token. Readable by the Next
+    #: proxy so its route gate can outlive the 15-minute access cookie -- see
+    #: `_set_session_cookies`. It authorises nothing; the API still verifies the JWT.
+    SESSION_HINT_COOKIE_NAME: str = "recall_signed_in"
     COOKIE_SECURE: bool = False  # True behind HTTPS in prod
 
     # --- Database ---
@@ -131,6 +135,11 @@ class Settings(BaseSettings):
     # Configurable because the first-party actor documents `startUrls` as *page*
     # URLs; a store actor that resolves a single reel can be swapped in here.
     APIFY_FACEBOOK_ACTOR: str = "apify~facebook-reels-scraper"
+    # Off because Facebook still serves a reel's Open Graph tags to a non-browser
+    # User-Agent, and those carry the whole caption for free. Turn it on only with an
+    # actor that accepts a *single reel* URL (the first-party one walks a page), and
+    # only when comments or engagement counts are worth paying per run for.
+    FACEBOOK_USE_APIFY: bool = False
     # Kept under the worker's job_timeout (120s) so a slow scrape fails as a scrape rather
     # than as an opaque job timeout.
     APIFY_TIMEOUT_SECONDS: float = 90.0
@@ -148,6 +157,30 @@ class Settings(BaseSettings):
     APIFY_WEBHOOK_SECRET: str = ""
     # A run that has neither called back nor finished by now is swept by the beat task.
     EXTRACTION_RUN_TIMEOUT_MINUTES: int = 20
+
+    # --- Telegram capture bot ---
+    # From @BotFather. The token is the bot's whole identity: anyone holding it can read
+    # every message sent to the bot and reply as it.
+    TELEGRAM_BOT_TOKEN: str = ""
+    # Without the @. Only used to build the t.me deep link the connect page hands out.
+    TELEGRAM_BOT_USERNAME: str = ""
+    # Verified in BOTH the webhook path segment and Telegram's own
+    # X-Telegram-Bot-Api-Secret-Token header, so a leaked URL alone is not a trigger.
+    TELEGRAM_WEBHOOK_SECRET: str = ""
+    # The link token is a one-shot hand-off between two devices; it only has to outlive
+    # the walk from the browser to the phone.
+    TELEGRAM_LINK_TOKEN_TTL_MINUTES: int = 10
+    # Telegram's own ceiling for getFile is 20 MB. Asking for more fails at their API,
+    # not ours, so the limit is enforced here to give the user a real message.
+    TELEGRAM_MAX_FILE_MB: int = 20
+    # Conversation context lives in Redis, not Postgres: it is disposable, and a chat
+    # that has gone quiet for an hour should start fresh rather than resume mid-thought.
+    TELEGRAM_CHAT_HISTORY_TTL_SECONDS: int = 3600
+    TELEGRAM_RECALL_TOP_K: int = 8
+    # Per-Telegram-user hourly caps. A recall costs an embedding plus two model calls, so
+    # it is capped harder than a capture.
+    TELEGRAM_CAPTURES_PER_HOUR: int = 60
+    TELEGRAM_RECALLS_PER_HOUR: int = 20
 
     # --- AI (Gemini) ---
     AI_PROVIDER: Literal["gemini", "openai", "claude"] = "gemini"
@@ -223,6 +256,20 @@ class Settings(BaseSettings):
         )
 
     @property
+    def telegram_enabled(self) -> bool:
+        """True only when the bot token, its username and the webhook secret are all set.
+
+        All-or-nothing for the same reason as `storage_enabled`: a half-configured bot
+        would hand the user a deep link to a bot that cannot answer, or register a
+        webhook nothing can authenticate.
+        """
+        return bool(
+            self.TELEGRAM_BOT_TOKEN
+            and self.TELEGRAM_BOT_USERNAME
+            and self.TELEGRAM_WEBHOOK_SECRET
+        )
+
+    @property
     def file_logging_enabled(self) -> bool:
         """Log files are a development affordance, gated on the environment itself.
 
@@ -292,8 +339,47 @@ def validate_deployment_config(config: Settings) -> None:
         ]
         raise RuntimeError(f"Backblaze storage is partly configured; missing: {missing}")
 
+    # Same reasoning for the bot: setting the token means intending to run it, and a
+    # missing username or webhook secret only surfaces when a user taps a dead link.
+    telegram_values = (
+        config.TELEGRAM_BOT_TOKEN,
+        config.TELEGRAM_BOT_USERNAME,
+        config.TELEGRAM_WEBHOOK_SECRET,
+    )
+    if any(telegram_values) and not all(telegram_values):
+        missing = [
+            name
+            for name, value in zip(
+                (
+                    "TELEGRAM_BOT_TOKEN",
+                    "TELEGRAM_BOT_USERNAME",
+                    "TELEGRAM_WEBHOOK_SECRET",
+                ),
+                telegram_values,
+                strict=True,
+            )
+            if not value
+        ]
+        raise RuntimeError(f"Telegram is partly configured; missing: {missing}")
+
     if config.ENV == "dev":
         return
+    # The webhook path segment is the only thing standing between the public internet
+    # and a queue producer, so it gets the same length floor as SECRET_KEY. Never print
+    # the value itself -- this function exists so secrets stay out of crash logs.
+    if config.telegram_enabled and len(config.TELEGRAM_WEBHOOK_SECRET) < MIN_SECRET_KEY_LENGTH:
+        raise RuntimeError(
+            f"TELEGRAM_WEBHOOK_SECRET must be at least {MIN_SECRET_KEY_LENGTH} characters "
+            f"when ENV={config.ENV} (got {len(config.TELEGRAM_WEBHOOK_SECRET)}). "
+            "Use: openssl rand -hex 32"
+        )
+    # Telegram refuses to register a plaintext webhook, so an unset or http:// base URL
+    # fails at setWebhook with an unhelpful error rather than here.
+    if config.telegram_enabled and not config.PUBLIC_BASE_URL.startswith("https://"):
+        raise RuntimeError(
+            f"PUBLIC_BASE_URL must be an https:// URL when Telegram is enabled and "
+            f"ENV={config.ENV}; Telegram will not deliver updates to a plaintext webhook."
+        )
     # A long-lived access token is a revocation hole: nothing consults the database while
     # it is valid, so "sign out everywhere" would not take effect for its whole lifetime.
     if config.ACCESS_TOKEN_EXPIRE_MINUTES > 60:

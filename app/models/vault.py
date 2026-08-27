@@ -67,6 +67,17 @@ class VaultItem(SQLModel, table=True):
         sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")),
     )
     ai_category: Optional[str] = Field(default=None, index=True)
+    #: One short distinctive name for this memory. Tags collide by design ("jobs" belongs
+    #: to hundreds of items); this is what tells two of them apart in a list.
+    ai_label: str | None = Field(default=None, max_length=120)
+    #: Sentences copied *verbatim* out of `content`, which is what lets the UI mark them
+    #: in place. Filtered through `ai/spans.py` before storage: a span that is not in the
+    #: content cannot be highlighted, and rendering a paraphrase as a quote would invent
+    #: words the author never wrote.
+    ai_highlights: list[str] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")),
+    )
 
     processing_status: ProcessingStatus = Field(default=ProcessingStatus.pending, index=True)
     processing_error: Optional[str] = None

@@ -21,6 +21,28 @@ from app.core.log_sink import sink_processor, start_sink, stop_sink
 #: worker failures. Set by `configure_logging`.
 _source = "api"
 
+#: Third-party loggers that put a whole request URL on an INFO line.
+#:
+#: `httpx` emits `HTTP Request: POST <url> "HTTP/1.1 200 OK"` at INFO, and the Telegram
+#: Bot API carries the bot token *in the path* -- so one INFO line writes a live
+#: credential to stdout and into the terminal scrollback, defeating the care taken in
+#: `services/telegram/client.py` never to log a URL itself. `log_sink.redact` cannot
+#: catch it: it matches on key names, and this arrives as one preformatted string.
+#: botocore is here for the same reason -- a presigned B2 URL *is* the bearer credential
+#: for that object, and its debug logging prints signed URLs in full.
+#:
+#: WARNING rather than removed: a failing request still says so, it just stops narrating
+#: the successful ones. Raise an individual one temporarily if you need the trace, and
+#: do not commit it.
+_URL_LOGGING_LIBRARIES = (
+    "httpx",
+    "httpcore",
+    "botocore",
+    "boto3",
+    "s3transfer",
+    "urllib3",
+)
+
 
 def configure_logging(source: str = "api") -> None:
     """Configure structlog + stdlib logging. JSON in prod, pretty in dev.
@@ -63,6 +85,10 @@ def configure_logging(source: str = "api") -> None:
         level=logging.INFO,
         handlers=[logging.StreamHandler(sys.stdout)],
     )
+
+    # After basicConfig, which is what put the root logger at INFO in the first place.
+    for name in _URL_LOGGING_LIBRARIES:
+        logging.getLogger(name).setLevel(logging.WARNING)
 
 
 def start_log_sink() -> None:

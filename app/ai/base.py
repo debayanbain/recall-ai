@@ -14,6 +14,24 @@ class AIProvider(Protocol):
     async def generate_tags(self, text: str) -> list[str]:
         ...
 
+    async def generate_label(self, text: str) -> str:
+        """One short, distinctive name for *this* memory.
+
+        Tags are topical and collide by design ("jobs" belongs to hundreds of items);
+        this is the line that tells two saved memories apart in a list, so it names the
+        specific thing rather than the subject area.
+        """
+        ...
+
+    async def generate_highlights(self, text: str) -> list[str]:
+        """Verbatim key sentences, quoted exactly so the UI can mark them in place.
+
+        The caller drops anything that is not actually present in the source (see
+        `app.ai.spans.keep_verbatim`) — a paraphrase cannot be highlighted, and silently
+        showing one as if it were the author's words would be a fabrication.
+        """
+        ...
+
     async def generate_category(self, text: str) -> str:
         ...
 

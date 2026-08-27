@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from app.extractors.article import ArticleExtractor
 from app.extractors.base import AnyExtractor
-from app.extractors.facebook import FacebookReelExtractor
+from app.extractors.facebook import FacebookReelApifyExtractor, FacebookReelExtractor
 from app.extractors.instagram import InstagramPostExtractor, InstagramReelExtractor
 from app.extractors.youtube import YouTubeExtractor
 
@@ -15,7 +15,8 @@ _EXTRACTORS: list[AnyExtractor] = [
     YouTubeExtractor(),
     InstagramReelExtractor(),   # paid: Apify
     InstagramPostExtractor(),   # free: saved as a link, no scrape
-    FacebookReelExtractor(),    # paid: Apify
+    FacebookReelApifyExtractor(),  # paid: Apify -- claims nothing unless FACEBOOK_USE_APIFY
+    FacebookReelExtractor(),    # free: Open Graph tags off the reel page
     ArticleExtractor(),         # fallback — keep last
 ]
 

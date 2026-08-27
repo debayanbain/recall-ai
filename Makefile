@@ -1,4 +1,5 @@
-.PHONY: install migrate revision dev dev-tunnel tunnel worker beat api openapi lint typecheck test check
+.PHONY: install migrate revision dev dev-tunnel tunnel worker beat api openapi lint typecheck test check \
+	telegram-webhook telegram-webhook-info telegram-webhook-delete
 
 install:            ## sync deps incl. dev extras
 	uv sync --extra dev
@@ -70,6 +71,18 @@ api:                ## production-style API: no reload, bound to all interfaces
 
 openapi:            ## regenerate docs/openapi.{json,yaml}
 	uv run python scripts/export_openapi.py
+
+# Telegram will not deliver to a plaintext URL, so PUBLIC_BASE_URL has to be the tunnel
+# in development. The registered URL carries the webhook secret; the script never
+# prints it back.
+telegram-webhook:   ## point Telegram at PUBLIC_BASE_URL
+	uv run python scripts/telegram_webhook.py register
+
+telegram-webhook-info:   ## what Telegram currently thinks, incl. its last error
+	uv run python scripts/telegram_webhook.py info
+
+telegram-webhook-delete: ## stop delivery
+	uv run python scripts/telegram_webhook.py delete
 
 lint:
 	uv run ruff check app tests

@@ -12,11 +12,13 @@ from app.schemas.vault import (
     CreateNoteRequest,
     FileLinkResponse,
     SaveUrlRequest,
+    UpdateContentRequest,
     VaultItemDetail,
     VaultItemRead,
     VaultListResponse,
 )
 from app.services.documents import DocumentError, allowed_extensions, max_upload_bytes
+from app.services.editor_doc import EditorDocumentError
 from app.storage import StorageError
 
 router = APIRouter(prefix="/vault", tags=["vault"])
@@ -109,6 +111,33 @@ async def get_item(
     item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep
 ) -> VaultItemDetail:
     item = await service.get(item_id, user.id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+    return VaultItemDetail.model_validate(item)
+
+
+@router.patch("/{item_id}/content", response_model=VaultItemDetail)
+async def update_item_content(
+    item_id: uuid.UUID,
+    body: UpdateContentRequest,
+    user: CurrentUser,
+    service: VaultServiceDep,
+) -> VaultItemDetail:
+    """Replace this item's body with what the user wrote in the editor.
+
+    The request carries blocks and nothing else -- the plain text, the stored document
+    and the surviving highlights are all derived server-side, so the browser cannot
+    write a `content` that disagrees with the document it sent, nor touch any other
+    column by adding it to the body.
+
+    404 covers "no such item" and "not yours" alike: the repository scopes on `user_id`,
+    so a guessed id from another account is indistinguishable from a missing one.
+    """
+    try:
+        item = await service.update_content(item_id, user.id, body.blocks)
+    except EditorDocumentError as exc:
+        # Written for a human and quoting nothing back from the submitted document.
+        raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
     return VaultItemDetail.model_validate(item)

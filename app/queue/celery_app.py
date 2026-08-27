@@ -49,6 +49,12 @@ celery_app.conf.update(
             "task": "app.queue.tasks.purge_expired_sessions",
             "schedule": crontab(hour="4", minute="15"),
         },
+        # Same reasoning for Telegram link tokens: an expired one cannot be redeemed,
+        # so it is only table growth.
+        "purge-expired-telegram-tokens": {
+            "task": "app.queue.tasks.purge_expired_telegram_tokens",
+            "schedule": crontab(hour="4", minute="30"),
+        },
     },
 )
 

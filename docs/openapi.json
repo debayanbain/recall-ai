@@ -56,51 +56,55 @@
         }
       }
     },
-    "/api/v1/auth/google/login": {
+    "/api/v1/auth/providers": {
       "get": {
         "tags": [
           "auth"
         ],
-        "summary": "Google Login",
-        "description": "Kick off Google OAuth. Stores CSRF state in a short-lived cookie.",
-        "operationId": "google_login_api_v1_auth_google_login_get",
+        "summary": "List Providers",
+        "description": "Providers this deployment can actually complete a login with.\n\nThe frontend renders exactly these buttons, so a provider missing its secret is\nnever offered rather than failing after the user clicks.",
+        "operationId": "list_providers_api_v1_auth_providers_get",
         "responses": {
           "200": {
             "description": "Successful Response",
             "content": {
               "application/json": {
-                "schema": {}
+                "schema": {
+                  "$ref": "#/components/schemas/ProvidersResponse"
+                }
               }
             }
           }
         }
       }
     },
-    "/api/v1/auth/google/callback": {
+    "/api/v1/auth/{provider}/login": {
       "get": {
         "tags": [
           "auth"
         ],
-        "summary": "Google Callback",
-        "description": "Handle Google's redirect: verify state, provision user, set session.",
-        "operationId": "google_callback_api_v1_auth_google_callback_get",
+        "summary": "Oauth Login",
+        "description": "Start the OAuth dance: mint CSRF state (+ PKCE) and bounce to the provider.",
+        "operationId": "oauth_login_api_v1_auth__provider__login_get",
         "parameters": [
           {
-            "name": "code",
-            "in": "query",
+            "name": "provider",
+            "in": "path",
             "required": true,
             "schema": {
               "type": "string",
-              "title": "Code"
+              "title": "Provider"
             }
           },
           {
-            "name": "state",
+            "name": "next",
             "in": "query",
-            "required": true,
+            "required": false,
             "schema": {
               "type": "string",
-              "title": "State"
+              "maxLength": 512,
+              "default": "/vault",
+              "title": "Next"
             }
           }
         ],
@@ -126,12 +130,124 @@
         }
       }
     },
+    "/api/v1/auth/{provider}/callback": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Oauth Callback",
+        "description": "Provider redirect target: verify state, exchange the code, set the session.",
+        "operationId": "oauth_callback_api_v1_auth__provider__callback_get",
+        "parameters": [
+          {
+            "name": "provider",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Provider"
+            }
+          },
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/refresh": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Refresh Session",
+        "description": "Trade the refresh cookie for a fresh access token, and rotate the refresh token.\n\nThis is the endpoint that makes a login survive three days away: the browser still\nholds the refresh cookie, the SPA calls this on boot (or after any 401), and the user\nnever sees the provider again.\n\nEvery rejection is the same 401 with the same message. The *reason* -- unknown token,\nrevoked, expired, deleted user -- is logged and never returned: a distinguishing\nerror would tell whoever holds a stolen token whether it was ever real.",
+        "operationId": "refresh_session_api_v1_auth_refresh_post",
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RefreshResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/auth/logout": {
       "post": {
         "tags": [
           "auth"
         ],
         "summary": "Logout",
+        "description": "Revoke this device's session server-side, then drop both cookies.\n\nClearing cookies alone would leave a live refresh token in the database that anyone\nholding a copy could still redeem, which is exactly what \"log out\" is supposed to\nprevent. Always answers 200: an unknown or already-dead token still ends with the\ncaller signed out, and a 401 here would only strand a client that cannot clear its\nown HttpOnly cookies.",
         "operationId": "logout_api_v1_auth_logout_post",
         "responses": {
           "200": {
@@ -144,6 +260,174 @@
                   },
                   "type": "object",
                   "title": "Response Logout Api V1 Auth Logout Post"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/logout-all": {
+      "post": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Logout All",
+        "description": "Sign out every device for the current user -- the \"someone has my account\" button.\n\nAccess tokens already minted stay valid until they expire (they are never checked\nagainst the database), so ACCESS_TOKEN_EXPIRE_MINUTES is the true bound on how long\nan attacker keeps read access after this. That is why it is capped at an hour.",
+        "operationId": "logout_all_api_v1_auth_logout_all_post",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "anyOf": [
+                      {
+                        "type": "boolean"
+                      },
+                      {
+                        "type": "integer"
+                      }
+                    ]
+                  },
+                  "title": "Response Logout All Api V1 Auth Logout All Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sessions": {
+      "get": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "List Sessions",
+        "description": "The current user's live sessions -- their own devices and nobody else's.\n\nScoped by `user.id` in the repository query, so there is no id a caller could\nsubstitute. The refresh token is never part of this payload; only its row id is.",
+        "operationId": "list_sessions_api_v1_auth_sessions_get",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "$ref": "#/components/schemas/SessionRead"
+                  },
+                  "title": "Response List Sessions Api V1 Auth Sessions Get"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/auth/sessions/{session_id}": {
+      "delete": {
+        "tags": [
+          "auth"
+        ],
+        "summary": "Revoke Session",
+        "description": "Revoke one of the caller's own sessions by id.\n\nOwnership is enforced in the service; a session belonging to someone else is\nreported as 404 rather than 403, so this cannot be used to test whether a given\nsession id exists.",
+        "operationId": "revoke_session_api_v1_auth_sessions__session_id__delete",
+        "parameters": [
+          {
+            "name": "session_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Session Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
                 }
               }
             }
@@ -206,7 +490,7 @@
           "vault"
         ],
         "summary": "Save Url",
-        "description": "Save a URL. Returns immediately; AI runs async in the worker.",
+        "description": "Save a URL. Returns immediately; AI runs async in the worker.\n\nAnswers 200 instead of 201 when the link is already in the vault, so the client can\nsay \"already saved\" rather than implying a second copy was created.",
         "operationId": "save_url_api_v1_vault_save_post",
         "parameters": [
           {
@@ -302,6 +586,118 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/VaultItemRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vault/upload": {
+      "post": {
+        "tags": [
+          "vault"
+        ],
+        "summary": "Upload Document",
+        "description": "Store an uploaded document in the bucket; index its text when it has any.\n\nRead with an explicit cap rather than trusting `file.size`: the client controls the\nContent-Length header, so a small declared size can still stream a large body. The\nfile type is decided from the bytes inside `services/documents.py`, never from the\nfilename or the browser's Content-Type.",
+        "operationId": "upload_document_api_v1_vault_upload_post",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_document_api_v1_vault_upload_post"
+              }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultItemRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vault/uploads/limits": {
+      "get": {
+        "tags": [
+          "vault"
+        ],
+        "summary": "Upload Limits",
+        "description": "What the client may send, so the picker can filter before a 25MB round-trip.",
+        "operationId": "upload_limits_api_v1_vault_uploads_limits_get",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "title": "Response Upload Limits Api V1 Vault Uploads Limits Get"
                 }
               }
             }
@@ -486,6 +882,136 @@
         "responses": {
           "204": {
             "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vault/{item_id}/content": {
+      "patch": {
+        "tags": [
+          "vault"
+        ],
+        "summary": "Update Item Content",
+        "description": "Replace this item's body with what the user wrote in the editor.\n\nThe request carries blocks and nothing else -- the plain text, the stored document\nand the surviving highlights are all derived server-side, so the browser cannot\nwrite a `content` that disagrees with the document it sent, nor touch any other\ncolumn by adding it to the body.\n\n404 covers \"no such item\" and \"not yours\" alike: the repository scopes on `user_id`,\nso a guessed id from another account is indistinguishable from a missing one.",
+        "operationId": "update_item_content_api_v1_vault__item_id__content_patch",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Item Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateContentRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/VaultItemDetail"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/vault/{item_id}/file": {
+      "get": {
+        "tags": [
+          "vault"
+        ],
+        "summary": "Get Item File",
+        "description": "Mint a short-lived download URL for this item's stored file.\n\n404 covers \"no such item\", \"not yours\" and \"has no file\" alike -- the repository\nscopes on `user_id`, so another account's id is indistinguishable from a missing one\nand the endpoint cannot be used to probe which ids exist.",
+        "operationId": "get_item_file_api_v1_vault__item_id__file_get",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Item Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/FileLinkResponse"
+                }
+              }
+            }
           },
           "422": {
             "description": "Validation Error",
@@ -814,6 +1340,389 @@
         }
       }
     },
+    "/api/v1/integrations/instagram": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "List Instagram",
+        "operationId": "list_instagram_api_v1_integrations_instagram_get",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/InstagramConnectionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/instagram/start": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Start Instagram",
+        "description": "Send the user to Facebook for the Instagram permission round.",
+        "operationId": "start_instagram_api_v1_integrations_instagram_start_get",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/instagram/callback": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Instagram Callback",
+        "operationId": "instagram_callback_api_v1_integrations_instagram_callback_get",
+        "parameters": [
+          {
+            "name": "code",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Code"
+            }
+          },
+          {
+            "name": "state",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "State"
+            }
+          },
+          {
+            "name": "error",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Error"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/instagram/{account_id}": {
+      "delete": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Disconnect Instagram",
+        "operationId": "disconnect_instagram_api_v1_integrations_instagram__account_id__delete",
+        "parameters": [
+          {
+            "name": "account_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Account Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/telegram": {
+      "get": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Get Telegram",
+        "operationId": "get_telegram_api_v1_integrations_telegram_get",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramConnectionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Disconnect Telegram",
+        "operationId": "disconnect_telegram_api_v1_integrations_telegram_delete",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/integrations/telegram/link": {
+      "post": {
+        "tags": [
+          "integrations"
+        ],
+        "summary": "Create Telegram Link",
+        "description": "Mint the deep link that connects this account to the bot.\n\nState-changing and cookie-authenticated, so it carries the Origin check as well as\nSameSite. The response body is a bearer credential for ten minutes -- it is never\ncached and never logged.",
+        "operationId": "create_telegram_link_api_v1_integrations_telegram_link_post",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TelegramLinkResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/public/{slug}": {
       "get": {
         "tags": [
@@ -855,6 +1764,99 @@
           }
         }
       }
+    },
+    "/api/v1/webhooks/apify/{secret}": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Apify Webhook",
+        "operationId": "apify_webhook_api_v1_webhooks_apify__secret__post",
+        "parameters": [
+          {
+            "name": "secret",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Secret"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Apify Webhook Api V1 Webhooks Apify  Secret  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/webhooks/telegram/{secret}": {
+      "post": {
+        "tags": [
+          "webhooks"
+        ],
+        "summary": "Telegram Webhook",
+        "description": "Receive one Telegram update, queue it, answer immediately.\n\nTwo independent checks, both constant-time: the shared secret in the path, and the\nsame secret echoed by Telegram in `X-Telegram-Bot-Api-Secret-Token`. The header is\nwhat makes a leaked URL -- from a proxy log, a screenshot, a browser history --\ninsufficient on its own.\n\nEverything after this returns 2xx. Telegram retries any non-2xx with the same update,\nso a 500 on one malformed message becomes an infinite redelivery loop.",
+        "operationId": "telegram_webhook_api_v1_webhooks_telegram__secret__post",
+        "parameters": [
+          {
+            "name": "secret",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Secret"
+            }
+          }
+        ],
+        "responses": {
+          "202": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "additionalProperties": {
+                    "type": "string"
+                  },
+                  "title": "Response Telegram Webhook Api V1 Webhooks Telegram  Secret  Post"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -872,6 +1874,20 @@
           "vault_item_id"
         ],
         "title": "AddItemRequest"
+      },
+      "Body_upload_document_api_v1_vault_upload_post": {
+        "properties": {
+          "file": {
+            "type": "string",
+            "contentMediaType": "application/octet-stream",
+            "title": "File"
+          }
+        },
+        "type": "object",
+        "required": [
+          "file"
+        ],
+        "title": "Body_upload_document_api_v1_vault_upload_post"
       },
       "CollectionDetail": {
         "properties": {
@@ -978,8 +1994,10 @@
           "youtube",
           "article",
           "pdf",
+          "document",
           "note",
           "instagram",
+          "facebook",
           "tiktok",
           "linkedin",
           "voice",
@@ -1038,6 +2056,58 @@
         ],
         "title": "CreateNoteRequest"
       },
+      "FileLinkResponse": {
+        "properties": {
+          "url": {
+            "type": "string",
+            "title": "Url"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "file_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Size"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
+          }
+        },
+        "type": "object",
+        "required": [
+          "url",
+          "expires_in"
+        ],
+        "title": "FileLinkResponse",
+        "description": "A short-lived download URL for an uploaded file.\n\nMinted per request and never stored. Treat it as a credential: it carries its own\nsignature, so anyone holding it can fetch the object until it expires."
+      },
       "HTTPValidationError": {
         "properties": {
           "detail": {
@@ -1050,6 +2120,136 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "InstagramAccountRead": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "instagram_user_id": {
+            "type": "string",
+            "title": "Instagram User Id"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Name"
+          },
+          "profile_picture_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Profile Picture Url"
+          },
+          "page_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Page Name"
+          },
+          "token_expires_at": {
+            "anyOf": [
+              {
+                "type": "string",
+                "format": "date-time"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Token Expires At"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "instagram_user_id",
+          "username",
+          "name",
+          "profile_picture_url",
+          "page_name",
+          "token_expires_at",
+          "created_at"
+        ],
+        "title": "InstagramAccountRead"
+      },
+      "InstagramConnectionsResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "accounts": {
+            "items": {
+              "$ref": "#/components/schemas/InstagramAccountRead"
+            },
+            "type": "array",
+            "title": "Accounts"
+          }
+        },
+        "type": "object",
+        "required": [
+          "available",
+          "accounts"
+        ],
+        "title": "InstagramConnectionsResponse"
+      },
+      "OAuthProviderInfo": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "title": "Id"
+          },
+          "label": {
+            "type": "string",
+            "title": "Label"
+          },
+          "login_url": {
+            "type": "string",
+            "title": "Login Url"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "label",
+          "login_url"
+        ],
+        "title": "OAuthProviderInfo"
       },
       "Plan": {
         "type": "string",
@@ -1070,6 +2270,22 @@
           "skipped"
         ],
         "title": "ProcessingStatus"
+      },
+      "ProvidersResponse": {
+        "properties": {
+          "providers": {
+            "items": {
+              "$ref": "#/components/schemas/OAuthProviderInfo"
+            },
+            "type": "array",
+            "title": "Providers"
+          }
+        },
+        "type": "object",
+        "required": [
+          "providers"
+        ],
+        "title": "ProvidersResponse"
       },
       "PublicCollection": {
         "properties": {
@@ -1104,6 +2320,31 @@
         ],
         "title": "PublicCollection"
       },
+      "RefreshResponse": {
+        "properties": {
+          "ok": {
+            "type": "boolean",
+            "title": "Ok",
+            "default": true
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "refresh_expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Refresh Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "expires_in",
+          "refresh_expires_at"
+        ],
+        "title": "RefreshResponse",
+        "description": "Answer to POST /auth/refresh. The tokens themselves travel as HttpOnly cookies and\ndeliberately never appear in a body -- a body is readable by script, a cookie is not.\n\n`expires_in` lets the SPA schedule a refresh slightly before the access token dies\ninstead of discovering it through a failed request."
+      },
       "SaveUrlRequest": {
         "properties": {
           "url": {
@@ -1131,6 +2372,190 @@
         ],
         "title": "SaveUrlRequest"
       },
+      "SessionRead": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "current": {
+            "type": "boolean",
+            "title": "Current",
+            "default": false
+          },
+          "user_agent": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "User Agent"
+          },
+          "ip_address": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ip Address"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "last_used_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Last Used At"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "created_at",
+          "last_used_at",
+          "expires_at"
+        ],
+        "title": "SessionRead",
+        "description": "One live device in the user's own session list.\n\nCarries no credential: `id` is a row id whose only power is `DELETE /auth/sessions/\n{id}`, and that is ownership-checked."
+      },
+      "TelegramAccountRead": {
+        "properties": {
+          "telegram_user_id": {
+            "type": "string",
+            "title": "Telegram User Id"
+          },
+          "username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Username"
+          },
+          "first_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "First Name"
+          },
+          "linked_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Linked At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "telegram_user_id",
+          "username",
+          "first_name",
+          "linked_at"
+        ],
+        "title": "TelegramAccountRead"
+      },
+      "TelegramConnectionResponse": {
+        "properties": {
+          "available": {
+            "type": "boolean",
+            "title": "Available"
+          },
+          "bot_username": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Bot Username"
+          },
+          "account": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TelegramAccountRead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "available",
+          "bot_username",
+          "account"
+        ],
+        "title": "TelegramConnectionResponse",
+        "description": "`available` mirrors InstagramConnectionsResponse: the server may have no bot."
+      },
+      "TelegramLinkResponse": {
+        "properties": {
+          "deep_link": {
+            "type": "string",
+            "title": "Deep Link"
+          },
+          "expires_in": {
+            "type": "integer",
+            "title": "Expires In"
+          },
+          "expires_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Expires At"
+          }
+        },
+        "type": "object",
+        "required": [
+          "deep_link",
+          "expires_in",
+          "expires_at"
+        ],
+        "title": "TelegramLinkResponse",
+        "description": "A freshly minted, single-use deep link. Shown once and never stored client-side."
+      },
+      "UpdateContentRequest": {
+        "properties": {
+          "blocks": {
+            "items": {
+              "additionalProperties": true,
+              "type": "object"
+            },
+            "type": "array",
+            "maxItems": 500,
+            "title": "Blocks"
+          }
+        },
+        "type": "object",
+        "required": [
+          "blocks"
+        ],
+        "title": "UpdateContentRequest",
+        "description": "A manual rewrite of an item's body, as EditorJS blocks.\n\nDeliberately the *only* thing this endpoint accepts. Taking the whole item and\ncopying fields across would let a caller set `ai_category`, `processing_status` or\n`user_id` by adding them to the body; there is nothing here to overpost with.\n\nThe plain text is derived from the blocks server-side rather than sent alongside\nthem, so `content` and the stored document can never disagree about what the user\nactually wrote."
+      },
       "UserRead": {
         "properties": {
           "id": {
@@ -1142,6 +2567,11 @@
             "type": "string",
             "format": "email",
             "title": "Email"
+          },
+          "email_verified": {
+            "type": "boolean",
+            "title": "Email Verified",
+            "default": false
           },
           "name": {
             "anyOf": [
@@ -1167,6 +2597,13 @@
           },
           "plan": {
             "$ref": "#/components/schemas/Plan"
+          },
+          "linked_providers": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Linked Providers"
           }
         },
         "type": "object",
@@ -1291,6 +2728,17 @@
             ],
             "title": "Ai Category"
           },
+          "ai_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Label"
+          },
           "processing_status": {
             "$ref": "#/components/schemas/ProcessingStatus"
           },
@@ -1298,6 +2746,39 @@
             "type": "string",
             "format": "date-time",
             "title": "Created At"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "file_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Size"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
           },
           "content": {
             "anyOf": [
@@ -1309,6 +2790,13 @@
               }
             ],
             "title": "Content"
+          },
+          "ai_highlights": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array",
+            "title": "Ai Highlights"
           },
           "item_metadata": {
             "additionalProperties": true,
@@ -1404,6 +2892,17 @@
             ],
             "title": "Ai Category"
           },
+          "ai_label": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Label"
+          },
           "processing_status": {
             "$ref": "#/components/schemas/ProcessingStatus"
           },
@@ -1411,6 +2910,39 @@
             "type": "string",
             "format": "date-time",
             "title": "Created At"
+          },
+          "file_name": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Name"
+          },
+          "file_size": {
+            "anyOf": [
+              {
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "File Size"
+          },
+          "mime_type": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mime Type"
           }
         },
         "type": "object",

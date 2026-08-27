@@ -35,6 +35,10 @@ ACCESS_TOKEN_TYPE = "access"
 # 48 bytes -> 64 url-safe chars. Far past any brute-force reach, and short enough to sit
 # in a cookie without crowding the 4 KB budget.
 _REFRESH_TOKEN_BYTES = 48
+# Telegram caps a /start deep-link payload at 64 characters and allows only
+# [A-Za-z0-9_-]; token_urlsafe(32) is 43 of exactly those characters. 48 bytes would be
+# 64 and leave no margin, which is why this is not simply _REFRESH_TOKEN_BYTES.
+_LINK_TOKEN_BYTES = 32
 
 
 def create_access_token(
@@ -93,5 +97,23 @@ def hash_refresh_token(token: str) -> str:
 
     A database dump therefore yields no usable session credential -- the same reason
     passwords are never stored raw.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_link_token() -> str:
+    """A fresh account-linking token, sized to fit a Telegram /start payload.
+
+    Handed to the browser once, inside a deep link, and never stored raw.
+    """
+    return secrets.token_urlsafe(_LINK_TOKEN_BYTES)
+
+
+def hash_link_token(token: str) -> str:
+    """Digest stored in `telegram_link_tokens.token_hash`.
+
+    Separate from `hash_refresh_token` despite the identical algorithm: these are
+    different credentials with different lifetimes, and a shared helper is how one of
+    them quietly inherits a change meant for the other.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()

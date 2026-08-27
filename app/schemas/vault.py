@@ -8,6 +8,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, HttpUrl
 
 from app.models.base import ContentType, ProcessingStatus
+from app.services.editor_doc import MAX_BLOCKS
 
 
 class SaveUrlRequest(BaseModel):
@@ -18,6 +19,21 @@ class SaveUrlRequest(BaseModel):
 class CreateNoteRequest(BaseModel):
     title: str = Field(min_length=1, max_length=512)
     content: str = Field(min_length=1)
+
+
+class UpdateContentRequest(BaseModel):
+    """A manual rewrite of an item's body, as EditorJS blocks.
+
+    Deliberately the *only* thing this endpoint accepts. Taking the whole item and
+    copying fields across would let a caller set `ai_category`, `processing_status` or
+    `user_id` by adding them to the body; there is nothing here to overpost with.
+
+    The plain text is derived from the blocks server-side rather than sent alongside
+    them, so `content` and the stored document can never disagree about what the user
+    actually wrote.
+    """
+
+    blocks: list[dict[str, Any]] = Field(max_length=MAX_BLOCKS)
 
 
 class VaultItemRead(BaseModel):
@@ -31,6 +47,9 @@ class VaultItemRead(BaseModel):
     thumbnail_url: str | None
     ai_tags: list[str]
     ai_category: str | None
+    #: One distinctive line per memory. Cards show it to tell two items apart when their
+    #: tags are identical, which for topical tags is the common case rather than the edge.
+    ai_label: str | None = None
     processing_status: ProcessingStatus
     created_at: datetime
 
@@ -43,6 +62,9 @@ class VaultItemRead(BaseModel):
 
 class VaultItemDetail(VaultItemRead):
     content: str | None
+    #: Verbatim spans of `content`, for the reader to mark in place. Only sent with the
+    #: detail because they are meaningless without the text they index into.
+    ai_highlights: list[str] = Field(default_factory=list)
     item_metadata: dict[str, Any] = Field(default_factory=dict)
 
 

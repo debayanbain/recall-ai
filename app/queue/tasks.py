@@ -15,6 +15,7 @@ from app.core.logging import configure_logging, get_logger
 from app.db.session import task_session
 from app.models.extraction_run import RunStatus
 from app.queue.celery_app import celery_app
+from app.queue.client import enqueue_process_item, enqueue_telegram_delivery
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
 from app.services.apify import get_run
@@ -27,6 +28,24 @@ log = get_logger("tasks")
 
 #: Apify run statuses that mean "there is a dataset to read".
 _SUCCESS = "SUCCEEDED"
+
+
+async def _notify_surface(item_id: uuid.UUID, session: Any) -> None:
+    """Tell the capture surface an item finished, if it came from one.
+
+    Called after the commit, so the delivery task always finds a visible row. Kept
+    here rather than in `ProcessingService` because the pipeline has no business
+    knowing which chat surface a save arrived from.
+    """
+    item = await VaultRepository(session).get_unscoped(item_id)
+    if item is None:
+        return
+    if (item.item_metadata or {}).get("source") != "telegram":
+        return
+    try:
+        await enqueue_telegram_delivery(item.id)
+    except Exception as exc:  # noqa: BLE001 - the item is saved either way
+        log.warning("telegram_delivery_enqueue_failed", error=type(exc).__name__)
 
 
 @celery_app.task(
@@ -44,9 +63,21 @@ def process_item(self: Any, item_id: str) -> str | None:
         # Provider SDK errors can hold unpicklable handles, and Celery serializes the
         # exception into the result backend. Re-raise a plain one.
         log.warning("process_item_failed", item_id=item_id, error=type(exc).__name__)
+        if self.request.retries >= self.max_retries:
+            # Last attempt. Without this the capture surface never hears back and the
+            # user is left watching an acknowledgement that never resolves.
+            try:
+                asyncio.run(_notify_final_failure(item_id))
+            except Exception:  # noqa: BLE001 - the retry result matters more
+                log.warning("notify_final_failure_failed", item_id=item_id)
         raise self.retry(
             exc=RuntimeError(f"{type(exc).__name__}: {str(exc)[:300]}")
         ) from None
+
+
+async def _notify_final_failure(item_id: str) -> None:
+    async with task_session() as session:
+        await _notify_surface(uuid.UUID(item_id), session)
 
 
 async def _process_item(item_id: str) -> str | None:
@@ -62,6 +93,10 @@ async def _process_item(item_id: str) -> str | None:
             await session.commit()
             raise
         await session.commit()
+        if run_id is None:
+            # A deferred extraction is not finished yet; its reply is sent by
+            # `_finalize_run` instead.
+            await _notify_surface(uuid.UUID(item_id), session)
         return run_id
 
 
@@ -110,6 +145,7 @@ async def _finalize_run(provider_run_id: str) -> None:
             await service.fail_item(run.vault_item_id, reason)
             await runs.mark(run, RunStatus.failed, reason)
             await session.commit()
+            await _notify_surface(run.vault_item_id, session)
             return
 
         items = await service.fetch_payload(run.vault_item_id, str(dataset_id))
@@ -121,6 +157,7 @@ async def _finalize_run(provider_run_id: str) -> None:
             # re-driven by the sweeper every five minutes forever.
             await runs.mark(run, RunStatus.succeeded)
             await session.commit()
+        await _notify_surface(run.vault_item_id, session)
 
 
 @celery_app.task(name="app.queue.tasks.sweep_stale_runs")
@@ -198,4 +235,147 @@ async def _purge_expired_sessions() -> int:
         await session.commit()
         if deleted:
             log.info("sessions_purged", deleted=deleted)
+        return deleted
+
+
+@celery_app.task(
+    name="app.queue.tasks.handle_telegram_update",
+    bind=True,
+    max_retries=2,
+    default_retry_delay=15,
+    acks_late=True,
+)
+def handle_telegram_update(self: Any, update: dict[str, Any]) -> None:
+    """Process one Telegram update: authorise the sender, act, reply.
+
+    Retried at most twice, and only for infrastructure failures. A malformed update is
+    dropped inside the body rather than raised, because Telegram redelivers the same
+    bytes and a message we cannot parse will never parse.
+    """
+    try:
+        asyncio.run(_handle_telegram_update(update))
+    except Exception as exc:
+        log.warning("telegram_update_failed", error=type(exc).__name__)
+        raise self.retry(
+            exc=RuntimeError(f"{type(exc).__name__}: {str(exc)[:300]}")
+        ) from None
+
+
+async def _handle_telegram_update(update: dict[str, Any]) -> None:
+    from app.repositories.telegram import (
+        TelegramAccountRepository,
+        TelegramLinkTokenRepository,
+    )
+    from app.services.telegram.client import TelegramClient
+    from app.services.telegram.dispatch import TelegramDispatcher
+    from app.services.telegram.linking import TelegramLinkService
+    from app.services.vault_service import VaultService
+    from app.storage import get_storage
+
+    async with TelegramClient() as client, task_session() as session:
+        links = TelegramLinkService(
+            TelegramAccountRepository(session), TelegramLinkTokenRepository(session)
+        )
+        vault = VaultService(VaultRepository(session), get_storage())
+        dispatcher = TelegramDispatcher(
+            links, vault, client, recall=_recall_responder(vault.repo)
+        )
+
+        result = await dispatcher.handle(update)
+        # Commit before enqueuing anything: the worker that picks the job up runs in a
+        # different transaction and must be able to see the row.
+        await session.commit()
+
+        for item_id in result.enqueue_item_ids:
+            try:
+                await enqueue_process_item(item_id)
+            except Exception as exc:  # noqa: BLE001 - the item is saved either way
+                log.warning("telegram_enqueue_failed", error=type(exc).__name__)
+
+        if result.reply and result.chat_id:
+            await client.send_message(
+                result.chat_id, result.reply, reply_markup=result.reply_markup
+            )
+
+
+def _recall_responder(repo: VaultRepository) -> Any:
+    """The retrieval half, if this deployment has a chat model configured.
+
+    Imported lazily so the worker still starts -- and still captures -- when the
+    LangChain extras are missing from the environment.
+    """
+    try:
+        from app.services.recall_chat import build_recall_responder
+    except ImportError:  # pragma: no cover - only when the extras are absent
+        log.warning("recall_chat_unavailable")
+        return None
+    return build_recall_responder(repo)
+
+
+@celery_app.task(
+    name="app.queue.tasks.deliver_telegram_result",
+    bind=True,
+    max_retries=3,
+    default_retry_delay=20,
+    acks_late=True,
+)
+def deliver_telegram_result(self: Any, item_id: str) -> None:
+    """Send the summary/category/tags reply once an item finishes processing."""
+    try:
+        asyncio.run(_deliver_telegram_result(item_id))
+    except Exception as exc:
+        log.warning(
+            "telegram_delivery_failed", item_id=item_id, error=type(exc).__name__
+        )
+        raise self.retry(
+            exc=RuntimeError(f"{type(exc).__name__}: {str(exc)[:300]}")
+        ) from None
+
+
+async def _deliver_telegram_result(item_id: str) -> None:
+    from app.repositories.telegram import TelegramAccountRepository
+    from app.services.telegram import formatting
+    from app.services.telegram.client import TelegramClient
+
+    async with task_session() as session:
+        item = await VaultRepository(session).get_unscoped(uuid.UUID(item_id))
+        if item is None:
+            log.warning("telegram_delivery_missing_item", item_id=item_id)
+            return
+
+        # The chat address is re-derived from the owner's binding, never read from
+        # `item_metadata`. A metadata value is writable by the pipeline and by any future
+        # extractor; trusting it here would be a way to route one user's content into
+        # another user's chat.
+        account = await TelegramAccountRepository(session).get_for_user(item.user_id)
+        if account is None:
+            log.info("telegram_delivery_no_account", item_id=item_id)
+            return
+
+        async with TelegramClient() as client:
+            await client.send_message(account.telegram_chat_id, formatting.result(item))
+
+
+@celery_app.task(name="app.queue.tasks.purge_expired_telegram_tokens")
+def purge_expired_telegram_tokens() -> int:
+    """Beat task: drop link tokens that can no longer be redeemed.
+
+    Deletes strictly by `expires_at`. A used-but-unexpired row is kept until it expires
+    so a replayed link is still recognised as spent rather than as unknown.
+    """
+    return asyncio.run(_purge_expired_telegram_tokens())
+
+
+async def _purge_expired_telegram_tokens() -> int:
+    from datetime import UTC, datetime
+
+    from app.repositories.telegram import TelegramLinkTokenRepository
+
+    async with task_session() as session:
+        deleted = await TelegramLinkTokenRepository(session).delete_expired(
+            datetime.now(UTC)
+        )
+        await session.commit()
+        if deleted:
+            log.info("telegram_link_tokens_purged", deleted=deleted)
         return deleted

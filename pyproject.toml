@@ -26,6 +26,15 @@ dependencies = [
     "tenacity>=9.0",
     "google-genai>=0.3",
     "openai>=3.3.1",
+    # Chat/retrieval only. The enrichment pipeline still goes through AIProvider --
+    # LangChain supplies the multi-turn chat model and structured output that the
+    # four-method Protocol has no room for. Deliberately NOT langchain-redis or
+    # langchain-community: the message history is ~40 lines over the redis client
+    # this project already depends on, and both of those pull in a vector-store stack
+    # we do not use.
+    "langchain-core>=0.3",
+    "langchain-openai>=0.3",
+    "langchain-google-genai>=2.1",
     "celery[redis]>=5.4",
     "pypdf>=6.16.2",
     "python-multipart>=0.0.32",

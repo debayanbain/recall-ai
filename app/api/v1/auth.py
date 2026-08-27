@@ -37,9 +37,9 @@ from urllib.parse import urlencode, urlsplit
 import httpx
 import jwt
 from fastapi import APIRouter, HTTPException, Query, Request, Response, status
-from fastapi.responses import RedirectResponse
+from fastapi.responses import JSONResponse, RedirectResponse
 
-from app.api.deps import AuthServiceDep, CurrentUser, SessionServiceDep
+from app.api.deps import AuthServiceDep, CurrentUser, SessionServiceDep, assert_same_site
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.security import decode_access_token
@@ -131,6 +131,25 @@ def _set_session_cookies(response: Response, issued: IssuedSession) -> None:
         domain=settings.SESSION_COOKIE_DOMAIN,
         path="/",
     )
+    # A marker, not a credential: it carries no token and grants nothing, and the API
+    # still verifies the JWT on every request. It exists because the frontend's route
+    # gate runs on a page *navigation*, which never carries the refresh cookie
+    # (Path=/api/v1/auth) and no longer carries the access cookie once its 15 minutes are
+    # up. Without it that gate reads "signed out" and redirects to /sign-in before any
+    # JavaScript can run, so the 7-day refresh token is never spent and the user is
+    # thrown back to the provider a quarter of an hour after signing in.
+    # Not HttpOnly-exempt: the proxy reads cookies server-side, so nothing needs script
+    # access to it.
+    response.set_cookie(
+        settings.SESSION_HINT_COOKIE_NAME,
+        "1",
+        max_age=settings.REFRESH_TOKEN_EXPIRE_DAYS * 24 * 3600,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        path="/",
+    )
     response.set_cookie(
         settings.REFRESH_COOKIE_NAME,
         issued.refresh_token,
@@ -157,6 +176,14 @@ def _clear_session_cookies(response: Response) -> None:
         samesite=settings.SESSION_COOKIE_SAMESITE,
     )
     response.delete_cookie(
+        settings.SESSION_HINT_COOKIE_NAME,
+        path="/",
+        domain=settings.SESSION_COOKIE_DOMAIN,
+        httponly=True,
+        secure=settings.COOKIE_SECURE,
+        samesite=settings.SESSION_COOKIE_SAMESITE,
+    )
+    response.delete_cookie(
         settings.REFRESH_COOKIE_NAME,
         path=_REFRESH_COOKIE_PATH,
         domain=settings.SESSION_COOKIE_DOMAIN,
@@ -164,6 +191,30 @@ def _clear_session_cookies(response: Response) -> None:
         secure=settings.COOKIE_SECURE,
         samesite=settings.SESSION_COOKIE_SAMESITE,
     )
+
+
+def _refusal(reason: str) -> JSONResponse:
+    """A 401 that also clears both cookies.
+
+    It has to be a real response object rather than `raise HTTPException(...)` after
+    mutating the injected `Response`: FastAPI only copies that object's headers onto a
+    *successful* return, so cookies set beside a raise are silently dropped and the
+    browser keeps the dead cookie. That is not cosmetic -- `proxy.ts` gates routes on the
+    cookie being *present*, so a stale one it can never verify makes the app bounce
+    between /sign-in and /vault with no way out.
+
+    Every rejection -- unknown token, already rotated, expired, revoked family, deleted
+    user, or no cookie at all -- answers with this same opaque body. The reason is logged
+    and never returned: a distinguishing error tells whoever holds a stolen token whether
+    it was ever real.
+    """
+    response = JSONResponse(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        content={"detail": "Not authenticated"},
+    )
+    _clear_session_cookies(response)
+    log.info("session_refresh_rejected", reason=reason)
+    return response
 
 
 def _client_ip(request: Request) -> str | None:
@@ -177,22 +228,6 @@ def _client_ip(request: Request) -> str | None:
     return request.client.host if request.client else None
 
 
-def _assert_same_site(request: Request) -> None:
-    """Reject a cross-origin state change on the session endpoints.
-
-    SameSite already blocks this for the default `lax` cookie, but a deployment whose SPA
-    and API are genuinely cross-site must set `SESSION_COOKIE_SAMESITE=none`, and that
-    hands the browser back to the attacker's page. An Origin allowlist is the check that
-    survives both settings. A request with no Origin at all (curl, a native app) is
-    allowed: no browser omits Origin on a cross-site POST, so absence is not the attack.
-    """
-    origin = request.headers.get("origin")
-    if origin is None:
-        return
-    allowed = {*settings.CORS_ORIGINS, settings.FRONTEND_URL.rstrip("/")}
-    if origin.rstrip("/") not in {a.rstrip("/") for a in allowed}:
-        log.warning("session_cross_origin_rejected", origin=origin, path=request.url.path)
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Cross-origin request rejected")
 
 
 def _pkce_pair() -> tuple[str, str]:
@@ -373,7 +408,7 @@ async def refresh_session(
     request: Request,
     response: Response,
     sessions: SessionServiceDep,
-) -> RefreshResponse:
+) -> RefreshResponse | JSONResponse:
     """Trade the refresh cookie for a fresh access token, and rotate the refresh token.
 
     This is the endpoint that makes a login survive three days away: the browser still
@@ -384,10 +419,13 @@ async def refresh_session(
     revoked, expired, deleted user -- is logged and never returned: a distinguishing
     error would tell whoever holds a stolen token whether it was ever real.
     """
-    _assert_same_site(request)
+    assert_same_site(request)
     raw = request.cookies.get(settings.REFRESH_COOKIE_NAME)
     if not raw:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated")
+        # Also a refusal, not a bare 401: the access cookie can outlive the refresh one
+        # (different Path, different Max-Age), and leaving that orphan in the jar is what
+        # strands the browser on a route gate that only checks for its presence.
+        return _refusal("no_cookie")
 
     try:
         issued = await sessions.refresh(
@@ -396,11 +434,9 @@ async def refresh_session(
             ip_address=_client_ip(request),
         )
     except SessionError as exc:
-        log.info("session_refresh_rejected", reason=exc.reason)
-        # Clear both cookies on the way out. Leaving a dead refresh cookie in place makes
-        # the SPA retry this endpoint on every navigation forever.
-        _clear_session_cookies(response)
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Not authenticated") from exc
+        # Clearing both cookies on the way out is what stops the SPA retrying this
+        # endpoint on every navigation forever.
+        return _refusal(exc.reason)
 
     _set_session_cookies(response, issued)
     return RefreshResponse(
@@ -423,7 +459,7 @@ async def logout(
     caller signed out, and a 401 here would only strand a client that cannot clear its
     own HttpOnly cookies.
     """
-    _assert_same_site(request)
+    assert_same_site(request)
     await sessions.revoke(request.cookies.get(settings.REFRESH_COOKIE_NAME))
     _clear_session_cookies(response)
     return {"ok": True}
@@ -442,7 +478,7 @@ async def logout_all(
     against the database), so ACCESS_TOKEN_EXPIRE_MINUTES is the true bound on how long
     an attacker keeps read access after this. That is why it is capped at an hour.
     """
-    _assert_same_site(request)
+    assert_same_site(request)
     count = await sessions.revoke_all(user.id)
     _clear_session_cookies(response)
     return {"ok": True, "revoked": count}
@@ -487,7 +523,7 @@ async def revoke_session(
     reported as 404 rather than 403, so this cannot be used to test whether a given
     session id exists.
     """
-    _assert_same_site(request)
+    assert_same_site(request)
     if not await sessions.revoke_one(user.id, session_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Session not found")
     response = Response(status_code=status.HTTP_204_NO_CONTENT)

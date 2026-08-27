@@ -6,6 +6,7 @@ from typing import Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
+from app.ai import parsing, prompts
 from app.ai.base import AIProvider
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -63,6 +64,14 @@ class GeminiProvider(AIProvider):
         )
         raw = await self._generate(prompt)
         return self._parse_tags(raw)
+
+    async def generate_label(self, text: str) -> str:
+        return parsing.clean_label(await self._generate(prompts.label_prompt(text)))
+
+    async def generate_highlights(self, text: str) -> list[str]:
+        return parsing.parse_string_list(
+            await self._generate(prompts.highlights_prompt(text))
+        )
 
     async def generate_category(self, text: str) -> str:
         prompt = (

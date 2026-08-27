@@ -224,6 +224,21 @@ catch-all and must stay last, so new extractors get appended *before* it.
   memory tags still come from `ProcessingService` via the `AIProvider`. Profile and story URLs are
   deliberately not claimed. Reels contribute caption, hashtags, mentions, audio and top comments —
   the *video itself* is not watched; `metadata.video_url` is stored for whenever that is added.
+- **Facebook reels are free, and unlike Instagram they need no scraper.** Facebook answers a
+  *non-browser* User-Agent with the full share preview: `og:title` carries the entire caption
+  (`og:description` is truncated at ~200 chars, so it is only the fallback), `og:url` the
+  canonical reel URL and the page slug. A Chrome-looking User-Agent gets **HTTP 400** — do not
+  "fix" the header block by disguising it. `og:title` arrives as
+  `"<stats> | <caption> | <page name>"`; the stats prefix is parsed into
+  `metadata.views/reactions`, and the trailing page name is only trimmed when it matches the
+  slug from `og:url`, since a caption may contain " | " itself. `share/r/<code>` shortlinks need
+  no special case — the redirect loop resolves them, re-validating each hop through
+  `assert_safe_url`. `Accept-Language: en-US` is not cosmetic: without it the engagement counts
+  come back in the exit node's locale and the stats prefix stops parsing.
+  `FacebookReelApifyExtractor` is the paid fallback and claims **nothing** unless
+  `FACEBOOK_USE_APIFY=true`; turning it on also means replacing `APIFY_FACEBOOK_ACTOR`, because
+  the first-party `facebook-reels-scraper` takes a *page* URL and walks its reels — handed a
+  single reel link it returns an empty dataset, which surfaces as "may be private, deleted".
 - **There are TWO Instagram integrations and they are not the same thing.** Sign-in
   (`services/oauth/instagram.py`, Instagram Login) establishes identity and uses the
   **Instagram** App ID/Secret; the connection (`services/instagram_service.py`, Facebook Login)
@@ -257,6 +272,85 @@ catch-all and must stay last, so new extractors get appended *before* it.
   victim to the callback URL, grafting their Instagram onto the victim's account. Every branch —
   no cookie, no state, wrong nonce, different user — fails closed; `tests/integrations/test_integrations_instagram.py`
   pins each one.
+- **The bot routes on the SHAPE of a message, never on guessed intent.** A link or a
+  file is captured immediately; `/note <text>` is the only way plain text becomes a
+  memory; everything else is answered by the chat model and **stored nowhere**
+  (`services/telegram/dispatch.py`). The old default -- unrecognised text becomes a note
+  -- was the right call only while there was no explicit way to keep a thought; with
+  `/note` it just accumulates greetings the user discovers in bulk much later. The
+  failure mode now is retyping something with `/note` in front, which is visible and
+  recoverable. `RecallChatService.respond` then splits chat from retrieval on
+  `planner.looks_like_question`, which costs no tokens -- and `ai/chat/chain.converse` is
+  a **separate chain** from `answer` on purpose: `answer`'s whole rule is "speak only
+  from the MEMORY blocks", which holds precisely because it is never handed an empty
+  context. `first_url` beats phrasing, so "what is this? <link>" saves rather than asks.
+- **The Telegram bot's whole authorisation is one lookup.** An update carries no session,
+  so `TelegramUpdateRouter` (`services/telegram/dispatch.py`) turning a sender into a user
+  via `telegram_accounts` *is* the access control — everything before that lookup succeeds
+  must not touch the vault. Two rules go with it: **private chats only** (a bot added to a
+  group would read one member's vault aloud to the room), and an unlinked sender learns
+  nothing — not a count, not a title, only how to connect.
+- **`telegram_accounts.telegram_user_id` is unique GLOBALLY, not per user.** Scoping it to
+  `(user_id, telegram_user_id)` would let a second account claim a Telegram identity
+  someone else already linked, and every later message from that chat would resolve to
+  whichever row was found first. `TelegramLinkService.consume` refuses rather than
+  rebinding, and spends the token on the way out so a refusal leaves nothing to retry with.
+- **Link tokens are single-use, hashed, and every rejection reads the same.** The raw value
+  exists only inside the `t.me/<bot>?start=<token>` deep link; `telegram_link_tokens` stores
+  the SHA-256 (fast hash is right — 32 random bytes, no dictionary, one indexed lookup).
+  Unknown, spent and expired all answer "that link expired": distinguishing them tells
+  whoever found a link in a screenshot what they are holding. Minting a link expires the
+  user's previous one — pressing Connect twice must not leave a live credential behind.
+- **The webhook is gated twice, and never answers 4xx to a real update.**
+  `POST /webhooks/telegram/{secret}` compares the secret in the path *and* in Telegram's
+  `X-Telegram-Bot-Api-Secret-Token` header, both with `compare_digest`, so a leaked URL is
+  not enough. Anything we cannot act on is acknowledged with 202: Telegram redelivers
+  non-2xx with the same bytes, so one 500 on a malformed update is an infinite retry loop.
+  **`/api/v1/webhooks/` is exempt from `RateLimitMiddleware`** for the same reason — the
+  limiter keys on client IP, all of Telegram's traffic shares one key, and a 429 is a
+  delivery failure it retries. The real cap is per-`telegram_user_id` in Redis
+  (`services/telegram/limits.py`), applied in the worker where the sender is known.
+- **The reply address is re-derived, never read from the item.** `deliver_telegram_result`
+  looks the chat up through `telegram_accounts` by `item.user_id`.
+  `item_metadata["telegram_chat_id"]` is recorded for debugging only — trusting it would let
+  a poisoned or mis-written metadata value route one user's content into another's chat.
+  `item_metadata["source"] == "telegram"` is what triggers a reply at all, checked in
+  `queue/tasks.py` after the commit rather than inside `ProcessingService` (the pipeline has
+  no business knowing which surface a save came from).
+- **The bot commits before it enqueues.** `VaultService.save_url` / `save_document` /
+  `create_note` take `enqueue=False` so `_handle_telegram_update` can commit its
+  `task_session()` first. On the web the enqueue-before-commit race (below) is a rare stuck
+  card; for the bot it means the completion reply never fires and the user watches an
+  acknowledgement that never resolves.
+- **Replies are Telegram HTML, never MarkdownV2.** MarkdownV2 makes 18 characters special
+  including `.` and `-`, so one unescaped article title returns HTTP 400 and the user gets
+  nothing. HTML needs only `& < >`; `services/telegram/formatting.escape` wraps every
+  interpolated value, because titles, tags and categories are model output derived from
+  scraped pages. **Nothing in `services/telegram/client.py` may log a request URL** — the
+  bot token is in the path, and `log_sink` redacts by key, not by value.
+- **Telegram photos arrive with no filename**, and `documents.inspect` reads the extension
+  from the filename only, so an un-synthesized name is a guaranteed `DocumentError`.
+  `capture.py` derives it from the `getFile` path's suffix, then from the declared MIME
+  type; the magic-byte check still decides what the bytes actually are. Voice notes are
+  refused out loud — there is no ASR and no audio MIME in the allowlist, and a silent drop
+  reads as a bug.
+- **LangChain is confined to `app/ai/chat/`.** Routers, services and Celery tasks reach it
+  only through `services/recall_chat.py`, the same way business code never imports
+  `GeminiProvider`. It supplies the multi-turn chat model, `with_structured_output` for
+  query planning, and the prompt/LCEL plumbing that the four-method `AIProvider` Protocol
+  has no room for. **Embeddings deliberately stay on `AIProvider`**: the stored vectors were
+  written by it, and under Gemini they are 768 dims zero-padded to 1536, so a second
+  embedding stack would rank against a space it was not drawn from — plausible ordering over
+  noise, with nothing to notice. Chat history is ~40 lines over the existing redis client
+  (`ai/chat/history.py`) rather than `langchain-redis`, which drags in a vector-store stack
+  this project does not use.
+- **Retrieved memories are data, not instructions.** `ai/chat/chain.py` fences each one in a
+  `<memory>` block and tells the model the contents are quoted material; the chain binds no
+  tools. A scraped Instagram caption saying "ignore previous instructions" is something a
+  person can write on purpose. Zero hits short-circuits to a fixed sentence with no model
+  call — an empty context invites the model to invent a memory, and pays for the privilege.
+  A purely time-scoped question ("what did I save this week?") is answered by
+  `list_filtered` alone: no embedding, no vector search, no answer model.
 - **Provider tokens are Fernet-encrypted** (`app/core/crypto.py`) in `oauth_accounts`, keyed by
   `TOKEN_ENCRYPTION_KEY`. With no key set (dev) they are dropped, not stored in the clear; the
   boot guard makes the key mandatory outside dev once any provider is configured. The Facebook
@@ -340,6 +434,50 @@ catch-all and must stay last, so new extractors get appended *before* it.
   the column width.
 - Gemini returns prose, not guaranteed JSON — `_parse_tags` strips ``` fences and falls back to
   comma-splitting. Keep new AI outputs equally defensive; `tests/ai/test_gemini_parsing.py` covers this.
+- **`ai_highlights` are quotes, and the pipeline enforces that.** The model is asked for exact
+  sentences from `content`, and `ai/spans.py::keep_verbatim` then *discards* anything that is not
+  actually in the text (whitespace and case are normalised, nothing looser — fuzzy matching starts
+  approving paraphrases again). The frontend marks these spans inside the content it already
+  renders, so a stored paraphrase would either vanish there or be displayed as words the author
+  never wrote. Spans are also length-bounded and de-overlapped, and returned in document order.
+  Highlights are only requested when `item.content` exists — an item enriched from its title alone
+  has nothing to index into. `tests/ai/test_spans_and_labels.py` pins each rule.
+- **`ai_label` is not another tag.** Tags are topical and collide by design (`jobs` belongs to
+  hundreds of items); the label is the one line that tells two memories apart in a list, so the
+  prompt (`ai/prompts.py`) explicitly rejects generic subject areas. New prompts live in
+  `ai/prompts.py` and new parsing in `ai/parsing.py`, shared by both providers — the older
+  summary/tags/category prompts stay duplicated inside each provider only because their wording is
+  pinned by that provider's tests. **A new provider method must be added to the `AIProvider`
+  Protocol *and* to every fake in `tests/`**: the Protocol is structural, so a stub missing the
+  method fails at runtime inside `_enrich`, not at type-check time.
+
+- **A hand-edited body is stored TWICE, and the two answer different questions.**
+  `PATCH /vault/{id}/content` takes EditorJS *blocks* and nothing else;
+  `services/editor_doc.py` derives both halves from one pass, so the browser cannot post a
+  `content` that disagrees with the document beside it, and no other column is reachable
+  by adding it to the body. `item_metadata["editor_doc"]` keeps the block structure and a
+  **small allowlist of inline markup** (`b i u mark code a[href] br`) — that is what the
+  reader renders, and rendering the flat text instead is what made an applied heading come
+  back looking like an ordinary paragraph. `VaultItem.content` stays the flat projection
+  that highlights index into, search matches and the embedding is drawn from; it never
+  contains tags.
+  The markup is produced by **re-serializing from the allowlist**, never by stripping
+  patterns out of the input: `_InlineSanitizer` reads whatever the contenteditable sent
+  and writes fresh tags from what it recognises, escaping all text and dropping every
+  attribute except a re-validated `href` (`http(s)`/`mailto` only, checked after
+  whitespace and control characters are removed). A tag outside the list cannot appear in
+  the output because nothing in the output is copied from the input. A `code` block is the
+  one exception and is kept verbatim — it comes from a textarea's `.value`, which never
+  parses markup, and sanitizing it would delete the user's own examples of the very tags
+  this refuses. **The frontend does not treat that as sufficient**: `editor_doc` is a
+  JSONB column, so `lib/editor-doc.ts` re-applies the same allowlist before anything
+  reaches the editor, and the reader builds React elements rather than setting innerHTML.
+  Saving an empty document is refused rather than treated as "clear the body". Two
+  consequences to know: `ai_highlights` are re-run through `keep_verbatim` against the new
+  text (a quote of a deleted paragraph would otherwise be marked somewhere the model never
+  pointed), and the **embedding is deliberately not recomputed** — reprocessing would
+  re-fetch `source_url` and overwrite what the user just wrote, so semantic search keeps
+  ranking the item by its pre-edit body until something else reprocesses it.
 
 ## Known rough edges (real, in the current code)
 
@@ -353,5 +491,9 @@ catch-all and must stay last, so new extractors get appended *before* it.
   hard `session.delete()`. Reads assume soft delete; writes do not implement it.
 - Rate limiting (`core/middleware.py`) is per-process in-memory — correct only for a single API
   replica.
-- Search is `ILIKE` over title/summary/content. The embeddings and the HNSW index are written but
-  nothing queries them yet; vector search is unimplemented.
+- `GET /search` is still `ILIKE` over title/summary/content. Vector search now exists —
+  `VaultRepository.search_semantic` orders by `embedding <=> $1` over the HNSW index — but
+  only the Telegram bot calls it; the HTTP search endpoint has not been switched over, so
+  the two surfaces answer the same question differently. `search_semantic` keeps the
+  ordering a bare `ORDER BY … LIMIT n` and dedupes by item in Python on purpose: a
+  `DISTINCT ON` makes the planner drop the index.

@@ -25,11 +25,22 @@ from urllib.parse import urlencode
 from fastapi import APIRouter, HTTPException, Query, Request, status
 from fastapi.responses import RedirectResponse
 
-from app.api.deps import CurrentUser, InstagramServiceDep
+from app.api.deps import (
+    CurrentUser,
+    InstagramServiceDep,
+    TelegramLinkServiceDep,
+    assert_same_site,
+)
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.schemas.integrations import InstagramAccountRead, InstagramConnectionsResponse
+from app.schemas.telegram import (
+    TelegramAccountRead,
+    TelegramConnectionResponse,
+    TelegramLinkResponse,
+)
 from app.services.instagram_service import InstagramConnectError, InstagramService
+from app.services.telegram.linking import TelegramLinkService
 
 router = APIRouter(prefix="/integrations", tags=["integrations"])
 log = get_logger("integrations")
@@ -136,4 +147,57 @@ async def disconnect_instagram(
     removed = await service.disconnect(account_id, user.id)
     if not removed:
         # 404, not 403: a caller must not be able to probe which ids exist.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Connection not found")
+
+
+# --- Telegram -------------------------------------------------------------------
+#
+# No OAuth round trip: there is no provider to redirect to. The browser proves who the
+# user is with the session cookie, mints a single-use token, and the token travels to the
+# phone inside a t.me deep link. Everything that consumes it lives in the worker, because
+# the redemption arrives as a webhook rather than as a request from this user's browser.
+
+
+@router.get("/telegram", response_model=TelegramConnectionResponse)
+async def get_telegram(
+    user: CurrentUser, service: TelegramLinkServiceDep
+) -> TelegramConnectionResponse:
+    account = await service.get_for_user(user.id)
+    available = TelegramLinkService.is_configured()
+    return TelegramConnectionResponse(
+        available=available,
+        # Only meaningful when configured, and the frontend renders it into a link.
+        bot_username=settings.TELEGRAM_BOT_USERNAME if available else None,
+        account=TelegramAccountRead.model_validate(account) if account else None,
+    )
+
+
+@router.post("/telegram/link", response_model=TelegramLinkResponse)
+async def create_telegram_link(
+    request: Request, user: CurrentUser, service: TelegramLinkServiceDep
+) -> TelegramLinkResponse:
+    """Mint the deep link that connects this account to the bot.
+
+    State-changing and cookie-authenticated, so it carries the Origin check as well as
+    SameSite. The response body is a bearer credential for ten minutes -- it is never
+    cached and never logged.
+    """
+    assert_same_site(request)
+    if not TelegramLinkService.is_configured():
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Telegram is not configured")
+    issued = await service.create_link(user.id)
+    return TelegramLinkResponse(
+        deep_link=issued.deep_link,
+        expires_in=issued.expires_in,
+        expires_at=issued.expires_at,
+    )
+
+
+@router.delete("/telegram", status_code=status.HTTP_204_NO_CONTENT)
+async def disconnect_telegram(
+    request: Request, user: CurrentUser, service: TelegramLinkServiceDep
+) -> None:
+    assert_same_site(request)
+    removed = await service.disconnect(user.id)
+    if not removed:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Connection not found")

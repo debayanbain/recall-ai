@@ -52,6 +52,8 @@ _TABLES = [
     "subscriptions",
     "audit_log",
     "user_sessions",
+    "telegram_link_tokens",
+    "telegram_accounts",
     "users",
 ]
 
