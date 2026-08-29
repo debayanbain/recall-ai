@@ -10,6 +10,17 @@ from __future__ import annotations
 LABEL_MAX_INPUT = 6000
 HIGHLIGHTS_MAX_INPUT = 12000
 
+#: Who the assistant is, in the three facts a person needs to use it. Kept here rather
+#: than inline in a prompt because more than one surface has to answer "what are you?"
+#: and two copies of an identity is how a product ends up describing itself two ways.
+#: Deliberately plain: no emoji, no adjectives, nothing the model can expand into a
+#: sales pitch. It states capability and stops.
+BOT_IDENTITY = (
+    "RecallAI is a memory assistant. "
+    "It saves the links, files and notes a person sends it. "
+    "It answers questions about what they have saved."
+)
+
 
 def label_prompt(text: str) -> str:
     """Ask for the one line that distinguishes this memory from every other one."""

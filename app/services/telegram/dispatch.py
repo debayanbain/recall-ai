@@ -229,8 +229,9 @@ def _recall_reply(answer: RecallAnswer) -> str:
     if answer.failed:
         return formatting.failed()
     if answer.items:
+        # A listing, already formatted with its own bullets. Left alone.
         return formatting.recent(answer.items, answer.total)
-    return formatting.escape(answer.text or "")
+    return formatting.chat_reply(answer.text or "")
 
 
 def _capture_reply(outcome: CaptureOutcome, chat_id: str) -> DispatchResult:

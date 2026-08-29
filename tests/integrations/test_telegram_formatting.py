@@ -124,3 +124,41 @@ def test_connect_markup_is_omitted_for_a_plaintext_frontend(monkeypatch: Any) ->
     """
     monkeypatch.setattr(settings, "FRONTEND_URL", "http://localhost:3000")
     assert formatting.connect_markup() is None
+
+
+# --- chat_reply ----------------------------------------------------------------------
+
+
+def test_a_lone_leading_dash_is_stripped_from_a_one_line_reply() -> None:
+    """The reported bug: "Hii" came back as a one-item bullet list."""
+    assert formatting.chat_reply("- Hey! Send me a link and I'll keep it.") == (
+        "Hey! Send me a link and I'll keep it."
+    )
+
+
+def test_asterisk_and_hash_markers_are_stripped_too() -> None:
+    assert formatting.chat_reply("* Hello there") == "Hello there"
+    assert formatting.chat_reply("# Hello there") == "Hello there"
+    assert formatting.chat_reply("## Hello there") == "Hello there"
+
+
+def test_a_real_list_keeps_every_marker() -> None:
+    """Multi-line means the first "-" has siblings; eating it would misalign the list."""
+    reply = "- one\n- two"
+    assert formatting.chat_reply(reply) == reply
+
+
+def test_a_marker_character_that_is_part_of_the_words_survives() -> None:
+    """Whitespace after the marker is required, so content is never trimmed."""
+    assert formatting.chat_reply("-5 degrees tonight") == "-5 degrees tonight"
+    assert formatting.chat_reply("#1 pick") == "#1 pick"
+    assert formatting.chat_reply("**bold**") == "**bold**"
+
+
+def test_chat_reply_still_escapes() -> None:
+    """Stripping is presentation; escaping is the security boundary and stays."""
+    assert formatting.chat_reply("- <b>hi</b> & bye") == "&lt;b&gt;hi&lt;/b&gt; &amp; bye"
+
+
+def test_chat_reply_escapes_markup_hiding_behind_a_marker() -> None:
+    assert "<script>" not in formatting.chat_reply("- <script>alert(1)</script>")

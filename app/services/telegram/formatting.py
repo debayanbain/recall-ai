@@ -10,6 +10,7 @@ the boundary where it becomes markup.
 """
 from __future__ import annotations
 
+import re
 from collections.abc import Sequence
 from html import escape as _html_escape
 
@@ -25,6 +26,31 @@ _MAX_TAGS = 5
 def escape(value: object) -> str:
     """HTML-escape any value for Telegram's HTML parse mode."""
     return _html_escape(str(value), quote=False)
+
+
+#: A leading list marker with nothing after it to be a list of. The chat prompt permits
+#: a leading "-" for genuine lists, and the model applies it to single-sentence answers
+#: too, so "Hii" comes back as "- Hey! Send me a link and I'll keep it." -- a bullet
+#: point with one item, which reads as a rendering fault rather than an answer.
+_LONE_BULLET_RE = re.compile(r"^[-*#]+\s+")
+
+
+def chat_reply(text: str) -> str:
+    """A conversational reply, escaped, minus a bullet marker it never needed.
+
+    Only stripped when the reply is a *single line*. A multi-line answer that opens with
+    "-" is an actual list, and eating its first marker would leave one item looking
+    different from the rest.
+
+    This trims presentation, never content: the marker has to be followed by whitespace,
+    so "-5 degrees", "#1 pick" and "**bold**" are left exactly as written. Escaping is
+    unchanged and still happens here -- `escape` is the boundary where model output
+    becomes markup, and nothing may reach Telegram without crossing it.
+    """
+    stripped = text.strip()
+    if "\n" not in stripped:
+        stripped = _LONE_BULLET_RE.sub("", stripped, count=1).strip()
+    return escape(stripped)
 
 
 def _clip(value: str, limit: int) -> str:

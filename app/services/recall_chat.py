@@ -21,6 +21,7 @@ of those a Telegram client.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass, field
@@ -34,10 +35,24 @@ from app.core.config import settings
 from app.core.logging import get_logger
 from app.models.vault import VaultItem
 from app.repositories.vault import VaultRepository
+from app.services.chat_engine.router import Intent, route
 
 log = get_logger("recall.chat")
 
 _LIST_LIMIT = 10
+
+#: Presence-only link detection, for the router's `url` argument. The router does no URL
+#: finding of its own -- that is the caller's job precisely because every surface carries
+#: links differently, and this one has nothing but a string. It is deliberately NOT
+#: `telegram.capture.first_url`: that reads a provider's entity offsets, and importing it
+#: would make this module a client of the one surface its docstring promises it does not
+#: know about. Nothing is ever fetched from the result; it only decides a branch.
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+
+
+def _first_url(text: str) -> str | None:
+    match = _URL_RE.search(text)
+    return match.group(0) if match else None
 
 
 @dataclass(slots=True)
@@ -63,20 +78,38 @@ class RecallChatService:
     ) -> RecallAnswer:
         """The one entry point for a plain-text message. Never writes anything.
 
-        Two lanes, split by `planner.looks_like_question`, which costs no tokens:
+        Two lanes, chosen by `chat_engine.router.route`, which costs no tokens:
 
-        * **A question about their vault** -- the retrieval lane below.
-        * **Anything else** ("hi", "what can you do") -- a conversational reply with no
-          retrieval at all. Routing this into `answer` instead would run an embedding
-          and a vector search over a greeting, then report that nothing was saved about
-          "hi", which reads as a broken bot rather than a quiet one.
+        * **RECALL** -- a question about their vault, so the retrieval lane below.
+        * **META and CHAT** -- a conversational reply with no retrieval at all. Both go
+          to the same chain: `converse` already knows who it is (`BOT_IDENTITY`), so
+          "what can you do" needs no separate branch here, only a guarantee that it does
+          not reach `answer`.
+
+        `route` replaced `planner.looks_like_question`, which routed on a trailing "?".
+        That sent "who are you?" and "what is the capital of France?" down the retrieval
+        lane, which spent an embedding and a vector scan to reply that nothing was saved
+        about "you" -- a bot that looks broken every time someone talks to it. Phrases
+        decide now; a question mark on its own does not.
 
         The split is by *shape*, not by asking a model to classify intent: a
         misclassification here is a wrong-looking reply either way, and a model call to
         decide whether to make a model call is a cost with no ceiling.
         """
-        if planner.looks_like_question(text):
+        intent = route(text, url=_first_url(text))
+
+        if intent is Intent.RECALL:
             return await self.answer(user_id, text, session_id)
+
+        if intent is Intent.COMMAND or intent is Intent.CAPTURE:
+            # Unreachable through the dispatcher, which claims commands, links and files
+            # before any of this runs. Logged rather than raised: this executes inside a
+            # Celery task serving a webhook Telegram redelivers on any non-2xx, so an
+            # exception here is an infinite retry loop over a message we could have
+            # simply talked back to. Falling through to `chat` loses nothing -- this
+            # method cannot save anything in the first place.
+            log.warning("recall_unexpected_intent", intent=intent.value)
+
         return await self.chat(text, session_id)
 
     async def chat(self, message: str, session_id: str) -> RecallAnswer:

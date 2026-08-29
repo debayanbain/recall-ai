@@ -1,0 +1,194 @@
+"""Every branch of `route`, in the order the router checks them.
+
+The ordering cases matter more than the pattern cases: a pattern that stops matching
+loses one phrasing, while a branch checked in the wrong order silently changes what gets
+saved.
+"""
+from __future__ import annotations
+
+import pytest
+
+from app.services.chat_engine.router import Intent, route
+
+URL = "https://x.com/a"
+
+
+# --- attachments win outright --------------------------------------------------------
+
+
+def test_an_attachment_is_a_capture() -> None:
+    assert route("look at this", has_attachment=True) is Intent.CAPTURE
+
+
+def test_an_attachment_with_no_caption_is_still_a_capture() -> None:
+    """A photo sent bare is the commonest capture there is."""
+    assert route(None, has_attachment=True) is Intent.CAPTURE
+
+
+def test_an_attachment_beats_a_command() -> None:
+    assert route("/note", has_attachment=True) is Intent.CAPTURE
+
+
+def test_an_attachment_beats_recall_phrasing() -> None:
+    assert route("did i save this?", has_attachment=True) is Intent.CAPTURE
+
+
+# --- nothing to read -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", [None, "", "   ", "\n\t "])
+def test_empty_text_is_chat(text: str | None) -> None:
+    assert route(text) is Intent.CHAT
+
+
+# --- commands ------------------------------------------------------------------------
+
+
+def test_a_leading_slash_is_a_command() -> None:
+    assert route("/recent") is Intent.COMMAND
+
+
+def test_a_command_is_never_re_read_as_prose() -> None:
+    """`/find` contains a recall word; the slash still decides."""
+    assert route("/find sweden") is Intent.COMMAND
+
+
+def test_a_command_beats_a_url() -> None:
+    assert route("/note https://x.com/a", url=URL) is Intent.COMMAND
+
+
+def test_leading_whitespace_does_not_hide_a_command() -> None:
+    assert route("   /help") is Intent.COMMAND
+
+
+# --- links ---------------------------------------------------------------------------
+
+
+def test_a_url_is_a_capture() -> None:
+    assert route("https://x.com/a", url=URL) is Intent.CAPTURE
+
+
+def test_a_url_beats_the_phrasing_around_it() -> None:
+    """Someone pasting a link is saving it, whatever they typed alongside."""
+    assert route("what is this?", url=URL) is Intent.CAPTURE
+
+
+def test_a_url_beats_recall_phrasing() -> None:
+    assert route("did i already save https://x.com/a", url=URL) is Intent.CAPTURE
+
+
+def test_link_text_without_a_parsed_url_is_not_a_capture() -> None:
+    """The caller finds the link. No url in, no capture out."""
+    assert route("https://x.com/a") is Intent.CHAT
+
+
+# --- meta ----------------------------------------------------------------------------
+
+
+def test_who_are_you_and_your_name_is_meta() -> None:
+    assert route("Who are you? What is your name") is Intent.META
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "who are you",
+        "whats your name?",
+        "what can you do",
+        "who made you",
+        "are you a bot",
+        "are you human",
+        "are you an ai?",
+    ],
+)
+def test_meta_phrasings(text: str) -> None:
+    assert route(text) is Intent.META
+
+
+def test_meta_is_checked_before_recall() -> None:
+    """`find` is recall phrasing; a question about the bot is still meta."""
+    assert route("find out who made you") is Intent.META
+
+
+# --- recall --------------------------------------------------------------------------
+
+
+def test_what_did_i_save_this_week_is_recall() -> None:
+    assert route("what did I save this week?") is Intent.RECALL
+
+
+def test_any_cooking_videos_is_recall() -> None:
+    assert route("any cooking videos?") is Intent.RECALL
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "i saved something about rust",
+        "did i keep that pdf",
+        "have i got anything on sweden",
+        "show me the tax stuff",
+        "find the sweden article",
+        "remember the job portal thing",
+        "my saves about python",
+        "whats in my vault",
+        "my notes on hiring",
+        "my links from the conference",
+        "anything from last week",
+        "what came in this week",
+        "what did i keep yesterday",
+    ],
+)
+def test_recall_phrasings(text: str) -> None:
+    assert route(text) is Intent.RECALL
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["any cooking videos", "any reels about sweden", "any posts on hiring", "any articles"],
+)
+def test_any_kind_phrasings(text: str) -> None:
+    assert route(text) is Intent.RECALL
+
+
+def test_a_kind_word_before_any_is_not_recall() -> None:
+    """The kind has to follow "any" -- otherwise every sentence with "post" in it matches."""
+    assert route("videos are fun, got any thoughts") is Intent.CHAT
+
+
+def test_recall_is_case_insensitive() -> None:
+    assert route("SHOW ME MY NOTES") is Intent.RECALL
+
+
+# --- chat, the default ---------------------------------------------------------------
+
+
+def test_a_greeting_is_chat() -> None:
+    assert route("Hii") is Intent.CHAT
+
+
+def test_general_knowledge_is_chat() -> None:
+    """The load-bearing case: a question mark alone must not mean recall."""
+    assert route("what is the capital of France?") is Intent.CHAT
+
+
+@pytest.mark.parametrize(
+    "text",
+    ["thanks!", "how does pgvector work?", "why is the sky blue?", "ok"],
+)
+def test_chat_phrasings(text: str) -> None:
+    assert route(text) is Intent.CHAT
+
+
+def test_a_recall_word_inside_another_word_does_not_match() -> None:
+    """Word boundaries, not substrings -- "confined" is not "find"."""
+    assert route("the space felt confined") is Intent.CHAT
+
+
+# --- the enum itself -----------------------------------------------------------------
+
+
+def test_intent_is_a_str_enum() -> None:
+    """Values are compared and logged as text, so they are part of the contract."""
+    assert Intent.RECALL == "recall"
+    assert {i.value for i in Intent} == {"command", "capture", "meta", "recall", "chat"}

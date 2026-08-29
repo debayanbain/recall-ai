@@ -23,6 +23,7 @@ from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 
 from app.ai.chat.factory import get_chat_model
+from app.ai.prompts import BOT_IDENTITY
 
 _SYSTEM = """You are RecallAI, answering questions about one person's own saved memories.
 
@@ -68,9 +69,15 @@ def format_context(documents: Sequence[Document]) -> str:
     return "\n\n".join(blocks)
 
 
-_CONVERSE_SYSTEM = """You are RecallAI, a second-brain assistant that lives in a \
-Telegram chat. The person is talking to you directly rather than asking about something \
-they saved.
+# Identity is injected HERE and nowhere else. `converse` is the only chain that is ever
+# asked "what are you?", and it is the only one that can answer without a memory in front
+# of it. Putting the same block in `_SYSTEM` would hand the answer model a second source
+# of truth alongside the MEMORY blocks -- and "answer only from the blocks" is the rule
+# that stops it inventing the user's vault. It does not get facts from anywhere else.
+_CONVERSE_SYSTEM = f"""{BOT_IDENTITY}
+
+You are RecallAI, speaking in a chat window. The person is talking to you directly \
+rather than asking about something they saved.
 
 Rules:
 
