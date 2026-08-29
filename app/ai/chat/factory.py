@@ -18,6 +18,18 @@ _TEMPERATURE = 0.2
 _TIMEOUT = 30.0
 _MAX_RETRIES = 2
 
+#: Hard ceiling on a reply, in tokens. The prompts ask for under four sentences and that
+#: is what shapes the answer; this is the backstop for when the model ignores them, since
+#: replies land on a phone screen and a wall of text is unreadable there and paid for by
+#: the token. Set generously above four sentences (~100 tokens) so a normal reply is
+#: never cut off mid-word -- a truncated answer is worse than a long one.
+#:
+#: The kwarg is named differently by each provider, which is why this lives here: the
+#: factory is the only place that knows which provider is configured. It applies to the
+#: planner's structured call too, which needs roughly sixty tokens, so the headroom is
+#: ample there as well.
+_MAX_OUTPUT_TOKENS = 256
+
 
 def chat_available() -> bool:
     """True when the configured provider has a key. Checked before any chat feature."""
@@ -39,6 +51,7 @@ def get_chat_model() -> BaseChatModel:
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
             max_retries=_MAX_RETRIES,
+            max_tokens=_MAX_OUTPUT_TOKENS,
         )
     if settings.AI_PROVIDER == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -49,5 +62,6 @@ def get_chat_model() -> BaseChatModel:
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
             max_retries=_MAX_RETRIES,
+            max_output_tokens=_MAX_OUTPUT_TOKENS,
         )
     raise ValueError(f"No chat model for AI_PROVIDER={settings.AI_PROVIDER!r}")

@@ -25,9 +25,16 @@ from app.core.logging import get_logger
 
 log = get_logger("telegram")
 
-#: Kept small on purpose. The answer is grounded in retrieved memories, so history only
-#: has to carry pronouns and follow-ups ("what about last month?"), not the subject matter.
+#: How many turns Redis keeps. The list is trimmed to this on write.
 _MAX_TURNS = 6
+
+#: How many turns are actually sent to the model, which is fewer. History only has to
+#: carry pronouns and follow-ups ("what about last month?") -- the subject matter comes
+#: from the retrieved memories -- and every older turn is prompt weight paying for
+#: something the retrieval already supplies. Redis still holds `_MAX_TURNS`: nothing is
+#: deleted here, the read is simply narrower than the store, so widening this again is a
+#: one-line change with the data already there.
+_PROMPT_TURNS = 4
 
 
 def _key(session_id: str) -> str:
@@ -35,10 +42,14 @@ def _key(session_id: str) -> str:
 
 
 async def load(session_id: str) -> list[BaseMessage]:
-    """Recent turns, oldest first. Returns nothing at all if Redis is unreachable."""
+    """The last `_PROMPT_TURNS` turns, oldest first. Nothing at all if Redis is down.
+
+    A read-only slice: `lrange` with a negative start takes the tail of the list and
+    leaves it exactly as it was. The stored history is longer than this on purpose.
+    """
     client = redis.from_url(settings.redis_url_str)  # type: ignore[no-untyped-call]
     try:
-        raw = await client.lrange(_key(session_id), -_MAX_TURNS * 2, -1)
+        raw = await client.lrange(_key(session_id), -_PROMPT_TURNS * 2, -1)
     except Exception as exc:  # noqa: BLE001 - history is an enhancement, not a dependency
         log.warning("telegram_history_load_failed", error=type(exc).__name__)
         return []

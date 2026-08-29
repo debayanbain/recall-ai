@@ -75,6 +75,11 @@ def to_document(item: Any, distance: float | None = None) -> Document:
     return Document(
         page_content=str(body)[:_MAX_EXCERPT],
         metadata={
+            # The row itself, so `chain.format_context` can render a card from every
+            # field rather than re-deriving one from this flattened metadata (which
+            # carries no ai_label, no highlights and no summary). Nothing serializes a
+            # Document, so an ORM object in here never has to survive a round trip.
+            "item": item,
             "item_id": str(item.id),
             "title": item.title or item.source_url or "Untitled",
             "source_url": item.source_url,
