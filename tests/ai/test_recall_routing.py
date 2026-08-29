@@ -1,12 +1,9 @@
-"""Which lane a plain-text message takes, and that neither lane writes anything.
+"""The two lanes themselves, as `RecallChatService` implements them.
 
-`RecallChatService.respond` is the single entry point the Telegram dispatcher calls. It
-splits on `looks_like_question`, which costs no tokens: a question about the vault gets
-retrieval, anything else gets a conversational reply with no retrieval at all.
-
-The split matters beyond phrasing. Sending "hi" down the retrieval lane runs an embedding
-and a vector search over a greeting and then reports that nothing was saved about "hi" --
-paying for a reply that reads as a broken bot.
+Which lane a message takes is no longer decided here -- that moved to
+`app/services/chat_engine/engine.py` and is pinned by `tests/chat_engine/test_engine.py`.
+What is left is the promise each lane makes on its own: the chat lane never touches the
+vault, and neither lane ever lets a provider traceback out.
 """
 from __future__ import annotations
 
@@ -16,7 +13,7 @@ from typing import Any
 import pytest
 
 from app.ai.chat import chain, history
-from app.services.recall_chat import RecallAnswer, RecallChatService
+from app.services.recall_chat import RecallChatService
 
 _USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 
@@ -42,30 +39,14 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> list[str]:
     return seen
 
 
-async def test_a_greeting_is_answered_without_touching_the_vault(
-    _offline: list[str],
-) -> None:
+async def test_the_chat_lane_never_touches_the_vault(_offline: list[str]) -> None:
+    """`repo=None` is the assertion: a single query would raise instead of passing."""
     service = RecallChatService(repo=None)  # type: ignore[arg-type]
-    answer = await service.respond(_USER, "hi", session_id="555000")
+    answer = await service.chat("hi", session_id="555000")
 
     assert _offline == ["hi"]
     assert answer.text == "Hey! Send me a link and I'll keep it."
     assert answer.items == [] and not answer.failed
-
-
-async def test_a_vault_question_does_not_take_the_chat_lane(
-    _offline: list[str], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    service = RecallChatService(repo=None)  # type: ignore[arg-type]
-
-    async def _answer(user_id: uuid.UUID, question: str, session_id: str) -> RecallAnswer:
-        return RecallAnswer(text="You saved two things about pasta.")
-
-    monkeypatch.setattr(service, "answer", _answer)
-    result = await service.respond(_USER, "any pasta videos?", session_id="555000")
-
-    assert _offline == []
-    assert result.text == "You saved two things about pasta."
 
 
 async def test_a_provider_failure_is_a_failure_not_a_traceback(
@@ -81,6 +62,6 @@ async def test_a_provider_failure_is_a_failure_not_a_traceback(
     monkeypatch.setattr(history, "load", _load)
 
     service = RecallChatService(repo=None)  # type: ignore[arg-type]
-    answer = await service.respond(_USER, "hi", session_id="555000")
+    answer = await service.chat("hi", session_id="555000")
 
     assert answer.failed and answer.text is None

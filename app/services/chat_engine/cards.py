@@ -120,6 +120,32 @@ def build_card(item: VaultItem) -> str:
     return "\n".join(lines)
 
 
+#: How much of an item's body a detail answer may see. Two of these is already more than
+#: the whole default context, which is the point: it is paid for only when the question
+#: asked for the words rather than for which memory it was.
+DETAIL_CONTENT_LIMIT = 2000
+#: And over how few items. Reading two memories closely beats skimming eight.
+DETAIL_MAX_ITEMS = 2
+
+
+def build_detail_card(item: VaultItem, limit: int = DETAIL_CONTENT_LIMIT) -> str:
+    """The card, plus as much of the item's own text as the limit allows.
+
+    For the one question a card cannot answer: "what did it actually say?". The card
+    stays on top so the answer can still name the memory, and the body is appended under
+    a label that says plainly it is the saved text -- an unlabelled wall of prose reads
+    to the model as more instructions.
+
+    An item with no stored body (an image, a `.docx` -- see the `skipped` status) simply
+    yields its card. There is nothing further to show and saying so is the answer.
+    """
+    card = build_card(item)
+    body = _clip(" ".join(str(item.content or "").split()), limit)
+    if not body:
+        return card
+    return f"{card}\n  full text: {body}"
+
+
 def build_context(
     items: Sequence[VaultItem], budget: int = DEFAULT_BUDGET
 ) -> str:

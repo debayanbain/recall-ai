@@ -83,8 +83,30 @@ _RECALL_PATTERNS = (
     r"\byesterday\b",
 )
 
+#: "help" on its own is someone asking what the assistant can do. It is deliberately
+#: anchored to the whole message rather than added to `_META_PATTERNS`: as a bare
+#: substring it would swallow "help me find my notes about docker", which is a search.
+_BARE_HELP_RE = re.compile(r"^help[!?. ]*$")
+
+#: Phrases that ask for what a memory actually *said*, rather than which memory it was.
+#: Checked only once a message is already RECALL, so this never decides a lane -- it
+#: decides how much of the item the answer is allowed to see. Deliberately a short
+#: literal list: a model call to decide whether to spend a model call has no ceiling.
+_DETAIL_PATTERNS = (
+    r"\bexactly\b",
+    r"\bin detail\b",
+    r"\bmore detail\b",
+    r"\bfull (?:text|article|post|content)\b",
+    r"\bwhat did (?:the|that) \w+ say\b",
+    r"\bwhat does (?:the|that) \w+ say\b",
+    r"\bexplain the details\b",
+    r"\bquote\b",
+    r"\bverbatim\b",
+)
+
 _META_RE = re.compile("|".join(_META_PATTERNS))
 _RECALL_RE = re.compile("|".join(_RECALL_PATTERNS))
+_DETAIL_RE = re.compile("|".join(_DETAIL_PATTERNS))
 
 # "any cooking videos?" -- a kind word somewhere after "any". Split into two anchored
 # scans rather than one `\bany\b.*\bvideos\b`: the wildcard form backtracks across the
@@ -121,10 +143,22 @@ def route(
 
     lowered = stripped[:_MAX_SCAN].lower()
 
-    if _META_RE.search(lowered):
+    if _META_RE.search(lowered) or _BARE_HELP_RE.match(lowered):
         return Intent.META
 
     if _RECALL_RE.search(lowered) or _asks_for_a_kind(lowered):
         return Intent.RECALL
 
     return Intent.CHAT
+
+
+def wants_detail(text: str | None) -> bool:
+    """True when a recall question asks for a memory's own words, not just which one.
+
+    The default answer is built from cards, which carry a clipped summary and at most two
+    quotes -- enough to say *which* memory, never enough to say what its third paragraph
+    argued. This is the deterministic check that decides when to pay for the body
+    instead, and it is only ever consulted for a question already routed to RECALL.
+    """
+    stripped = (text or "").strip()
+    return bool(stripped) and _DETAIL_RE.search(stripped[:_MAX_SCAN].lower()) is not None

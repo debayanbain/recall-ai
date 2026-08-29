@@ -19,11 +19,13 @@ import json
 import secrets
 from typing import Any
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, BackgroundTasks, HTTPException, Request, status
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.queue.client import enqueue_finalize_run, enqueue_telegram_update
+from app.queue.health import is_stalled
+from app.services.telegram.notices import notify_degraded
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = get_logger("webhooks")
@@ -65,7 +67,9 @@ async def apify_webhook(secret: str, request: Request) -> dict[str, str]:
 
 
 @router.post("/telegram/{secret}", status_code=status.HTTP_202_ACCEPTED)
-async def telegram_webhook(secret: str, request: Request) -> dict[str, str]:
+async def telegram_webhook(
+    secret: str, request: Request, background: BackgroundTasks
+) -> dict[str, str]:
     """Receive one Telegram update, queue it, answer immediately.
 
     Two independent checks, both constant-time: the shared secret in the path, and the
@@ -102,6 +106,47 @@ async def telegram_webhook(secret: str, request: Request) -> dict[str, str]:
         log.info("telegram_webhook_ignored", update_id=str(body.get("update_id"))[:20])
         return {"status": "ignored"}
 
-    await enqueue_telegram_update(body)
+    chat_id = _telegram_chat_id(body)
+
+    try:
+        await enqueue_telegram_update(body)
+    except Exception as exc:  # noqa: BLE001 - a broker outage is not a bad request
+        # Telegram redelivers any non-2xx with the same bytes, so raising here would turn
+        # a Redis outage into an infinite retry loop *and* still leave the sender in
+        # silence. Acknowledge, then say out loud that the message did not land.
+        log.warning("telegram_enqueue_failed", error=type(exc).__name__)
+        if chat_id:
+            background.add_task(notify_degraded, chat_id, queued=False)
+        return {"status": "unavailable"}
+
     log.info("telegram_webhook_queued", update_id=str(body.get("update_id"))[:20])
+
+    # Queued is not the same as "will be answered". If nothing is consuming the queue the
+    # update is durable but nobody is working on it, and the sender would otherwise wait
+    # on a reply that no process is going to write. Checked after the 202 is decided, in
+    # the background, so a healthy path pays nothing for it.
+    if chat_id:
+        background.add_task(_notify_if_stalled, chat_id)
     return {"status": "queued"}
+
+
+async def _notify_if_stalled(chat_id: str) -> None:
+    """Tell the sender only when the queue really is going nowhere."""
+    try:
+        if await is_stalled():
+            await notify_degraded(chat_id, queued=True)
+    except Exception as exc:  # noqa: BLE001 - a health probe must not break delivery
+        log.warning("telegram_stall_check_failed", error=type(exc).__name__)
+
+
+def _telegram_chat_id(body: dict[str, Any]) -> str:
+    """Where to answer, read straight off the update we are acknowledging.
+
+    Safe here in a way `deliver_telegram_result`'s address is not: this is the chat that
+    just sent us this message, within the same request. It is never used to route
+    anything *retrieved* -- only to answer the sender that we cannot answer them.
+    """
+    message = body.get("message")
+    chat = message.get("chat") if isinstance(message, dict) else None
+    chat_id = chat.get("id") if isinstance(chat, dict) else None
+    return str(chat_id) if chat_id is not None else ""

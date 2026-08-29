@@ -262,6 +262,16 @@ def handle_telegram_update(self: Any, update: dict[str, Any]) -> None:
 
 
 async def _handle_telegram_update(update: dict[str, Any]) -> None:
+    import structlog
+
+    # The HTTP middleware stamps a request_id on API traffic; nothing does for an update
+    # that arrives here through the queue, so one line of a bot conversation could not be
+    # correlated with the model calls it caused. Telegram's own update_id is the natural
+    # key -- it is unique per bot and already identifies this delivery.
+    structlog.contextvars.bind_contextvars(
+        request_id=f"tg-{update.get('update_id', 'unknown')}"
+    )
+
     from app.repositories.telegram import (
         TelegramAccountRepository,
         TelegramLinkTokenRepository,

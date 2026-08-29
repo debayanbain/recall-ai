@@ -16,11 +16,13 @@ import pytest
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
 from app.services.chat_engine.cards import (
+    DETAIL_CONTENT_LIMIT,
     MAX_HIGHLIGHTS,
     MAX_TAGS,
     SUMMARY_LIMIT,
     build_card,
     build_context,
+    build_detail_card,
     estimate_tokens,
 )
 
@@ -194,3 +196,38 @@ def test_cards_are_joined_by_a_blank_line_and_kept_whole() -> None:
 
 def test_no_items_is_an_empty_string() -> None:
     assert build_context([]) == ""
+
+
+# --- build_detail_card ---------------------------------------------------------------
+
+
+def test_a_detail_card_adds_the_body_the_ordinary_card_withholds() -> None:
+    item = _item(summary="Short summary.", content="The body says something specific.")
+    card, detail = build_card(item), build_detail_card(item)
+
+    assert "The body says something specific." not in card
+    assert "The body says something specific." in detail
+    assert detail.startswith(card)
+
+
+def test_the_body_is_labelled_rather_than_appended_bare() -> None:
+    """An unlabelled wall of prose reads to the model as more instructions."""
+    assert "full text:" in build_detail_card(_item(content="words"))
+
+
+def test_the_body_is_capped() -> None:
+    detail = build_detail_card(_item(content="word " * 5000))
+    assert len(detail) < DETAIL_CONTENT_LIMIT + len(build_card(_item())) + 50
+    assert detail.endswith("…")
+
+
+def test_an_item_with_no_body_is_just_its_card() -> None:
+    """An image or a .docx is stored but never read; there is nothing further to show."""
+    item = _item(content=None)
+    assert build_detail_card(item) == build_card(item)
+    assert "full text:" not in build_detail_card(item)
+
+
+def test_the_ordinary_context_never_contains_a_detail_card() -> None:
+    item = _item(content="SECRET-BODY-TEXT")
+    assert "SECRET-BODY-TEXT" not in build_context([item])

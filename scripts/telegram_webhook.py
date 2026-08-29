@@ -20,19 +20,8 @@ import sys
 
 from app.core.config import settings
 from app.services.telegram.client import TelegramApiError, TelegramClient
-
-
-def _webhook_url() -> str:
-    base = settings.PUBLIC_BASE_URL.rstrip("/")
-    return f"{base}{settings.API_V1_PREFIX}/webhooks/telegram/{settings.TELEGRAM_WEBHOOK_SECRET}"
-
-
-def _redacted(url: str) -> str:
-    """Show enough to confirm the right deployment, never the secret itself."""
-    if not url:
-        return "(none)"
-    head, _, _ = url.rpartition("/")
-    return f"{head}/<secret>"
+from app.services.telegram.webhook import redacted as _redacted
+from app.services.telegram.webhook import webhook_url as _webhook_url
 
 
 async def _register() -> int:

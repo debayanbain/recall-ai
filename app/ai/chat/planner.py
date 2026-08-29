@@ -18,6 +18,7 @@ from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
 from app.ai.chat.factory import get_chat_model
+from app.ai.chat.usage import UsageLogger
 from app.core.logging import get_logger
 from app.models.base import ContentType
 
@@ -119,7 +120,9 @@ async def plan(question: str) -> MemoryQuery:
     """Extract query parameters, defensively."""
     try:
         chain = _PLANNER_PROMPT | get_chat_model().with_structured_output(MemoryQuery)
-        result = await chain.ainvoke({"question": question})
+        result = await chain.ainvoke(
+            {"question": question}, config={"callbacks": [UsageLogger("planner")]}
+        )
     except Exception as exc:  # noqa: BLE001 - a worse search beats no search
         log.warning("recall_planner_failed", error=type(exc).__name__)
         return _fallback(question)

@@ -26,6 +26,11 @@ class Settings(BaseSettings):
 
     # --- App ---
     ENV: Literal["dev", "staging", "prod"] = "dev"
+    #: Reconcile the Telegram webhook registration and probe for a live worker at boot.
+    #: Both are outbound network calls, which is why they are switchable: a test suite
+    #: must not talk to Telegram, and a deployment whose webhook is managed by its
+    #: infrastructure should not have the app quietly re-point it.
+    STARTUP_SELF_CHECK: bool = True
     DEBUG: bool = True
     APP_NAME: str = "RecallAI"
     API_V1_PREFIX: str = "/api/v1"

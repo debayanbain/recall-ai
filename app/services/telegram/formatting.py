@@ -28,6 +28,18 @@ def escape(value: object) -> str:
     return _html_escape(str(value), quote=False)
 
 
+def escape_attr(value: object) -> str:
+    """HTML-escape a value going *inside* an attribute, where a quote also terminates.
+
+    `escape` deliberately leaves `"` alone -- it is not special in element text, and
+    escaping it there would put `&quot;` in front of the user in every quoted title.
+    Inside `href="…"` it is the delimiter, so a saved URL containing one would end the
+    attribute and inject the rest as markup. Telegram's parser allows no attribute but
+    `href`, so the practical result is HTTP 400 and the user receiving nothing at all.
+    """
+    return _html_escape(str(value), quote=True)
+
+
 #: A leading list marker with nothing after it to be a list of. The chat prompt permits
 #: a leading "-" for genuine lists, and the model applies it to single-sentence answers
 #: too, so "Hii" comes back as "- Hey! Send me a link and I'll keep it." -- a bullet
@@ -170,6 +182,26 @@ def chat_unavailable() -> str:
     )
 
 
+def service_degraded(queued: bool) -> str:
+    """Told immediately when the pipeline cannot answer, instead of leaving them waiting.
+
+    Two different truths, because the difference matters to the person reading it. If the
+    update reached the queue it is durable and will be answered on its own; if it did not,
+    it is gone and only they can send it again. Promising the first when the second
+    happened is how a user loses something and never finds out.
+    """
+    if queued:
+        return (
+            "⏳ I've got your message, but my processing service is restarting — so the "
+            "reply will be a moment.\n\nNothing is lost. I'll answer here as soon as "
+            "I'm back; you don't need to send it again."
+        )
+    return (
+        "⚠️ I can't reach my processing service right now, so that message wasn't "
+        "saved.\n\nPlease send it again in a minute."
+    )
+
+
 def saving() -> str:
     return "Saving…"
 
@@ -247,7 +279,7 @@ def recent(items: Sequence[VaultItem], total: int) -> str:
     for item in items:
         title = escape(_title_of(item))
         line = f"• <b>{title}</b>" if not item.source_url else (
-            f'• <a href="{escape(item.source_url)}">{title}</a>'
+            f'• <a href="{escape_attr(item.source_url)}">{title}</a>'
         )
         if item.ai_category:
             line += f" — {escape(item.ai_category)}"

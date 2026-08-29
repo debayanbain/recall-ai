@@ -87,19 +87,28 @@ class FakeClient:
 
 
 class FakeRecall:
-    """The real split between chat and retrieval lives in `RecallChatService.respond`.
+    """The two lanes the engine chooses between, recorded separately.
 
-    The dispatcher's contract is only that plain text reaches it and nothing is written,
-    so the fake records rather than classifies.
+    Which lane a message takes is the engine's decision and has its own tests; what the
+    dispatcher owes is that plain text reaches one of them and nothing is written. Both
+    are recorded so a test can still say which, without re-testing the router.
     """
 
     def __init__(self) -> None:
         self.asked: list[str] = []
+        self.retrieved: list[str] = []
+        self.chatted: list[str] = []
 
-    async def respond(
-        self, user_id: uuid.UUID, text: str, session_id: str
+    async def answer(
+        self, user_id: uuid.UUID, question: str, session_id: str
     ) -> RecallAnswer:
-        self.asked.append(text)
+        self.asked.append(question)
+        self.retrieved.append(question)
+        return RecallAnswer(text="You saved three things about pasta.")
+
+    async def chat(self, message: str, session_id: str) -> RecallAnswer:
+        self.asked.append(message)
+        self.chatted.append(message)
         return RecallAnswer(text="You saved three things about pasta.")
 
 
@@ -208,7 +217,7 @@ async def test_plain_text_is_answered_and_never_saved() -> None:
     recall = FakeRecall()
     result = await _dispatcher(FakeLinks(_account()), vault, recall).handle(_update("hi"))
 
-    assert recall.asked == ["hi"]
+    assert recall.chatted == ["hi"] and recall.retrieved == []
     assert vault.notes == [] and vault.saved_urls == []
     assert result.reply == "You saved three things about pasta."
     assert result.enqueue_item_ids == []
@@ -221,7 +230,7 @@ async def test_a_question_goes_to_recall_not_to_capture() -> None:
         _update("any pasta videos?")
     )
 
-    assert recall.asked == ["any pasta videos?"]
+    assert recall.retrieved == ["any pasta videos?"] and recall.chatted == []
     assert vault.notes == []
     assert result.reply == "You saved three things about pasta."
 
@@ -374,3 +383,39 @@ async def test_linked_sender_is_offered_no_connect_button(monkeypatch: Any) -> N
     result = await _dispatcher(FakeLinks(_account())).handle(_update("/start"))
 
     assert result.reply_markup is None
+
+
+# --- the routing seam ----------------------------------------------------------------
+
+
+async def test_an_unknown_command_is_answered_rather_than_ignored() -> None:
+    """Dispatch serves the commands it has; the rest is the engine's to answer."""
+    vault = FakeVault()
+    recall = FakeRecall()
+    result = await _dispatcher(FakeLinks(_account()), vault, recall).handle(
+        _update("/froobulate")
+    )
+
+    assert recall.chatted == ["/froobulate"] and recall.retrieved == []
+    assert vault.notes == [] and vault.saved_urls == []
+    assert result.reply
+
+
+async def test_a_hyperlinked_label_is_captured_by_its_target() -> None:
+    """No URL appears in the words; routing still has to see one."""
+    vault = FakeVault()
+    recall = FakeRecall()
+    update = _update("click here for the recipe")
+    update["message"]["entities"] = [
+        {
+            "type": "text_link",
+            "offset": 0,
+            "length": len("click here for the recipe"),
+            "url": "https://www.instagram.com/reel/xyz/",
+        }
+    ]
+
+    await _dispatcher(FakeLinks(_account()), vault, recall).handle(update)
+
+    assert vault.saved_urls == [(_ALICE, "https://www.instagram.com/reel/xyz/")]
+    assert recall.asked == []

@@ -69,6 +69,25 @@ _SENSITIVE_KEY_PARTS: tuple[str, ...] = (
 
 _REDACTED = "[redacted]"
 
+#: Keys that contain a sensitive-looking substring but are counts, not credentials.
+#:
+#: `input_tokens` matches "token" and was redacted, which silently defeated the whole
+#: point of usage logging: the field was present, looked deliberate, and carried
+#: `[redacted]` where the number should be. Matched **exactly**, never as a substring --
+#: an allowlist that matched loosely would be a way to smuggle a real credential past the
+#: redactor by naming it well. Only add an integer here, and only one whose meaning is
+#: fixed by this codebase rather than by a value someone else supplies.
+_NEVER_REDACT: frozenset[str] = frozenset(
+    {
+        "input_tokens",
+        "output_tokens",
+        "total_tokens",
+        "token_count",
+        "prompt_tokens",
+        "completion_tokens",
+    }
+)
+
 #: Keys promoted to top-level record fields; they must not be duplicated into `context`.
 _PROMOTED: frozenset[str] = frozenset(
     {
@@ -101,6 +120,8 @@ _LOG_FILE = re.compile(r"^(?P<source>[a-z0-9_]+)-(?P<date>\d{4}-\d{2}-\d{2})\.js
 
 def _is_sensitive(key: str) -> bool:
     lowered = key.lower()
+    if lowered in _NEVER_REDACT:
+        return False
     return any(part in lowered for part in _SENSITIVE_KEY_PARTS)
 
 

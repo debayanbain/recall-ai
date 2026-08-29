@@ -30,16 +30,25 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Protocol, runtime_checkable
+from typing import Any
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.chat_engine.engine import ChatEngine, RecallLanes, classify
+from app.services.chat_engine.router import Intent
+from app.services.chat_engine.types import (
+    ErrorBlock,
+    ErrorKind,
+    InboundMessage,
+    OutboundReply,
+)
+from app.services.surfaces.telegram.parse import parse_message
+from app.services.surfaces.telegram.render import render
 from app.services.telegram import formatting, limits
 from app.services.telegram.capture import (
     CaptureKind,
     CaptureOutcome,
     TelegramCaptureService,
-    first_url,
 )
 from app.services.telegram.client import TelegramClient
 from app.services.telegram.linking import (
@@ -49,21 +58,9 @@ from app.services.telegram.linking import (
 )
 from app.services.vault_service import VaultService
 
-if TYPE_CHECKING:  # pragma: no cover - a type-only edge, never a runtime import
-    from app.services.recall_chat import RecallAnswer
-
 log = get_logger("telegram")
 
 _RECENT_LIMIT = 10
-
-
-@runtime_checkable
-class RecallResponder(Protocol):
-    """The retrieval half, injected so this module never imports the AI stack."""
-
-    async def respond(
-        self, user_id: uuid.UUID, text: str, session_id: str
-    ) -> RecallAnswer: ...
 
 
 @dataclass(slots=True)
@@ -89,7 +86,7 @@ class TelegramDispatcher:
         links: TelegramLinkService,
         vault: VaultService,
         client: TelegramClient,
-        recall: RecallResponder | None = None,
+        recall: RecallLanes | None = None,
     ) -> None:
         self.links = links
         self.vault = vault
@@ -105,8 +102,13 @@ class TelegramDispatcher:
         if not isinstance(message, dict):
             return DispatchResult()
 
-        chat = message.get("chat")
-        if not isinstance(chat, dict) or chat.get("type") != "private":
+        # The one hand-off from Telegram's payload shape to something portable. Nothing
+        # below this line reads the update again.
+        inbound = parse_message(message)
+        if inbound is None:
+            return DispatchResult()
+
+        if not inbound.is_private:
             log.info("telegram_non_private_ignored")
             return DispatchResult()
 
@@ -114,8 +116,11 @@ class TelegramDispatcher:
         if identity is None:
             return DispatchResult()
 
-        text = _message_text(message)
-        command, argument = _parse_command(text)
+        # The one shape decision, made once, by the engine. This module's remaining job
+        # is to serve the two intents the engine cannot: its own commands, and capture.
+        intent = classify(inbound)
+        text = inbound.text or ""
+        command, argument = _parse_command(text) if intent is Intent.COMMAND else (None, "")
 
         # /start is the only thing an unlinked sender may do, because it is the only
         # thing that can make them linked.
@@ -140,7 +145,9 @@ class TelegramDispatcher:
         if command == "note":
             return await self._handle_note(account.user_id, identity, message, argument)
 
-        return await self._handle_message(account.user_id, identity, message, text)
+        return await self._handle_message(
+            account.user_id, identity, message, inbound, intent
+        )
 
     async def _handle_start(
         self, identity: TelegramIdentity, token: str
@@ -176,10 +183,13 @@ class TelegramDispatcher:
         user_id: uuid.UUID,
         identity: TelegramIdentity,
         message: dict[str, Any],
-        text: str,
+        inbound: InboundMessage,
+        intent: Intent,
     ) -> DispatchResult:
-        # A file or a link is the whole of "save this". Everything else is talk.
-        saves = _has_attachment(message) or first_url(message) is not None
+        # Capture stays here rather than moving into the engine: it needs this surface's
+        # own file handles, and it writes -- the engine does neither. *Whether* a message
+        # is one is no longer decided here.
+        saves = intent is Intent.CAPTURE
 
         action = limits.Action.capture if saves else limits.Action.recall
         if not await limits.allow(identity.telegram_user_id, action):
@@ -194,11 +204,16 @@ class TelegramDispatcher:
             # No chat model. Say so -- the old behaviour of filing unanswerable text as
             # a note is exactly the silent save this routing exists to remove.
             return DispatchResult(
-                formatting.chat_unavailable(), chat_id=identity.chat_id
+                render(OutboundReply([ErrorBlock(ErrorKind.chat_unavailable)])),
+                chat_id=identity.chat_id,
             )
 
-        answer = await self.recall.respond(user_id, text, session_id=identity.chat_id)
-        return DispatchResult(_recall_reply(answer), chat_id=identity.chat_id)
+        # The user is resolved by now, and that lookup is the authorisation. The engine
+        # is handed the result, never the means to do it.
+        engine = ChatEngine(self.recall, user_id)
+        return DispatchResult(
+            render(await engine.handle(inbound)), chat_id=identity.chat_id
+        )
 
     async def _handle_note(
         self,
@@ -224,16 +239,6 @@ class TelegramDispatcher:
         return _capture_reply(outcome, identity.chat_id)
 
 
-def _recall_reply(answer: RecallAnswer) -> str:
-    """Rendering happens here, not in the service that did the retrieving."""
-    if answer.failed:
-        return formatting.failed()
-    if answer.items:
-        # A listing, already formatted with its own bullets. Left alone.
-        return formatting.recent(answer.items, answer.total)
-    return formatting.chat_reply(answer.text or "")
-
-
 def _capture_reply(outcome: CaptureOutcome, chat_id: str) -> DispatchResult:
     kind, item = outcome.kind, outcome.item
     if kind is CaptureKind.voice_unsupported:
@@ -256,19 +261,6 @@ def _capture_reply(outcome: CaptureOutcome, chat_id: str) -> DispatchResult:
     # tags -- is sent by `deliver_telegram_result` once the pipeline finishes.
     ack = formatting.note_saved(item) if kind is CaptureKind.note else formatting.saving()
     return DispatchResult(ack, enqueue_item_ids=[item.id], chat_id=chat_id)
-
-
-def _message_text(message: dict[str, Any]) -> str:
-    for key in ("text", "caption"):
-        value = message.get(key)
-        if isinstance(value, str):
-            return value.strip()
-    return ""
-
-
-def _has_attachment(message: dict[str, Any]) -> bool:
-    keys = ("document", "photo", "voice", "audio", "video", "video_note")
-    return any(message.get(key) for key in keys)
 
 
 def _parse_command(text: str) -> tuple[str | None, str]:

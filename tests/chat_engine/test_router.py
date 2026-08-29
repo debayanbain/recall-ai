@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import pytest
 
-from app.services.chat_engine.router import Intent, route
+from app.services.chat_engine.router import Intent, route, wants_detail
 
 URL = "https://x.com/a"
 
@@ -192,3 +192,67 @@ def test_intent_is_a_str_enum() -> None:
     """Values are compared and logged as text, so they are part of the contract."""
     assert Intent.RECALL == "recall"
     assert {i.value for i in Intent} == {"command", "capture", "meta", "recall", "chat"}
+
+
+# --- "help" ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("text", ["Help", "help", "HELP", "help!", "help?"])
+def test_help_on_its_own_is_meta(text: str) -> None:
+    """Someone typing only "help" is asking what this thing does."""
+    assert route(text) is Intent.META
+
+
+def test_help_inside_a_search_is_still_recall() -> None:
+    """Why "help" is anchored: as a substring it would swallow real searches."""
+    assert route("help me find my notes about docker") is Intent.RECALL
+
+
+def test_helpful_is_not_help() -> None:
+    assert route("helpful tips please") is Intent.CHAT
+
+
+def test_slash_help_is_a_command_not_meta() -> None:
+    assert route("/help") is Intent.COMMAND
+
+
+# --- detail: how much of a memory the answer may see ----------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "What exactly did that article say?",
+        "Explain the details from that saved post.",
+        "What did the article say about cache invalidation?",
+        "give me the full text of that one",
+        "quote it for me",
+        "tell me more detail about the redis one",
+    ],
+)
+def test_a_question_asking_for_the_words_wants_detail(text: str) -> None:
+    assert wants_detail(text) is True
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "what did I save about redis?",
+        "any cooking videos?",
+        "what did I save this week?",
+        "show me my notes",
+        "Hii",
+        None,
+        "",
+    ],
+)
+def test_an_ordinary_question_does_not_want_detail(text: str | None) -> None:
+    """The default is cards. Detail is paid for only when it was asked for."""
+    assert wants_detail(text) is False
+
+
+def test_detail_is_orthogonal_to_the_lane() -> None:
+    """It never decides routing -- only how much of an already-RECALL memory to show."""
+    question = "what exactly did that article say?"
+    assert route(question) is Intent.CHAT or route(question) is Intent.RECALL
+    assert wants_detail(question) is True

@@ -31,6 +31,26 @@ celery_app.conf.update(
     # A task is acknowledged only after it finishes, so a worker killed mid-job returns
     # the message to the queue instead of dropping the user's capture.
     task_acks_late=True,
+    # `acks_late` alone is not enough. It returns a message on a *clean* shutdown; a
+    # worker that is SIGKILLed, OOM-killed or loses its host acknowledges nothing and the
+    # message would stay invisible until the visibility timeout expires. With this, the
+    # broker treats a lost worker as a rejection and redelivers -- which is the whole
+    # difference between "the bot replied late" and "the message vanished".
+    task_reject_on_worker_lost=True,
+    # How long Redis hides a delivered-but-unacknowledged message before handing it to
+    # someone else. Redis defaults to an hour, so a worker killed mid-task leaves the
+    # user waiting an hour for a redelivery. A task cannot outlive its own time limit, so
+    # anything past that plus a margin is a message nobody is working on.
+    broker_transport_options={"visibility_timeout": settings.CELERY_TASK_TIME_LIMIT + 60},
+    result_backend_transport_options={
+        "visibility_timeout": settings.CELERY_TASK_TIME_LIMIT + 60
+    },
+    # A worker started before Redis is ready -- the ordinary case under a process
+    # manager, docker-compose or a machine reboot -- must wait rather than exit. Celery 6
+    # turns this off by default, which turns a five-second race into a dead worker.
+    broker_connection_retry_on_startup=True,
+    broker_connection_retry=True,
+    broker_connection_max_retries=None,
     worker_prefetch_multiplier=1,
     task_time_limit=settings.CELERY_TASK_TIME_LIMIT,
     task_soft_time_limit=settings.CELERY_TASK_TIME_LIMIT - 30,

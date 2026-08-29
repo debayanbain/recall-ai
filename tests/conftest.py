@@ -86,6 +86,18 @@ _assert_not_the_live_database()
 _REQUIRED_EXTENSIONS = ("vector", "pg_trgm", "pgcrypto", "citext")
 
 
+@pytest.fixture(autouse=True)
+def _no_startup_network(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep the app's boot self-check off the network.
+
+    The lifespan reconciles the Telegram webhook registration and pings for a live Celery
+    worker. Both are real outbound calls, and every `TestClient(app)` runs the lifespan --
+    so left on, the suite talks to api.telegram.org once per test and waits out a
+    broadcast timeout on top of it. The self-check has its own tests, calls stubbed.
+    """
+    monkeypatch.setattr(settings, "STARTUP_SELF_CHECK", False)
+
+
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def engine() -> AsyncGenerator[AsyncEngine, None]:
     """Session-wide engine with the schema built once. Skips if no database answers."""
