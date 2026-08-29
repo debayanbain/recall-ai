@@ -14,6 +14,7 @@ import pytest
 
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
+from app.services.chat_engine import scope
 from app.services.chat_engine.engine import ChatEngine, classify
 from app.services.chat_engine.router import Intent
 from app.services.chat_engine.types import (
@@ -98,19 +99,59 @@ async def test_a_question_about_the_bot_takes_the_chat_lane_not_retrieval() -> N
     assert recall.chatted == ["Who are you?"] and recall.answered == []
 
 
-async def test_general_knowledge_is_chat_not_retrieval() -> None:
+async def test_general_knowledge_is_declined_without_a_model_call() -> None:
+    """Not retrieval -- there is nothing to retrieve -- and not conversation either.
+
+    This assistant answers about the vault and about itself. Answering world trivia in
+    the same voice teaches the user that fluency is the signal, and the next answer,
+    which *is* about their vault, is believed for the same reason.
+    """
     recall = FakeRecall()
-    await ChatEngine(recall, _USER).handle(_msg("what is the capital of France?"))
+    reply = await ChatEngine(recall, _USER).handle(
+        _msg("what is the capital of France?")
+    )
 
-    assert recall.chatted == ["what is the capital of France?"]
-    assert recall.answered == []
+    assert recall.chatted == [] and recall.answered == []
+    assert reply.blocks == [TextBlock(text=scope.DECLINE)]
 
 
-async def test_the_chat_id_is_the_conversation_key() -> None:
+async def test_ordinary_conversation_still_reaches_the_chat_lane() -> None:
+    """The scope guard is narrow on purpose: a greeting is not an off-topic request."""
+    recall = FakeRecall()
+    await ChatEngine(recall, _USER).handle(_msg("Hii, thanks for that"))
+
+    assert recall.chatted == ["Hii, thanks for that"]
+
+
+async def test_asking_what_the_bot_can_do_is_never_declined() -> None:
+    """META is this assistant being asked about itself -- in scope by definition."""
+    recall = FakeRecall()
+    await ChatEngine(recall, _USER).handle(_msg("what can you do?"))
+
+    assert recall.chatted == ["what can you do?"]
+
+
+async def test_the_conversation_key_is_scoped_to_the_account() -> None:
+    """Not the chat alone: history is replayed into the next prompt."""
     recall = FakeRecall()
     await ChatEngine(recall, _USER).handle(_msg("Hii", external_chat_id="42"))
 
-    assert recall.sessions == ["42"]
+    assert recall.sessions == [f"{_USER}:42"]
+
+
+async def test_two_accounts_on_one_chat_do_not_share_a_conversation() -> None:
+    """The same messaging identity, relinked to another account, must start clean.
+
+    Chat history carries the titles and summaries already spoken aloud, so a key made of
+    the chat alone would hand the second account the first one's memories.
+    """
+    other = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    first, second = FakeRecall(), FakeRecall()
+
+    await ChatEngine(first, _USER).handle(_msg("Hii", external_chat_id="42"))
+    await ChatEngine(second, other).handle(_msg("Hii", external_chat_id="42"))
+
+    assert first.sessions != second.sessions
 
 
 # --- what should never arrive here ---------------------------------------------------

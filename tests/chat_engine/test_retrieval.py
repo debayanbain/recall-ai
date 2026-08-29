@@ -11,6 +11,8 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
 from app.services.chat_engine.retrieval import (
@@ -129,14 +131,23 @@ async def test_the_question_is_embedded_by_the_provider_that_wrote_the_vectors(
     assert repo.calls[0]["vector"] == [0.1, 0.2, 0.3]
 
 
-async def test_rows_come_back_as_items_without_their_distances(
+async def test_rows_come_back_as_items_carrying_their_score(
     monkeypatch: Any,
 ) -> None:
+    """The distance travels with the row rather than being dropped here.
+
+    Nothing downstream can reconstruct it -- the query vector is gone by then -- and
+    without it "nothing matched" and "eight weak matches" look identical to every later
+    stage. Judging what the number *means* is `evidence.assess`, not this module.
+    """
     item = _item()
     provider, repo = FakeProvider(), FakeRepo([(item, 0.12)])
     _patched(monkeypatch, provider)
 
-    assert await MemoryRetriever(repo).recall(_ALICE, "redis") == [item]  # type: ignore[arg-type]
+    memories = await MemoryRetriever(repo).recall(_ALICE, "redis")  # type: ignore[arg-type]
+
+    assert [memory.item for memory in memories] == [item]
+    assert memories[0].score == pytest.approx(0.88)
 
 
 async def test_filters_narrow_and_are_passed_through(monkeypatch: Any) -> None:

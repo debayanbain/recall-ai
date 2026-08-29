@@ -14,6 +14,16 @@ Two lanes, chosen by `router.route`, which costs no tokens:
   branch of its own, only a guarantee that it never reaches the retrieval prompt and
   comes back "I couldn't find anything about you".
 
+**The conversation lane is not a general-purpose assistant**, and that is enforced here
+as well as asked for in the prompt. A message that is plainly somebody else's product --
+write me a function, translate this, what is the capital of France -- is declined without
+a model call (`scope.py`). Answering it would cost a provider call per turn, widen the
+prompt-injection surface to "do X with this text", and, worst of the three, teach the
+user that fluency is the signal: the next answer is about their vault, sounds exactly the
+same, and is believed for the same reason. The point of everything in this package is
+that a claim about the vault is backed by evidence, and a confident answer about
+world capitals sitting beside it quietly erases the distinction.
+
 **The engine is handed an already-authorised user.** `user_id` arrives through the
 constructor because working out *which* account an external sender belongs to needs a
 table this package must not know exists. A caller that has not resolved that lookup has
@@ -28,6 +38,7 @@ from typing import Protocol
 import structlog
 
 from app.core.logging import get_logger
+from app.services.chat_engine import scope
 from app.services.chat_engine.router import Intent, route
 from app.services.chat_engine.types import (
     ErrorBlock,
@@ -86,6 +97,19 @@ class ChatEngine:
         self.recall = recall
         self.user_id = user_id
 
+    def _session_id(self, msg: InboundMessage) -> str:
+        """The conversation key: this account, in this chat -- never the chat alone.
+
+        Short-term chat history is stored under this key and fed back into the next
+        prompt, so it carries the titles and summaries the assistant has already spoken
+        aloud. A key made only of the external chat id would survive a change of account
+        on that chat: the same messaging identity, unlinked from one RecallAI account and
+        linked to another, would open its first conversation prefilled with the previous
+        account's memories. Binding the user id into the key makes that impossible by
+        construction rather than by remembering to clear something on disconnect.
+        """
+        return f"{self.user_id}:{msg.external_chat_id}"
+
     async def handle(self, msg: InboundMessage) -> OutboundReply:
         """Route one message and return what to say. Never writes anything."""
         if not msg.is_private:
@@ -96,7 +120,7 @@ class ChatEngine:
 
         intent = classify(msg)
         text = msg.text or ""
-        session_id = msg.external_chat_id
+        session_id = self._session_id(msg)
 
         # Stamped once, here, so every model call made downstream carries which surface
         # asked and which lane it took. Passing them down four signatures to reach one
@@ -106,6 +130,27 @@ class ChatEngine:
 
         if intent is Intent.RECALL:
             return _to_reply(await self.recall.answer(self.user_id, text, session_id))
+
+        if intent is Intent.CHAT:
+            # Checked only for CHAT: a CAPTURE is already being saved, a COMMAND is the
+            # caller's own, RECALL has been recognised as a question about the vault,
+            # and META is this assistant being asked about itself -- in scope by
+            # definition. So nothing here can intercept a message that was going to
+            # become a memory or a search.
+            #
+            # The lane is closed by default: `scope.check` allows a recognised social,
+            # self-referential or domain message and refuses everything else. The
+            # reason is logged because it is the one number worth watching -- a rise in
+            # `no_domain_signal` is either an attack surface or a gate that has become
+            # too tight, and the two are told apart by reading the messages.
+            verdict = scope.check(text)
+            if not verdict.allowed:
+                log.info(
+                    "chat_engine_out_of_scope",
+                    surface=msg.surface,
+                    reason=verdict.reason,
+                )
+                return OutboundReply([TextBlock(text=scope.DECLINE)])
 
         if intent is Intent.COMMAND or intent is Intent.CAPTURE:
             # The caller claims these through `classify` before it gets here, so what

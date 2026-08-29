@@ -76,6 +76,12 @@ _RECALL_PATTERNS = (
     r"\bhave i\b",
     r"\bshow me\b",
     r"\bfind\b",
+    # "search X" and "look up X" are retrieval verbs. Routed here rather than left to
+    # the conversation lane on purpose: retrieval answers an unknown subject with "I
+    # couldn't find anything about that in your vault", which is both true and the
+    # answer the person wanted -- while the conversation lane would have to refuse it.
+    r"\bsearch\b",
+    r"\blook up\b",
     r"\bremember\b",
     r"\bmy (?:saves|vault|notes|links)\b",
     r"\blast week\b",

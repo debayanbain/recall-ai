@@ -279,8 +279,16 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
     from app.services.telegram.client import TelegramClient
     from app.services.telegram.dispatch import TelegramDispatcher
     from app.services.telegram.linking import TelegramLinkService
+    from app.services.telegram.typing import chat_id_of, typing_action
     from app.services.vault_service import VaultService
     from app.storage import get_storage
+
+    # Read before any work starts, and from the raw payload: the indicator is the only
+    # sign the message arrived, and a reply can be several seconds away -- an embedding,
+    # a planner call and an answer call for a question, a download and an upload for a
+    # file. Silence for that long reads as a bot that never received the message, and
+    # the user sends it again.
+    typing_chat_id = chat_id_of(update)
 
     async with TelegramClient() as client, task_session() as session:
         links = TelegramLinkService(
@@ -291,10 +299,11 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
             links, vault, client, recall=_recall_responder(vault.repo)
         )
 
-        result = await dispatcher.handle(update)
-        # Commit before enqueuing anything: the worker that picks the job up runs in a
-        # different transaction and must be able to see the row.
-        await session.commit()
+        async with typing_action(client, typing_chat_id):
+            result = await dispatcher.handle(update)
+            # Commit before enqueuing anything: the worker that picks the job up runs in
+            # a different transaction and must be able to see the row.
+            await session.commit()
 
         for item_id in result.enqueue_item_ids:
             try:

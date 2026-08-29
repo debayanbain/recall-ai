@@ -16,7 +16,7 @@ from app.ai.chat.chain import format_context
 from app.ai.chat.retriever import to_document
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine.cards import build_detail_card
+from app.services.chat_engine.cards import build_detail_card, short_id
 
 _USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 _BODY = "SECRET-BODY-TEXT that used to be pasted into the prompt. " * 40
@@ -40,8 +40,9 @@ def _item(n: int, **overrides: object) -> VaultItem:
 
 
 def test_the_fencing_and_its_headers_are_unchanged() -> None:
-    context = format_context([to_document(_item(1))])
-    assert context.startswith('<memory id="1" title="Title 1"')
+    item = _item(1)
+    context = format_context([to_document(item)])
+    assert context.startswith(f'<memory id="{short_id(item)}" title="Title 1"')
     assert 'category="Business"' in context
     assert 'saved="2026-08-25"' in context
     assert 'url="https://example.com/1"' in context
@@ -75,17 +76,30 @@ def test_the_budget_drops_whole_blocks_rather_than_truncating_one() -> None:
     cap that never engages would make this test pass while proving nothing.
     """
     long_summary = "Applying to employers in this country works as follows. " * 6
-    context = format_context(
-        [to_document(_item(n, summary=long_summary)) for n in range(40)]
-    )
+    items = [_item(n, summary=long_summary) for n in range(40)]
+    context = format_context([to_document(item) for item in items])
     blocks = context.split("\n\n")
 
     assert 0 < len(blocks) < 40
     assert all(b.startswith("<memory id=") and b.endswith("</memory>") for b in blocks)
     # Kept blocks are a prefix, in the retriever's relevance order.
     assert [b.split('id="')[1].split('"')[0] for b in blocks] == [
-        str(n) for n in range(1, len(blocks) + 1)
+        short_id(item) for item in items[: len(blocks)]
     ]
+
+
+def test_a_block_is_labelled_with_the_memorys_own_id_not_its_position() -> None:
+    """The id is what an answer's citation is checked against, so it has to be stable.
+
+    "memory 3" names a different row on the next question, which makes an invented
+    citation indistinguishable from a real one -- there is nothing to compare it to.
+    """
+    items = [_item(n) for n in range(3)]
+    blocks = format_context([to_document(item) for item in items]).split("\n\n")
+
+    for item, block in zip(items, blocks, strict=True):
+        assert block.startswith(f'<memory id="{short_id(item)}"')
+        assert f"[{short_id(item)}]" in block
 
 
 def test_a_document_without_an_item_still_renders_rather_than_vanishing() -> None:

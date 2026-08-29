@@ -351,6 +351,98 @@ catch-all and must stay last, so new extractors get appended *before* it.
   call — an empty context invites the model to invent a memory, and pays for the privilege.
   A purely time-scoped question ("what did I save this week?") is answered by
   `list_filtered` alone: no embedding, no vector search, no answer model.
+- **Top-k is not truth, and the filter runs before the prompt exists.** A vector search
+  cannot return "nothing": `ORDER BY embedding <=> $1 LIMIT 8` hands back the eight
+  least-unrelated rows however far away they are, so the old zero-hit short circuit
+  caught an empty vault and nothing else. `MemoryRetriever.recall` now returns
+  `RetrievedMemory(item, score)` — `score = 1 - cosine_distance`, clamped — and
+  `services/chat_engine/evidence.py::assess` turns that into one of three states before
+  a prompt is built. `no_evidence` (nothing cleared `RECALL_MIN_SCORE`) is answered by
+  the fixed sentence with **no model call at all**, exactly like zero rows; `insufficient`
+  still answers but the chain is handed `GUIDANCE_WEAK`, which tells it to say the match
+  is weak rather than stretch it; `supported` is the ordinary path. Two filters, doing
+  different jobs: the absolute floor is what the *embedding model's* scale decides — it
+  is configuration because Gemini's similarities sit high and bunched while OpenAI's
+  spread low, and a constant compiled in would be wrong for one of them with nothing to
+  notice — while `RECALL_SCORE_MARGIN` is relative and provider-independent, dropping
+  memories far weaker than the best hit so one strong match is not diluted by seven
+  mediocre ones the model would try to connect. **Retune the floor whenever the embedding
+  provider changes**, alongside the re-embed that change already requires.
+- **A memory block is labelled with the item's own short id, not its position.**
+  `cards.short_id` is the single definition, used by the card, by the fence in
+  `ai/chat/chain.py` and by the answer validator — `"memory 3"` names a different row on
+  the next question, which makes an invented citation indistinguishable from a real one.
+- **The answer is checked against its evidence on the way out**
+  (`services/chat_engine/validation.py`). A prompt is a request, not a constraint, and
+  the answer that breaks a rule is the one nobody notices because it reads like the
+  others. Deterministic checks only: a citation naming a memory that was never supplied
+  is removed and logged as `recall_answer_corrected` (the clearest fabrication signal the
+  system has), a URL appearing in no block is replaced (both a false claim about the
+  vault *and* a link a person is invited to tap, in text derived from scraped pages), an
+  empty reply becomes a failure rather than a blank message, and the length is capped.
+  **The checked text is what goes into chat history** — history is replayed into the next
+  prompt, so keeping the raw reply would let a fabrication come back as context and be
+  built on. Verifying a *claim* ("saved on 12 August") is deliberately not attempted:
+  that is claim extraction plus per-claim verification, a real design and not a regex.
+  `RecallAnswer.memory_ids` carries the evidence ids so a wrong answer stays traceable;
+  nothing renders them yet.
+- **The chat lane is a CLOSED gate, not a filter — it was a blocklist and that was a
+  bug.** `services/chat_engine/scope.py` first enumerated what to refuse (translate,
+  "what is the capital of"), and a live bot asked *"Who is sunny leone?"* matched nothing
+  and replied with a biography. Adding a `who is <person>` pattern would not have fixed
+  it: general knowledge is not a list of phrasings, it is everything. The polarity is now
+  inverted — `scope.check` **allows** only a message that is recognisably (a) *social*
+  (greeting/thanks/goodbye, matched against the whole normalised message, or a ≤6-word
+  message that *opens* with a social word and asks for nothing), (b) *self-referential*
+  ("how does this work"), or (c) *domain* (names saving, notes, links, files, the vault,
+  a content source, connecting an account) — and refuses everything else with no model
+  call. Blocked instruction shapes are checked first so a domain word cannot launder one
+  ("translate this note"). The `Verdict.reason` is logged: a rise in `no_domain_signal`
+  is either an attack surface or a gate that has gone too tight, and only reading the
+  messages tells them apart.
+  Three traps for anyone editing it. **`you`/`your` are not domain signals** — they read
+  as being about the bot until someone writes "can you tell me who X is". **The social
+  word must lead** — matching it anywhere let "recommend a good movie" through on
+  "good". **This package may not name the messaging surface** (`test_boundaries.py`), so
+  content sources are listed and the surface is not. Keep the gate narrow: a false
+  decline costs a rephrase and is visible; a false allow is a confident answer in the
+  assistant's own voice that nobody notices. `search`/`look up` were moved into the
+  router's RECALL patterns for the same reason — retrieval answers an unknown subject
+  with "I couldn't find anything about that in your vault", which is both true and what
+  the person wanted.
+- **The conversation lane's output is bounded too, and harder than recall's.**
+  `RecallChatService.chat` runs its reply through the same `validate_answer` with
+  `allowed_urls=()` and `CHAT_REPLY_MAX_CHARS` (600): this lane has *no evidence at all*
+  behind it, so every URL it emits is unsupported by construction, and a reply that has
+  run to essay length has stopped being about this product. It is the layer that still
+  holds when the prompt is talked past — a prompt is a request, a cap is not.
+- **The bot types while it works, and the indicator is started in TWO places.**
+  `sendChatAction` existed on the client and was never called, so the bot was silent
+  from the message to the reply — several seconds for a
+  recall (embedding, planner, vector scan, answer) and longer for a file, which reads as
+  a bot that never received the message and gets the same thing sent again.
+  `services/telegram/typing.py` wraps the dispatch in `typing_action`, which **re-sends
+  the action on a timer**: Telegram expires the indicator after ~5s and offers no way to
+  cancel one, so a single action at the start goes quiet mid-wait, which is worse than
+  never showing it. It is bounded by `MAX_SECONDS`, cancelled when the block exits (the
+  reply itself clears the indicator), and swallows its own failures — a cosmetic dot must
+  never turn a successful capture into a Celery retry. The chat id is read straight off
+  the raw update by `chat_id_of`, before parsing and before the `telegram_accounts`
+  lookup, because typing at a chat discloses nothing; group chats are excluded there as
+  everywhere else in this surface.
+  The **webhook** fires one action too (`send_typing_once`, a FastAPI background task so
+  the 202 never waits on a Bot API round trip), because the worker's loop cannot begin
+  until something dequeues the update — and that hop through Redis is the part the sender
+  reads as "did it even arrive?". One action lasts ~5s, which covers the hop; the worker
+  takes over from there. It is fired only on the *queued* path: when the enqueue failed,
+  `notify_degraded` apologises instead, and a typing dot is a promise to reply. The
+  webhook uses `chat_id_of` rather than its own `_telegram_chat_id` for exactly the group
+  reason above — the degraded notice may answer a room because it is an apology for a
+  message already sent there; typing must not.
+  **Both call sites are pinned by wiring tests** (`tests/integrations/test_telegram_typing.py`,
+  `test_telegram_webhook.py`) that run the real `_handle_telegram_update` and the real
+  route, because "the method exists and is tested" is precisely what was true while
+  nothing called it.
 - **Provider tokens are Fernet-encrypted** (`app/core/crypto.py`) in `oauth_accounts`, keyed by
   `TOKEN_ENCRYPTION_KEY`. With no key set (dev) they are dropped, not stored in the clear; the
   boot guard makes the key mandatory outside dev once any provider is configured. The Facebook

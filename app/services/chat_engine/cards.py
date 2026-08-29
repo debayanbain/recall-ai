@@ -91,7 +91,7 @@ def _field(value: object, limit: int) -> str | None:
 def build_card(item: VaultItem) -> str:
     """Render one memory. Every field is optional; an empty item still yields a card."""
     name = _field(item.ai_label, SUMMARY_LIMIT) or _field(item.title, SUMMARY_LIMIT)
-    lines = [f"[{_short_id(item)}] {name or 'Untitled'}"]
+    lines = [f"[{short_id(item)}] {name or 'Untitled'}"]
 
     facts = []
     saved = _saved_on(item)
@@ -172,7 +172,17 @@ def build_context(
     return "\n\n".join(cards)
 
 
-def _short_id(item: VaultItem) -> str:
+def short_id(item: VaultItem) -> str:
+    """The handle a memory is known by inside a prompt, and nowhere else.
+
+    Public because three places have to agree on it exactly: the card that carries it,
+    the fence in `ai/chat/chain.py` that labels the block with it, and the validator that
+    checks a citation in the model's answer against the ids it was actually given. Two
+    implementations of this is a validator that approves an id it derived itself.
+
+    Not a secret and not a capability -- it is a prefix of a UUID the owner already has,
+    reaching nothing on its own.
+    """
     return item.id.hex[:ID_CHARS] if item.id is not None else "unsaved"
 
 

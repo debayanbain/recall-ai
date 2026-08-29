@@ -187,6 +187,40 @@ class Settings(BaseSettings):
     TELEGRAM_CAPTURES_PER_HOUR: int = 60
     TELEGRAM_RECALLS_PER_HOUR: int = 20
 
+    # --- Recall answering guard rails ---
+    # A retrieved memory carries a relevance score: 1 - cosine distance, so 1.0 is
+    # identical and 0.0 is unrelated. Top-k is not truth -- a vector search always
+    # returns its k nearest rows, however far away they are, and handing the answer
+    # model a distant memory is how "you saved something about Sweden" gets attached to
+    # a note about Norway. Anything below the floor is dropped before the prompt is
+    # built, and a question left with nothing above it is answered by a fixed sentence
+    # with no model call at all.
+    #
+    # **The right value depends on the embedding model and must be tuned against real
+    # data.** Gemini's text-embedding-004 sits high and close together -- unrelated text
+    # still scores around 0.5 -- while OpenAI's text-embedding-3-small spreads much
+    # lower; roughly 0.25 / 0.40 is the equivalent pair there. The defaults below are
+    # for the default provider. Setting the floor to 0 disables it, which is a decision
+    # to make deliberately rather than by leaving a field blank.
+    RECALL_MIN_SCORE: float = 0.55
+    # Above this a memory is treated as answering the question; between the two the
+    # answer is still generated, but told to say plainly that the match is weak.
+    RECALL_STRONG_SCORE: float = 0.68
+    # Provider-independent second filter: drop memories much weaker than the best hit,
+    # even when they clear the floor. Keeps a single strong match from being diluted by
+    # seven mediocre ones the model would otherwise try to connect.
+    RECALL_SCORE_MARGIN: float = 0.15
+    # A grounded answer about a handful of cards has no honest reason to be long, and an
+    # answer that runs away from its evidence is the shape a fabrication takes. Clipped
+    # rather than rejected -- the first sentences are the answer.
+    RECALL_ANSWER_MAX_CHARS: int = 1500
+    # The conversation lane answers greetings and questions about the bot itself, and
+    # nothing it can honestly say needs more room than this. It is the last gate in front
+    # of a model that has been told to stay in scope and asked politely: a jailbroken
+    # reply gets clipped mid-essay rather than delivered whole. Deliberately smaller than
+    # the recall cap -- an answer here has no evidence behind it to be long about.
+    CHAT_REPLY_MAX_CHARS: int = 600
+
     # --- AI (Gemini) ---
     AI_PROVIDER: Literal["gemini", "openai", "claude"] = "gemini"
 

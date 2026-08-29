@@ -12,6 +12,8 @@ from typing import Any
 
 from langchain_core.documents import Document
 
+from app.services.chat_engine.cards import short_id
+
 #: Enough for the model to answer from, short enough that eight of them stay in budget.
 _MAX_EXCERPT = 600
 
@@ -37,6 +39,10 @@ def to_document(
             # Document, so an ORM object in here never has to survive a round trip.
             "item": item,
             "item_id": str(item.id),
+            # The handle the prompt labels this block with, and the only thing the
+            # answer validator will accept as a citation. Derived from the same
+            # function the card uses, so the two cannot drift apart.
+            "short_id": short_id(item),
             "title": item.title or item.source_url or "Untitled",
             "source_url": item.source_url,
             "ai_category": item.ai_category,

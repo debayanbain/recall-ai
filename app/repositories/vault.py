@@ -187,8 +187,17 @@ class VaultRepository:
 
         # One round trip for the rows themselves, then restored to distance order: the
         # IN clause loses the ordering the index just established.
+        #
+        # The tenant predicate is repeated here even though every id came from the scoped
+        # query above. Fetching rows by id alone is the shape that turns any upstream
+        # scoping mistake into a cross-tenant read, and this is the last query before the
+        # rows reach a prompt -- so it states the constraint rather than inheriting it.
         items = await self.session.exec(
-            select(VaultItem).where(col(VaultItem.id).in_(list(best)))
+            select(VaultItem).where(
+                col(VaultItem.id).in_(list(best)),
+                VaultItem.user_id == user_id,
+                col(VaultItem.deleted_at).is_(None),
+            )
         )
         by_id = {item.id: item for item in items.all()}
         return sorted(

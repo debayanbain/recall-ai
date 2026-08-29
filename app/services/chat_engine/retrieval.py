@@ -16,6 +16,13 @@ nothing would flag.
 positional argument and goes straight to `VaultRepository.search_semantic`, which does
 the filtering. `get_unscoped` exists for the worker, which has no request user, and must
 never be reachable from a conversation -- `tests/chat_engine/test_retrieval.py` pins that.
+
+**Distances travel with the rows.** They used to be dropped here, which made every later
+stage treat the eighth result exactly like the first -- and a vector search always
+returns its k nearest rows however far away they are, so "nothing matched" and "eight
+weak matches" arrived downstream looking identical. Nothing after this point can
+reconstruct the number: the query vector is gone. Judging what the score *means* is
+`evidence.py`'s job, not this module's; this only refuses to throw it away.
 """
 from __future__ import annotations
 
@@ -26,8 +33,8 @@ from datetime import datetime
 
 from app.ai import get_ai_provider
 from app.models.base import ContentType
-from app.models.vault import VaultItem
 from app.repositories.vault import VaultRepository
+from app.services.chat_engine.evidence import RetrievedMemory, from_rows
 
 #: Enough for the answer to have something to choose between, few enough that their cards
 #: fit a prompt budget. The caller may lower it -- a detail question wants one or two.
@@ -56,8 +63,13 @@ class MemoryRetriever:
         filters: MemoryFilters | None = None,
         *,
         limit: int = DEFAULT_LIMIT,
-    ) -> list[VaultItem]:
-        """The memories most like `question`, most similar first. No answer model."""
+    ) -> list[RetrievedMemory]:
+        """The memories most like `question`, best first, each with its score.
+
+        No answer model, and no judgement about whether the scores are good enough --
+        that is `evidence.assess`, deliberately a separate step so the threshold is not
+        buried in the query.
+        """
         narrowing = filters or MemoryFilters()
         vector = await get_ai_provider().generate_embedding(question)
         rows = await self.repo.search_semantic(
@@ -68,4 +80,4 @@ class MemoryRetriever:
             content_types=narrowing.content_types,
             category=narrowing.category,
         )
-        return [item for item, _distance in rows]
+        return from_rows(rows)

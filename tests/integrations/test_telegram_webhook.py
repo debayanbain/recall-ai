@@ -239,3 +239,59 @@ def test_a_stall_check_that_itself_fails_stays_quiet(
 
     assert response.status_code == 202
     assert notices == []
+
+
+# --- the typing indicator starts here, not at the worker ------------------------------
+
+
+@pytest.fixture
+def typed(monkeypatch: pytest.MonkeyPatch) -> list[str]:
+    """Capture the chat the API asked Telegram to show "typing…" in."""
+    chats: list[str] = []
+
+    async def _fake(chat_id: str) -> None:
+        chats.append(chat_id)
+
+    monkeypatch.setattr("app.api.v1.webhooks.send_typing_once", _fake)
+    return chats
+
+
+def test_a_queued_update_starts_typing_before_the_worker_has_it(
+    client: TestClient, queued: list[dict[str, Any]], typed: list[str]
+) -> None:
+    """The worker keeps the indicator alive, but it cannot start one until something
+    dequeues the update -- and that hop is the part the sender reads as "did it arrive?".
+    """
+    assert _post(client, _SECRET, _SECRET, _update()).status_code == 202
+    assert typed == ["4242"]
+
+
+def test_a_group_update_is_never_typed_into(
+    client: TestClient, queued: list[dict[str, Any]], typed: list[str]
+) -> None:
+    """A typing dot is a promise to reply, and the bot does not act in a room."""
+    update = _update(chat={"id": -100200, "type": "group"})
+    assert _post(client, _SECRET, _SECRET, update).status_code == 202
+    assert typed == []
+
+
+def test_nothing_types_when_the_update_never_reached_the_queue(
+    client: TestClient, typed: list[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A broker outage answers with the degraded notice instead. Typing there would
+    promise a reply nothing is going to write."""
+
+    async def _explode(update: dict[str, Any]) -> None:
+        raise RuntimeError("redis is gone")
+
+    async def _quiet_notice(chat_id: str, *, queued: bool) -> None:
+        return None
+
+    monkeypatch.setattr("app.api.v1.webhooks.enqueue_telegram_update", _explode)
+    monkeypatch.setattr(settings, "TELEGRAM_WEBHOOK_SECRET", _SECRET)
+    monkeypatch.setattr("app.api.v1.webhooks.notify_degraded", _quiet_notice)
+
+    response = _post(client, _SECRET, _SECRET, _update())
+
+    assert response.json() == {"status": "unavailable"}
+    assert typed == []

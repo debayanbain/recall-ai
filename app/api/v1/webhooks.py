@@ -26,6 +26,7 @@ from app.core.logging import get_logger
 from app.queue.client import enqueue_finalize_run, enqueue_telegram_update
 from app.queue.health import is_stalled
 from app.services.telegram.notices import notify_degraded
+from app.services.telegram.typing import chat_id_of, send_typing_once
 
 router = APIRouter(prefix="/webhooks", tags=["webhooks"])
 log = get_logger("webhooks")
@@ -121,11 +122,29 @@ async def telegram_webhook(
 
     log.info("telegram_webhook_queued", update_id=str(body.get("update_id"))[:20])
 
-    # Queued is not the same as "will be answered". If nothing is consuming the queue the
-    # update is durable but nobody is working on it, and the sender would otherwise wait
-    # on a reply that no process is going to write. Checked after the 202 is decided, in
-    # the background, so a healthy path pays nothing for it.
     if chat_id:
+        # Start the typing indicator here rather than leaving it all to the worker. The
+        # worker keeps it alive for as long as the work takes, but it cannot begin until
+        # something dequeues the update -- and that hop through Redis is the part of the
+        # wait the sender experiences as "did it even arrive?". Added first so it runs
+        # before the stall probe below, which talks to the broker.
+        #
+        # A background task, so the 202 is not waiting on a Bot API round trip: Telegram
+        # redelivers anything it does not get an answer to, which is exactly how one slow
+        # outbound call becomes a redelivery loop.
+        #
+        # `chat_id_of` and not the `chat_id` above: it is private-only, and the bot does
+        # not act in a group, so it must not appear to be about to. The degraded notice
+        # answers a room because it is an apology for a message that was already sent
+        # there; a typing dot is a promise to reply.
+        typing_chat_id = chat_id_of(body)
+        if typing_chat_id:
+            background.add_task(send_typing_once, typing_chat_id)
+
+        # Queued is not the same as "will be answered". If nothing is consuming the queue
+        # the update is durable but nobody is working on it, and the sender would
+        # otherwise wait on a reply that no process is going to write. Checked after the
+        # 202 is decided, in the background, so a healthy path pays nothing for it.
         background.add_task(_notify_if_stalled, chat_id)
     return {"status": "queued"}
 
