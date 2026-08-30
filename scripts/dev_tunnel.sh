@@ -37,14 +37,23 @@ TUNNEL="${TUNNEL:-ngrok}"
 API_PREFIX="/api/v1"
 LOG="$(mktemp -t recall-tunnel.XXXXXX)"
 TUNNEL_PID=""
+WORKER_PID=""
+FLOWER_PID=""
 
 cleanup() {
-  if [ -n "$TUNNEL_PID" ]; then
-    # Children first: cloudflared and ngrok are single processes, but a wrapper script
-    # on PATH would otherwise leave the real tunnel orphaned.
-    pkill -P "$TUNNEL_PID" 2>/dev/null || true
-    kill "$TUNNEL_PID" 2>/dev/null || true
-  fi
+  for pid in "$TUNNEL_PID" "$WORKER_PID" "$FLOWER_PID"; do
+    if [ -n "$pid" ]; then
+      # Children first: cloudflared and ngrok are single processes, but a wrapper script
+      # on PATH would otherwise leave the real tunnel orphaned -- and the worker really
+      # is a wrapper, since watchfiles owns the celery process rather than being it.
+      pkill -P "$pid" 2>/dev/null || true
+      kill "$pid" 2>/dev/null || true
+    fi
+  done
+  # Celery's prefork children outlive a plain kill of their parent often enough that a
+  # stale worker on old code survives a restart -- which is the exact failure this
+  # script now exists to prevent.
+  pkill -f "celery -A app.queue.celery_app" 2>/dev/null || true
   rm -f "$LOG"
 }
 trap cleanup EXIT INT TERM
@@ -166,5 +175,38 @@ if [ "$TUNNEL" = "ngrok" ] && [ -z "${NGROK_DOMAIN:-}" ]; then
 
 EOF
 fi
+
+# The worker comes up with the API, not in a second terminal someone has to remember.
+# This is the tunnel path, which is the one Telegram needs (it will not deliver to a
+# plaintext URL), so it is also the path where a missing worker is most visible: the
+# webhook accepts the update, nothing consumes it, and the sender is told the processing
+# service is restarting. Started before uvicorn so the queue has a consumer from the
+# first delivery.
+./scripts/dev_worker.sh > /tmp/recall-worker.log 2>&1 &
+WORKER_PID=$!
+echo "  worker      started (pid $WORKER_PID) -- log: /tmp/recall-worker.log"
+
+# Flower, on localhost only. It renders task arguments -- Telegram chat ids among them --
+# behind no authentication, so it is bound to 127.0.0.1 and deliberately NOT published
+# through the tunnel that everything else here runs behind. The URL below is the loopback
+# one for that reason; do not "helpfully" swap it for $URL.
+FLOWER_PORT="${FLOWER_PORT:-5555}"
+./scripts/dev_flower.sh > /tmp/recall-flower.log 2>&1 &
+FLOWER_PID=$!
+FLOWER_URL=""
+for _ in $(seq 1 10); do
+  if curl -sf -o /dev/null "http://127.0.0.1:$FLOWER_PORT/" 2>/dev/null; then
+    FLOWER_URL="http://127.0.0.1:$FLOWER_PORT"
+    break
+  fi
+  sleep 0.4
+done
+if [ -n "$FLOWER_URL" ]; then
+  echo "  flower      $FLOWER_URL"
+else
+  # A cold uv cache takes longer to resolve flower than it is worth blocking the API for.
+  echo "  flower      http://127.0.0.1:$FLOWER_PORT (starting -- see /tmp/recall-flower.log)"
+fi
+echo
 
 uv run uvicorn app.main:app --reload --port "$API_PORT"

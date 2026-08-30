@@ -196,16 +196,32 @@ class Settings(BaseSettings):
     # built, and a question left with nothing above it is answered by a fixed sentence
     # with no model call at all.
     #
-    # **The right value depends on the embedding model and must be tuned against real
-    # data.** Gemini's text-embedding-004 sits high and close together -- unrelated text
-    # still scores around 0.5 -- while OpenAI's text-embedding-3-small spreads much
-    # lower; roughly 0.25 / 0.40 is the equivalent pair there. The defaults below are
-    # for the default provider. Setting the floor to 0 disables it, which is a decision
-    # to make deliberately rather than by leaving a field blank.
-    RECALL_MIN_SCORE: float = 0.55
+    # **These numbers belong to the embedding model and were measured, not guessed.**
+    # Against a live vault on OpenAI `text-embedding-3-small`:
+    #
+    #     "sweden education jobs" -> 0.560  (the Sweden item)      true match
+    #     "software engineer"     -> 0.373  (the CV item)          true match
+    #     "cooking recipes"       -> 0.148                         noise
+    #     "sunny leone"           -> 0.111                         noise
+    #     "quantum physics"       -> 0.092                         noise
+    #
+    # True matches land in 0.37-0.56 and noise tops out around 0.27, so the floor goes
+    # in the gap. The first draft of this setting was 0.55 -- a figure carried over from
+    # Gemini, whose similarities sit high and bunched -- and it would have rejected the
+    # 0.373 match and reported an item the user really had saved as missing. That is the
+    # failure this pair of settings can cause and the reason to re-measure rather than
+    # copy a number: **the floor is only meaningful next to the model that produced the
+    # vectors.** Re-run the measurement whenever the embedding provider changes, at the
+    # same time as the full re-embed that change already requires. Setting the floor to 0
+    # disables it, which is a decision to make deliberately rather than by leaving a
+    # field blank.
+    RECALL_MIN_SCORE: float = 0.30
     # Above this a memory is treated as answering the question; between the two the
-    # answer is still generated, but told to say plainly that the match is weak.
-    RECALL_STRONG_SCORE: float = 0.68
+    # answer is still generated, but told to say plainly that the match is weak. Sits
+    # between the two measured true matches on purpose: 0.56 answers plainly, 0.37
+    # answers with the caveat. Erring toward the caveat is the safe direction -- it is a
+    # hedge, not a refusal.
+    RECALL_STRONG_SCORE: float = 0.45
     # Provider-independent second filter: drop memories much weaker than the best hit,
     # even when they clear the floor. Keeps a single strong match from being diluted by
     # seven mediocre ones the model would otherwise try to connect.

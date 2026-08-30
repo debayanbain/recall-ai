@@ -47,6 +47,10 @@ dev = [
     "ruff>=0.8",
     "mypy>=1.13",
     "aiosqlite>=0.20",
+    # Celery's web UI, started by the dev runners. A dev extra rather than a runtime
+    # dependency: nothing in `app/` imports it, and it must not ship with the service --
+    # it renders task arguments (Telegram chat ids among them) behind no authentication.
+    "flower>=2.0",
 ]
 
 [tool.ruff]

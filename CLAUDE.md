@@ -18,6 +18,31 @@ uv run celery -A app.queue.celery_app.celery_app worker   # worker -- needs Redi
 uv run celery -A app.queue.celery_app.celery_app beat     # sweeper for lost callbacks
 ```
 
+**In development, start the stack with `make dev` or `make dev-tunnel` — they bring the
+worker up themselves.** The worker used to be a second terminal someone had to remember,
+and a worker that has to be remembered is a worker that is sometimes not running. The
+symptom reaches a real person: the webhook accepts the update, `is_stalled()` sees a
+non-empty queue with nobody consuming it, and the sender is told "my processing service
+is restarting". That message is correct — the update is durable and gets answered when a
+worker returns — but the cause is almost always just that nothing started one.
+
+`scripts/dev_worker.sh` also runs the worker under `watchfiles`, so it **reloads on code
+change** like `uvicorn --reload` does. Without that the API ran new code while the worker
+ran old, which is silent and worse than a crash: the bot still answers, just with the
+logic you thought you had replaced. Both dev runners clean the worker up through the
+*same* trap that stops the tunnel — `trap ... EXIT` replaces rather than appends, so a
+second trap would orphan the first process.
+
+Both runners also start **Flower**, Celery's web UI, and print its link in the terminal
+next to the tunnel URL — worker liveness, queue depth, task history and per-task
+tracebacks. `make flower` runs it alone against a stack someone else started. It is a
+*dev extra*, never a runtime dependency: nothing in `app/` imports it, and it must not
+ship with the service. **It binds 127.0.0.1 and is deliberately not published through the
+tunnel** — it renders task arguments, which here include Telegram chat ids, and it has no
+authentication in front of it. Its own `/api/*` endpoints answer 401 unless
+`FLOWER_UNAUTHENTICATED_API` is set; leave it unset, the browser UI does not need it.
+A worker that is simply not running is invisible from the app and a glance here.
+
 Quality gates (CI is not wired up — `.github/workflows/` is empty, so run these by hand):
 
 ```bash
@@ -367,7 +392,11 @@ catch-all and must stay last, so new extractors get appended *before* it.
   notice — while `RECALL_SCORE_MARGIN` is relative and provider-independent, dropping
   memories far weaker than the best hit so one strong match is not diluted by seven
   mediocre ones the model would try to connect. **Retune the floor whenever the embedding
-  provider changes**, alongside the re-embed that change already requires.
+  provider changes**, alongside the re-embed that change already requires — and *measure*
+  it rather than carrying a number over. The first draft shipped Gemini's 0.55 onto an
+  OpenAI (`text-embedding-3-small`) vault, where a measured true match scores 0.373 and
+  noise tops out near 0.27: it would have reported items the user really had saved as
+  missing. The measured distribution and the current values are in `app/core/config.py`.
 - **A memory block is labelled with the item's own short id, not its position.**
   `cards.short_id` is the single definition, used by the card, by the fence in
   `ai/chat/chain.py` and by the answer validator — `"memory 3"` names a different row on

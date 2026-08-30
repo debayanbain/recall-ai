@@ -18,6 +18,7 @@ import pytest
 
 from app.ai.chat import chain, history
 from app.ai.chat.planner import MemoryQuery
+from app.core.config import settings
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
 from app.services.chat_engine.cards import short_id
@@ -31,6 +32,11 @@ _BODY = "Redis persists with RDB snapshots and an append-only file. " * 30
 
 #: Comfortably above `RECALL_STRONG_SCORE` unless a test says otherwise.
 _STRONG = 0.9
+#: Between the floor and the strong threshold, wherever this deployment has put them.
+#: Derived rather than written down: the thresholds belong to the embedding model and
+#: get re-measured when it changes, and a hard-coded 0.6 here turns that retuning into
+#: a test failure that says nothing about the behaviour under test.
+_WEAK = (settings.RECALL_MIN_SCORE + settings.RECALL_STRONG_SCORE) / 2
 
 
 def _item(n: int = 0) -> VaultItem:
@@ -208,7 +214,7 @@ async def test_a_weak_match_is_answered_but_told_it_is_weak(
     """Between the floor and the strong threshold, the answer is hedged rather than
     dropped: "I found something related but it doesn't say" is a true and useful reply,
     and it is only honest if the model was told which of the two situations it is in."""
-    _with_memories(monkeypatch, [_item(0)], score=0.6)
+    _with_memories(monkeypatch, [_item(0)], score=_WEAK)
     service = RecallChatService(repo=None)  # type: ignore[arg-type]
 
     await service.answer(_USER, "what did I save about redis?", "555000")
