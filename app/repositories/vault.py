@@ -3,13 +3,15 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
-from typing import Any
+from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
+from sqlalchemy.orm import load_only
 from sqlmodel import col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.models.base import ContentType
+from app.models.base import ContentType, ProcessingStatus
+from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.vault import VaultChunk, VaultItem
 
 # Semantic search reads chunks, but callers want items. With more than one chunk per
@@ -50,6 +52,78 @@ class VaultRepository:
         """For workers: fetch without user scoping."""
         return await self.session.get(VaultItem, item_id)
 
+    #: The columns a card needs, which is what `VaultItemRead` serializes. A listing that
+    #: selects `*` also drags `content`, `item_metadata` and `ai_highlights` across the
+    #: wire for every row -- an article body is kilobytes, a page is twenty of them, and
+    #: none of it is rendered. Loaded with `raiseload` so a field added to the list
+    #: response without being added here fails loudly here rather than emitting a silent
+    #: per-row query (or a `DetachedInstanceError` after the session closes).
+    _CARD_COLUMNS = (
+        "type",
+        "source_url",
+        "title",
+        "summary",
+        "thumbnail_url",
+        "ai_tags",
+        "ai_category",
+        "ai_label",
+        "processing_status",
+        "processing_error",
+        "created_at",
+        "file_name",
+        "file_size",
+        "mime_type",
+    )
+
+    async def _page(
+        self,
+        base: Any,
+        limit: int,
+        offset: int,
+        *,
+        cards_only: bool = False,
+    ) -> tuple[Sequence[VaultItem], int]:
+        """Run a filtered listing and its total in ONE round trip.
+
+        The obvious shape is two statements -- `SELECT count(*)` then `SELECT ... LIMIT`
+        -- and against a local database that is free. Against a managed one in another
+        region each statement is a full network round trip (~290ms measured to Neon
+        ap-southeast-1), so the count silently doubled the cost of every list request.
+
+        `count(*) OVER ()` computes the same total inside the same scan and rides back on
+        every row. The one behavioural difference is that a page past the end returns no
+        rows and therefore no count: that is reported as 0, which is what the caller does
+        with an out-of-range offset anyway.
+
+        `base` is a SQLModel `select(VaultItem)` with the tenant predicate already
+        applied. It is never built from caller-supplied SQL -- every filter that reaches
+        it is a bound parameter -- so this adds no injection surface.
+        """
+        total_col = func.count().over().label("total")
+        query = (
+            base.add_columns(total_col)
+            .order_by(col(VaultItem.created_at).desc())
+            .limit(limit)
+            .offset(offset)
+        )
+        if cards_only:
+            query = query.options(
+                load_only(
+                    *(getattr(VaultItem, name) for name in self._CARD_COLUMNS),
+                    raiseload=True,
+                )
+            )
+        # `session.execute`, not `session.exec`: SQLModel's `exec()` narrows a select back
+        # to its single entity and silently drops the extra column, so the window total
+        # would never arrive (and the row would unpack as the model's own fields).
+        rows = await self.session.execute(query)
+        pairs = rows.all()
+        if not pairs:
+            # No rows means no window total either. An offset past the end is the only
+            # way to get here on a non-empty vault, and 0 is what the caller does with it.
+            return [], 0
+        return [cast("VaultItem", row[0]) for row in pairs], int(pairs[0][1])
+
     async def list_for_user(
         self, user_id: uuid.UUID, limit: int = 20, offset: int = 0
     ) -> tuple[Sequence[VaultItem], int]:
@@ -57,13 +131,7 @@ class VaultRepository:
             VaultItem.user_id == user_id,
             col(VaultItem.deleted_at).is_(None),
         )
-        total = await self.session.exec(
-            select(func.count()).select_from(base.subquery())
-        )
-        rows = await self.session.exec(
-            base.order_by(col(VaultItem.created_at).desc()).limit(limit).offset(offset)
-        )
-        return rows.all(), total.one()
+        return await self._page(base, limit, offset, cards_only=True)
 
     async def search(
         self, user_id: uuid.UUID, query: str, limit: int = 20, offset: int = 0
@@ -79,13 +147,7 @@ class VaultRepository:
                 col(VaultItem.content).ilike(pattern),
             ),
         )
-        total = await self.session.exec(
-            select(func.count()).select_from(base.subquery())
-        )
-        rows = await self.session.exec(
-            base.order_by(col(VaultItem.created_at).desc()).limit(limit).offset(offset)
-        )
-        return rows.all(), total.one()
+        return await self._page(base, limit, offset, cards_only=True)
 
     async def list_filtered(
         self,
@@ -117,13 +179,7 @@ class VaultRepository:
             # `@>` on jsonb: the item's tag array must contain every tag asked for.
             base = base.where(col(VaultItem.ai_tags).contains(list(tags)))
 
-        total = await self.session.exec(
-            select(func.count()).select_from(base.subquery())
-        )
-        rows = await self.session.exec(
-            base.order_by(col(VaultItem.created_at).desc()).limit(limit).offset(offset)
-        )
-        return rows.all(), total.one()
+        return await self._page(base, limit, offset)
 
     async def search_semantic(
         self,
@@ -204,6 +260,43 @@ class VaultRepository:
             ((by_id[i], d) for i, d in best.items() if i in by_id),
             key=lambda pair: pair[1],
         )
+
+    async def list_stranded(
+        self,
+        status: ProcessingStatus,
+        older_than_minutes: int,
+        limit: int = 100,
+    ) -> Sequence[VaultItem]:
+        """Items sitting in `status` with nobody behind them.
+
+        `updated_at` carries an `onupdate`, so for a `processing` row it is the moment the
+        worker claimed it — which is exactly the clock a stall should be measured against.
+
+        Items with a **running extraction run** are excluded. Those are the deferred
+        Apify captures, which legitimately sit in `processing` for minutes while a crawl
+        runs; `sweep_stale_runs` owns them and asks the provider what actually happened.
+        Two sweepers reaching for the same row would race to a verdict, and the one with
+        less information would sometimes win.
+
+        Ordered oldest-first and capped so one sweep tick cannot try to rescue the whole
+        table after an outage.
+        """
+        cutoff = datetime.now(UTC) - timedelta(minutes=older_than_minutes)
+        running_runs = select(ExtractionRun.vault_item_id).where(
+            ExtractionRun.status == RunStatus.running
+        )
+        result = await self.session.exec(
+            select(VaultItem)
+            .where(
+                VaultItem.processing_status == status,
+                col(VaultItem.updated_at) < cutoff,
+                col(VaultItem.deleted_at).is_(None),
+                col(VaultItem.id).not_in(running_runs),
+            )
+            .order_by(col(VaultItem.updated_at))
+            .limit(limit)
+        )
+        return result.all()
 
     async def delete(self, item: VaultItem) -> None:
         await self.session.delete(item)

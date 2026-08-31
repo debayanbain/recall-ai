@@ -30,6 +30,16 @@ one of three things, and is declined otherwise:
 3. **Domain.** The message names something this product is actually about: saving,
    notes, links, files, the vault, a source platform, connecting an account.
 
+**Every pattern here is English, and that was a second hole.** Normalisation strips
+everything outside `[a-z0-9' ]`, so a message in Bengali, Chinese or Arabic left an empty
+string -- which this module read as "an emoji, so a reaction" and allowed. The result was
+that every non-Latin sentence reached the conversation model, the one lane that cannot
+see the vault, while the router's English question test had already declined to send it
+to retrieval. Asking about your own memories in Bengali did nothing at all, quietly.
+Non-Latin text longer than a greeting is now routed to retrieval by the router
+(`app/core/scripts.py`), and anything unreadable that still arrives here is declined
+rather than assumed friendly.
+
 Everything else is declined with no model call. Note what is deliberately *not* a domain
 signal: the words "you" and "your". They read as being about the bot, but "can you tell
 me who X is" contains one, and admitting that single word reopens the whole hole.
@@ -53,6 +63,8 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+
+from app.core import scripts
 
 #: Bounded like the router's, and for the same reason: the caller may hand this an
 #: arbitrarily long body, and the ask is in the opening in every case that matters.
@@ -239,8 +251,18 @@ def check(text: str | None) -> Verdict:
 
     normalised = _normalise(raw)
     if not normalised:
-        # Emoji, punctuation, or a sticker's worth of nothing. A reaction, so social.
-        return Verdict(True, "social")
+        # `_normalise` keeps only `[a-z0-9' ]`, so "nothing left" covers two very
+        # different messages and used to wave both through as social.
+        #
+        # An emoji or a run of punctuation really is a reaction. A sentence in another
+        # script is not: "আমার নোট দেখাও" normalises to spaces too, and calling it a
+        # greeting sent every Bengali message to a model that cannot see the vault. Only
+        # something short enough to be a greeting keeps that treatment; anything longer
+        # is refused here rather than answered, and the router now sends it to retrieval
+        # before it can reach this gate at all.
+        if scripts.is_short_reaction(raw):
+            return Verdict(True, "social")
+        return Verdict(False, "unreadable_script")
     if _SOCIAL_RE.match(normalised):
         return Verdict(True, "social")
     if _SELF_RE.match(normalised):

@@ -8,14 +8,17 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync --extra dev                          # install deps (Python >=3.11)
 ```
 
-There is no docker-compose — the database is hosted (Neon), set via `DATABASE_URL` in `.env`.
-The API and worker are two separate processes; the worker is only needed for AI processing:
+The database is hosted (Neon), set via `DATABASE_URL` in `.env`. **Redis runs in Docker and
+only in Docker** (`docker-compose.yml`, container `recall-redis`, host port **6380**) — see
+"The queue's infrastructure" below. The API and worker are two separate processes; the
+worker is only needed for AI processing:
 
 ```bash
 uv run alembic upgrade head                         # migrate (needs Postgres w/ pgvector)
 uv run uvicorn app.main:app --reload                # API   -> :8000, docs at /docs
 uv run celery -A app.queue.celery_app.celery_app worker   # worker -- needs Redis
 uv run celery -A app.queue.celery_app.celery_app beat     # sweeper for lost callbacks
+make redis                                          # the broker (Docker); `make dev` does this
 ```
 
 **In development, start the stack with `make dev` or `make dev-tunnel` — they bring the
@@ -42,6 +45,70 @@ tunnel** — it renders task arguments, which here include Telegram chat ids, an
 authentication in front of it. Its own `/api/*` endpoints answer 401 unless
 `FLOWER_UNAUTHENTICATED_API` is set; leave it unset, the browser UI does not need it.
 A worker that is simply not running is invisible from the app and a glance here.
+
+## The queue's infrastructure
+
+**Redis is a container and nothing else.** `docker-compose.yml` owns it; `make redis` brings
+it up and waits for the healthcheck, and `make dev` / `make dev-tunnel` do that themselves
+before starting the worker — a broker that has to be remembered is one that is sometimes not
+running, and a Celery worker with no broker *does not fail*: it retries the connection
+forever, quietly, looking exactly like a healthy worker while every capture sits at
+`pending`.
+
+**Host port 6380, not 6379.** Another project on this machine owns 6379; binding over it
+would either refuse to start or silently share a keyspace with an application that knows
+nothing about ours. Because the instance is now dedicated, `REDIS_URL` uses db **0**. If a
+host Redis is still listening on 6379, `scripts/redis_up.sh` says so — "why is my queue
+empty" is usually "something is pointed at the other one".
+
+Three settings in the compose file are correctness, not tuning:
+
+- **`--maxmemory-policy noeviction`.** Any `allkeys-*` policy lets Redis delete keys of its
+  own accord under pressure, and on a Celery broker those keys *are* queued tasks: a capture
+  acknowledged to the user and then silently never processed, with nothing anywhere to say
+  so. With `noeviction` the **producer** gets an error instead, which `VaultService._enqueue`
+  already handles fail-soft — the row stays `pending` and `sweep_stranded_items` re-queues
+  it. Never "fix" an OOM error here by adding an eviction policy.
+- **`--appendonly yes`** (with RDB off). The broker holds user captures between "saved" and
+  "processed"; a restart with only snapshots drops whatever was queued since the last one.
+  This was verified the hard way — see below.
+- **`--auto-aof-rewrite-min-size 64mb`.** Without a floor Redis rewrites the AOF at 100%
+  growth, which on a near-empty broker fires constantly (observed: *"rewriting of AOF on
+  84224304% growth"*). Every rewrite **forks**, and a fork is where resident memory can
+  briefly approach double the dataset.
+
+**That fork is why the container limit is 3× `maxmemory`, not 2×.** A 2× limit was measured
+killing the broker mid-rewrite: the cgroup SIGKILLs the process, so there is no shutdown line
+in the log and `docker inspect` reports `OOMKilled=false` afterwards — it presents as a
+mystery restart. Redis recovered every key from the AOF, which is the other half of why that
+setting is not optional. `scripts/autoscale.sh` keeps the multiple.
+
+**What actually scales, in the order it reacts:**
+
+| Layer | Mechanism | Driven by |
+|---|---|---|
+| Worker processes | Celery `--autoscale=MAX,MIN` | Celery itself, per second |
+| Redis memory | `CONFIG SET maxmemory` + `docker update --memory` | `scripts/autoscale.sh` |
+| Worker containers | `docker compose up --scale worker=N` | `scripts/autoscale.sh`, from queue depth |
+
+`maxmemory` is a **ceiling, not an allocation** — Redis grows into it as tasks queue and
+frees as they are consumed, so the interesting question was never "does it grow" but "does
+it give the memory back". `--activedefrag yes` is what makes it do so: without it jemalloc
+holds fragmented pages, `used_memory_rss` stays at the high-water mark, and the broker looks
+like it never shrinks even though the queue drained. The autoscaler uses **separate up and
+down thresholds plus consecutive quiet ticks**, because a single threshold oscillates around
+itself and resizes on every gap between bursts.
+
+**Redis is deliberately not scaled horizontally.** Redis Cluster is the only way to add Redis
+capacity, and kombu — what Celery speaks to a broker through — does not support cluster mode.
+A clustered broker is not a bigger queue, it is a broken one. This workload is a handful of
+ops per capture; if one instance ever genuinely saturates, the move is a dedicated broker
+host, not shards.
+
+`make workers` runs the containerised worker and beat (compose profile `workers`) for
+scaling out. **Do not run it alongside `make dev`** — two pools on one queue is not more
+throughput, it is two things claiming the same messages. And never `--scale beat`: it is a
+scheduler, and two of them fire `sweep_stranded_items` twice, racing two verdicts onto one row.
 
 Quality gates (CI is not wired up — `.github/workflows/` is empty, so run these by hand):
 
@@ -356,9 +423,11 @@ catch-all and must stay last, so new extractors get appended *before* it.
 - **Telegram photos arrive with no filename**, and `documents.inspect` reads the extension
   from the filename only, so an un-synthesized name is a guaranteed `DocumentError`.
   `capture.py` derives it from the `getFile` path's suffix, then from the declared MIME
-  type; the magic-byte check still decides what the bytes actually are. Voice notes are
-  refused out loud — there is no ASR and no audio MIME in the allowlist, and a silent drop
-  reads as a bug.
+  type; the magic-byte check still decides what the bytes actually are. Telegram voice
+  messages are still refused out loud — ASR now exists (`services/transcription.py`) but
+  nothing on this surface calls it, and a silent drop reads as a bug. Wiring it means
+  `getFile` on the `voice`/`audio` payload and a call to `save_voice_note`; the audio MIME
+  types deliberately stay out of `documents._ALLOWED`, which is the *document* allowlist.
 - **LangChain is confined to `app/ai/chat/`.** Routers, services and Celery tasks reach it
   only through `services/recall_chat.py`, the same way business code never imports
   `GeminiProvider`. It supplies the multi-turn chat model, `with_structured_output` for
@@ -415,6 +484,58 @@ catch-all and must stay last, so new extractors get appended *before* it.
   that is claim extraction plus per-claim verification, a real design and not a regex.
   `RecallAnswer.memory_ids` carries the evidence ids so a wrong answer stays traceable;
   nothing renders them yet.
+- **Every routing decision in the chat path was English-only, and that was one bug in two
+  halves.** `planner.looks_like_question` matches English opening words, so "আমার নোট
+  দেখাও" ("show my notes") was not a question; `scope._normalise` strips everything
+  outside `[a-z0-9' ]`, so the same sentence became an empty string, which the gate read
+  as an emoji -- a *reaction* -- and allowed into the conversation lane. That lane is
+  given no memories by design. So asking about your own vault in Bengali was answered by
+  a model that had never seen it, and nothing reported a problem. Both halves now go
+  through `app/core/scripts.py`, which counts **letters outside ASCII** -- an observable
+  fact, no model, no table, no network. It is not language identification and does not
+  claim to be. Three consequences:
+  * **Non-Latin text longer than a greeting is a question**, so it goes to *retrieval*.
+    That is the lane that can be wrong safely: with no matching memory it says "I couldn't
+    find anything about that in your vault" rather than answering from general knowledge.
+    A short piece of general knowledge in another script ("সানি লিওন কে", 6 letters) lands
+    there too and gets exactly that answer -- the same outcome the scope gate exists for.
+  * **The threshold is measured, not guessed.** Greetings sit at 2-5 letters in every
+    script tried (হ্যালো 3, 你好 2, नमस्ते 4, مرحبا 5) and anything with a subject and a
+    verb starts at 6. Counted in letters rather than words because Chinese, Japanese and
+    Thai have no spaces -- a whitespace word count reads a whole sentence as one word.
+    Bengali vowel signs are combining marks, not letters, which is another reason to
+    measure rather than eyeball.
+  * **The gate no longer treats "nothing left after normalisation" as friendly.** An
+    emoji still is; an unreadable *sentence* is declined as `unreadable_script`. The
+    router keeps those away from the gate now, but a gate that reads a Bengali sentence
+    as a greeting is wrong whether or not anything depends on it today.
+- **Nothing detects the reply language, so both prompts are told outright.** `_SYSTEM`
+  rule 10 and `_CONVERSE_SYSTEM` rule 8: answer in the language the person wrote in,
+  including declining in it -- a refusal in English to a Bengali request is unreadable to
+  the person who triggered it. The answer prompt also pins that **titles, names and URLs
+  stay exactly as the block spells them**: those identify a saved item, and a translated
+  title is one the user cannot search for.
+- **The no-match reply is a table, because there is no model call to translate it.** A
+  zero-hit search short-circuits with no provider call -- an empty context is the one
+  input the answer prompt has no honest response to -- so `_NO_MATCH` in `recall_chat`
+  carries the sentence per **script**. That has a consequence worth stating: `devanagari`
+  covers Hindi, Marathi and Nepali, so a Marathi speaker gets the Hindi sentence, and no
+  amount of character counting improves on that. The table is **deliberately short** and
+  anything unlisted falls back to English: a machine-translated sentence that reads as
+  broken is worse than plain English at the exact moment someone's search failed. Adding
+  a language is one entry, written by someone who speaks it. The subject is echoed back
+  verbatim -- it is the user's own words, and translating their search term tells them
+  they looked for something they did not.
+- **Enrichment follows the content's language, except the category.** Summary, tags and
+  `ai_label` are all asked for in the content's language, or a Bengali note gets an
+  English card its own author reads in translation. Tags too, accepting that the tag
+  space splits ("jobs" and "চাকরি" never match) -- which is the same split their notes
+  already have. **`ai_category` is the exception and must stay English**: the reply is
+  checked with `in _CATEGORIES`, so a model that helpfully translates it drops the item
+  into "Other". The prompt now says so outright. Highlights need no rule -- they are
+  verbatim quotes and `keep_verbatim` enforces it. The summary and tag prompts are still
+  written out inside each provider, so a rule added to one and not the other is a real
+  risk; `tests/chat_engine/test_non_latin_routing.py` counts them in both.
 - **The chat lane is a CLOSED gate, not a filter — it was a blocklist and that was a
   bug.** `services/chat_engine/scope.py` first enumerated what to refuse (translate,
   "what is the capital of"), and a live bot asked *"Who is sunny leone?"* matched nothing
@@ -540,6 +661,141 @@ catch-all and must stay last, so new extractors get appended *before* it.
   (prefix listing also returns neighbours like `a.png.bak`, which are skipped) and removes
   each by id, falling back to a plain delete when versioning is off. Do not "simplify"
   this back to one `delete_object`.
+- **A voice note's transcript is the memory; the audio is a keepsake beside it.**
+  `POST /vault/voice` (`services/transcription.py` + `VaultService.save_voice_note`)
+  transcribes with OpenAI Whisper, saves a `ContentType.voice` item whose `content` is
+  the transcript, and lets the ordinary pipeline summarise, tag, label and embed it — so
+  a spoken note is searchable by its words, not by its filename. Five things go with that:
+  * **Transcription is NOT on the `AIProvider` Protocol.** Every provider implements that
+    Protocol and Gemini has no Whisper equivalent wired up here; adding `transcribe` would
+    oblige a provider to implement what it cannot, and because the Protocol is structural
+    the gap would only show at runtime. Speech has its own switch —
+    `settings.transcription_enabled`, gated on `OPENAI_API_KEY` alone — so a vault
+    summarising with Gemini still records voice notes.
+  * **The model is `gpt-4o-transcribe`, not `whisper-1`, and language detection is not
+    trusted on its own.** whisper-1 decides the language from the first window of audio,
+    and on a short clip in a non-Latin script it goes wrong in a specific and expensive
+    way: a Bengali voice note came back as fluent, confident Traditional Chinese. Every
+    downstream artefact — title, tags, embedding — was then correct about the wrong text,
+    so nothing on the page looked broken. Three things address it, in order of how much
+    they can be relied on:
+      1. **Pinning.** The recorder offers a language picker and `POST /vault/voice` takes
+         `language` (ISO-639-1, re-derived from the closed `LANGUAGES` allowlist — the
+         value reaches a provider and a page). Passing it removes the detection step
+         entirely, which is the only complete fix.
+      2. **The characters.** `script_of` labels a transcript from its Unicode block, and
+         `contradicts_script` decides whether the model's answer disagrees. Deliberately
+         narrower than "they differ": Hindi *is* written in Devanagari, so demoting
+         "hindi" to "devanagari" would lose real information — only a genuine
+         contradiction (Han characters reported as Bengali) lets the script win. A
+         mismatch is logged as `voice_language_mismatch`; a rise there is the difference
+         between one bad clip and a model that cannot hear a language.
+      3. **The model's own answer**, kept when it agrees with the script or when the
+         script says nothing (Latin).
+  * **The duration now comes from the recorder.** Only the `whisper-*` models answer
+    `verbose_json`, which is what carried `language` and `duration`; the gpt-4o
+    transcribers answer plain `json` and report neither. The player needs a length
+    regardless — a MediaRecorder WebM has none in its header and reports `Infinity` until
+    fully buffered — so the client sends the `duration` it measured.
+  * **A voice note is the one thing re-drivable after it SUCCEEDED.** `reprocess`
+    normally refuses `completed`, because re-running a good item spends the whole pipeline
+    to reproduce itself. A transcript is the exception: it is the single output that can be
+    confidently, fluently wrong, and "finished" is exactly what would make that unfixable.
+    So when the item is `voice` **and its audio is still in the bucket**, `reprocess`
+    clears `content` — which makes `ProcessingService._transcribe` re-read the object —
+    and accepts a `language` to pin the re-run, because repeating a failed auto-detection
+    unchanged is the same coin flip. `components/transcript-controls.tsx` is that UI, and
+    it renders for a completed item unlike the generic retry.
+  * **The container is sniffed from the bytes, never from a name.** A `MediaRecorder` blob
+    has no filename; the client invents one. `transcription.inspect` reads the signature
+    (WebM/EBML, Ogg, RIFF+WAVE, ISO `ftyp`, ID3 or an MPEG frame sync, FLAC) and the name
+    handed to the provider — and to `Content-Disposition` on download — is one the server
+    wrote.
+  * **A failed *storage* upload does not abort the save, and that is the opposite of
+    `save_document` on purpose.** By the time the bucket is reached the clip has been
+    transcribed and paid for; dropping the words because the audio could not be filed
+    throws away the expensive half to keep the cheap one. A failed *transcription* does
+    abort — a row holding only unreadable audio is an empty memory the user has to find
+    and delete.
+  * **`file_name` is only set once the object is really in the bucket**, because it is
+    what the detail page reads to decide whether to offer playback and a Download —
+    filling it in for audio that was never stored puts a button on the page whose only
+    possible answer is a 404. The clip's size and type stay in `item_metadata` regardless.
+    Playback (`components/audio-attachment.tsx`) mints the presigned URL **on the click**,
+    never on render: it expires in `DOWNLOAD_LINK_TTL_SECONDS`, so a tab left open
+    overnight would otherwise hold a dead link. One silent re-mint per mount on an
+    `error` event covers expiry; a second error is reported as an unplayable file, which
+    is a real case — a Chrome-recorded WebM/Opus clip does not decode in Safari.
+  * **The waveform is measured while recording, never re-derived.** The recorder keeps
+    every amplitude sample and downsamples it once on stop to 48 peaks, sent as a `peaks`
+    form field and kept in `item_metadata["waveform"]`. Reading peaks back off the stored
+    file would mean re-downloading and decoding the audio in the browser, and the
+    presigned URL is not fetchable cross-origin. It is client-written data bound for a
+    JSONB column and then for an SVG, so `transcription.parse_waveform` re-derives it —
+    JSON list, finite numbers only, truncated to 48, clamped to 0-100 ints — and returns
+    None for anything else, silently: the picture is decoration beside a transcript and
+    must never cost the user the words. A memory with no peaks draws a **flat baseline**;
+    `components/voice-hero.tsx` says explicitly not to synthesize a shape from the item
+    id, because a plausible waveform unrelated to the audio is a picture of data that does
+    not exist and nobody looking at it could tell.
+  * **The hero banner IS the player for audio items.** For every other kind
+    `MemoryBanner` is decoration over content further down; for a recording the audio is
+    the content, so `VoiceHero` replaces it and there is deliberately no second transport
+    on the page. The `<audio>` element is hidden and the waveform is the scrubber — bars
+    are `aria-hidden`, and the control under them is a real `<input type="range">`, which
+    is what supplies arrow-key seeking and "Seek, 7 of 42 seconds" to a screen reader.
+    Duration comes from Whisper (`item_metadata.duration_seconds`) rather than the
+    element: a MediaRecorder WebM carries no duration in its header and reports
+    `Infinity` until fully buffered, so the scrubber would otherwise have no length.
+  * **An inaudible clip is refused, not saved.** Whisper answers silence with an empty
+    string; that is a real answer, so the retry sits on `_call_provider` rather than on
+    `transcribe` and nobody pays twice for it. Two attempts, not three: a retry re-uploads
+    the whole clip. Provider faults are re-raised as `TranscriptionFailed` with our own
+    wording — theirs can name the account it rejected — and only the exception *type* is
+    logged.
+
+- **An uploaded image is read by a vision model, not filed blind.** `services/vision.py`
+  describes the picture and transcribes any text in it; the description becomes `content`,
+  so the ordinary pipeline summarises, tags, labels and embeds it and a screenshot of a
+  receipt is findable by asking about the receipt. Its own capability with its own switch
+  (`OPENAI_API_KEY`), for the same reason as transcription — not a fifth method on the
+  `AIProvider` Protocol. Four rules go with it:
+  * **The bytes go to the provider; the presigned URL never does.** Handing OpenAI a
+    signed bucket URL sends a live bearer credential to a third party and makes a private
+    object externally fetchable for its whole TTL. The worker downloads
+    (`ObjectStorage.download`) and inlines a base64 data URL.
+  * **`can_describe` is checked at save time, not in the worker.** A HEIC, an oversized
+    file or a missing key means `skipped` immediately, rather than a round trip through
+    the queue to be skipped there. HEIC is in the *upload* allowlist and not in the vision
+    one on purpose: stored and downloadable, just not readable.
+  * **`VisionError` is `skipped`; `VisionFailed` is retried.** "This image cannot be read"
+    is an answer — retrying spends another reading to reach the same place. A provider
+    fault or an unreachable bucket is not.
+  * **The description is marked as machine-written** (`item_metadata["content_source"] =
+    "vision"`) and the reader says so. Rendering a model's account of a picture
+    identically to words the user typed is the one way this feature can lie.
+- **Nothing captured is allowed to sit in limbo, and `processing_error` is scrubbed
+  before it is stored.** Celery's retries only cover a task that *ran and raised*; two
+  shapes slip past them and both end as a card the user watches forever. The beat task
+  `sweep_stranded_items` (every 5 min) owns both: an item stuck in `pending` was never
+  queued — usually `vault_enqueue_failed` against an unreachable Redis — so it is
+  **re-queued**, bounded by `MAX_SWEEP_REQUEUES` because an item that kills the worker on
+  load would otherwise be re-driven forever; an item stuck in `processing` past
+  `STUCK_PROCESSING_MINUTES` had its worker killed mid-task, and since there is no safe
+  way to know how far the half-finished run got it is marked **failed** with a sentence
+  its owner can act on. `list_stranded` excludes items with a *running* extraction run —
+  those legitimately sit in `processing` for minutes and belong to `sweep_stale_runs`;
+  two sweepers racing to a verdict is how the one with less information wins.
+  `POST /vault/{id}/reprocess` is the manual half: allowed only from `failed` and
+  `skipped` (`skipped` matters — an image saved before a vision key existed becomes
+  readable the moment one is set), refused with 409 when already queued or already
+  finished, and 429 inside `REPROCESS_COOLDOWN_SECONDS`. **The retry button renders only
+  for those two states** — offering it on a healthy memory invites spending the whole
+  pipeline again to replace a result with itself.
+  `core/errors.safe_error_text` scrubs the stored reason **on the way in, not at render
+  time**: an httpx error carries the whole request URL and Apify's carry a live token in
+  the query string, and a redaction that only happens on one render path is one the second
+  render path forgets.
 - **An upload that carries no readable text is `skipped`, not `failed`.** A PDF's or a
   .txt's text goes through the normal AI pipeline; an image or a .docx is stored and
   downloadable but never sent to the model -- there is no OCR and no OOXML parser, and
@@ -599,6 +855,92 @@ catch-all and must stay last, so new extractors get appended *before* it.
   pointed), and the **embedding is deliberately not recomputed** — reprocessing would
   re-fetch `source_url` and overwrite what the user just wrote, so semantic search keeps
   ranking the item by its pre-edit body until something else reprocesses it.
+
+## Latency: one statement is one network round trip
+
+**The database is not local and never will be.** `DATABASE_URL` points at Neon in
+`ap-southeast-1` through its **pooler** endpoint, and a round trip from a development
+machine measures **~290ms** — a cold connect, TLS and auth included, measures **~1.85s**.
+That single number explains every slow endpoint this API has ever had: `/health` answered
+in 2ms while `/vault` took 1178ms, and the difference was not code, it was four
+statements. Read the request log before optimising anything here —
+`jq -c 'select(.event=="request")' logs/api-*.jsonl` carries `duration_ms` per request,
+and dividing it by ~290 gives the statement count without a profiler.
+
+So the unit of optimisation on a read path is **statements, not milliseconds**, and the
+budget is what the endpoint actually needs:
+
+| Endpoint | Statements |
+|---|---|
+| `GET /vault`, `GET /search` | 1 |
+| `GET /auth/me` | 1 (the `oauth_accounts` join for `linked_providers`) |
+| `GET /vault/uploads/limits` | 0 |
+
+Five things hold that budget, and each of them looks like a safe thing to undo:
+
+- **`pool_pre_ping` is OFF** (`DB_POOL_PRE_PING`). It sends `SELECT 1` on every checkout
+  to prove a connection is alive, which against a database across a region costs the same
+  as the query the request came to run — it was the whole 637ms of an endpoint whose only
+  work was the session lookup. `DB_POOL_RECYCLE` (240s) covers the case it existed for by
+  discarding a connection idle longer than the shortest timeout in front of Postgres
+  (Neon suspends an idle compute at 300s), rather than testing every connection to catch
+  the rare stale one. Turn it back on only if stale-connection errors actually appear.
+- **The pool is warmed at startup** (`warm_pool`, `DB_POOL_WARMUP`). The ~1.85s handshake
+  otherwise lands on whoever arrives first after a deploy or an idle period — precisely
+  the page load that gets reported as "the app is broken". It fails soft: the database
+  being unreachable at boot must degrade to a slow first request, never to an API that
+  will not start.
+- **A listing and its `total` are ONE statement.** `VaultRepository._page` uses
+  `count(*) OVER ()`, computed inside the scan it is already doing. The `SELECT count(*)`
+  + `SELECT … LIMIT` pair reads as obviously correct and silently doubles the cost of
+  every page. Its one behavioural difference: a page past the end has no rows and
+  therefore no window total, reported as 0.
+- **Listings load card columns only** (`_CARD_COLUMNS`, `cards_only=True`), with
+  `raiseload=True`. A `SELECT *` listing drags `content`, `item_metadata` and
+  `ai_highlights` for every row — an article body is kilobytes, a page is twenty of them,
+  and none of it is rendered. `raiseload` is what makes a field added to `VaultItemRead`
+  but not to `_CARD_COLUMNS` fail loudly instead of emitting a silent per-row query or a
+  `DetachedInstanceError` after the session closes; `tests/core/test_query_shape.py`
+  turns it into a test failure instead. **`list_filtered` is deliberately NOT narrowed** —
+  it feeds chat retrieval, which needs the bodies.
+- **A write does not read itself back.** `UserSessionRepository.add` flushes without
+  `refresh()`: every value the caller uses comes from a Python `default_factory`, so the
+  refresh was a second round trip for nothing — twice per rotation, on what was already
+  the slowest endpoint in the log. Only add `refresh()` back for a value the *database*
+  generates and the caller actually reads.
+
+**`get_current_user` caches the `users` row for `AUTH_USER_CACHE_SECONDS` (30s).** Every
+authenticated request re-read the same immutable row; nothing under this dependency
+writes to the user, and the one place that does mutate one (the OAuth callback) does not
+go through it. Four properties keep this out of the security envelope, and a boot guard
+enforces the fourth:
+
+- Keyed by the **digest of the access token**, never by user id — a different token
+  cannot read another token's entry, and the raw token is never a key in a dict that a
+  heap dump or a traceback can reach.
+- Only a **live, verified** user is ever inserted, so a hit cannot skip the `deleted_at`
+  check; the token's signature is still verified on every single request, and the cached
+  row's id is re-checked against the token's `sub` on the way out.
+- `forget_cached_user(user_id)` is the hook for account deletion, so it takes effect on
+  the next request rather than after the TTL.
+- **It does not widen the revocation window; it sits inside one that already exists.**
+  Nothing consults the database while an access token is valid, so `logout-all` and
+  deletion already take up to `ACCESS_TOKEN_EXPIRE_MINUTES` (capped at 60 outside dev).
+  `validate_deployment_config` refuses to start if the TTL exceeds a quarter of that.
+
+**Responses are gzipped** above `GZIP_MIN_BYTES` — vault listings are text and compress
+roughly 4:1, and on a phone the transfer is a real share of the wait.
+
+**The single biggest remaining win is not in this repository: colocate the API with the
+database.** Every number above is 290ms of physics that no amount of code removes; an API
+deployed in `ap-southeast-1` sees ~1-5ms instead, which is roughly a 50x cut to the part
+of each request that is not compute. Until then, the frontend should fetch `/auth/me`,
+`/vault` and `/vault/uploads/limits` **in parallel** — issued serially they add up, issued
+together they cost one round trip. Two smaller levers, both deliberately not taken:
+`prepared_statement_cache_size=0` in the URL is required by the pooler and costs a few
+extra round trips on the *first* execution of each statement shape per process (the
+compiled cache makes every later one 1); and Neon's direct (non-pooled) endpoint would
+allow prepared statements at the cost of a much smaller connection ceiling.
 
 ## Known rough edges (real, in the current code)
 

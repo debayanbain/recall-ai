@@ -13,6 +13,7 @@ from typing import Any
 
 from app.core.logging import configure_logging, get_logger
 from app.db.session import task_session
+from app.models.base import ProcessingStatus
 from app.models.extraction_run import RunStatus
 from app.queue.celery_app import celery_app
 from app.queue.client import enqueue_process_item, enqueue_telegram_delivery
@@ -20,6 +21,7 @@ from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
 from app.services.apify import get_run
 from app.services.processing_service import ProcessingService
+from app.storage import get_storage
 
 # The worker overrides this from `worker_process_init` (see celery_app.py); this call
 # covers module import and any process that imports tasks without those signals.
@@ -83,7 +85,7 @@ async def _notify_final_failure(item_id: str) -> None:
 async def _process_item(item_id: str) -> str | None:
     async with task_session() as session:
         service = ProcessingService(
-            VaultRepository(session), ExtractionRunRepository(session)
+            VaultRepository(session), ExtractionRunRepository(session), get_storage()
         )
         try:
             run_id = await service.process(uuid.UUID(item_id))
@@ -158,6 +160,85 @@ async def _finalize_run(provider_run_id: str) -> None:
             await runs.mark(run, RunStatus.succeeded)
             await session.commit()
         await _notify_surface(run.vault_item_id, session)
+
+
+@celery_app.task(name="app.queue.tasks.sweep_stranded_items")
+def sweep_stranded_items() -> dict[str, int]:
+    """Beat task: nothing captured is allowed to sit in limbo unnoticed.
+
+    Celery's own retries only cover a task that *ran and raised*. Two failure shapes slip
+    past them entirely, and both end as a card the user watches forever:
+
+    * **Stuck in `processing`** — the worker was SIGKILLed, OOM-killed or lost its host
+      mid-task. `acks_late` returns the message to the broker, but nothing resets the row,
+      so the item claims to be working while no one is working on it. There is no safe way
+      to know whether the AI calls half-happened, so it is marked `failed` with a sentence
+      the owner can act on, which is what puts the Retry button on the page.
+    * **Stuck in `pending`** — it was never queued at all. The usual cause is
+      `vault_enqueue_failed`: the row committed while Redis was unreachable. That is
+      re-drivable, so it is re-queued rather than failed, up to `MAX_SWEEP_REQUEUES` —
+      without a ceiling, an item that kills the worker on load is re-driven forever.
+
+    Returns counts rather than raising: one bad row must never stop the sweep.
+    """
+    return asyncio.run(_sweep_stranded_items())
+
+
+async def _sweep_stranded_items() -> dict[str, int]:
+    from app.core.config import settings
+
+    requeued = 0
+    failed = 0
+
+    async with task_session() as session:
+        repo = VaultRepository(session)
+
+        # --- never picked up -------------------------------------------------------
+        for item in await repo.list_stranded(
+            ProcessingStatus.pending, settings.STUCK_PENDING_MINUTES
+        ):
+            if item.retry_count >= settings.MAX_SWEEP_REQUEUES:
+                item.processing_status = ProcessingStatus.failed
+                item.processing_error = (
+                    "This never reached the processing queue. Try again — if it keeps "
+                    "happening, the background service needs attention."
+                )
+                failed += 1
+                log.warning("sweep_pending_exhausted", item_id=str(item.id))
+                continue
+            item.retry_count += 1
+            try:
+                await enqueue_process_item(item.id)
+            except Exception as exc:  # noqa: BLE001 - the queue is the thing that is down
+                log.warning(
+                    "sweep_requeue_failed", item_id=str(item.id), error=type(exc).__name__
+                )
+                continue
+            requeued += 1
+            log.info("sweep_requeued", item_id=str(item.id), attempt=item.retry_count)
+
+        # --- claimed, then abandoned -----------------------------------------------
+        for item in await repo.list_stranded(
+            ProcessingStatus.processing, settings.STUCK_PROCESSING_MINUTES
+        ):
+            item.processing_status = ProcessingStatus.failed
+            item.processing_error = (
+                "Processing stopped partway through — the background worker went away "
+                "before it finished. Nothing was lost; try again."
+            )
+            item.retry_count += 1
+            failed += 1
+            log.warning(
+                "sweep_marked_stuck_failed",
+                item_id=str(item.id),
+                minutes=settings.STUCK_PROCESSING_MINUTES,
+            )
+
+        await session.commit()
+
+    if requeued or failed:
+        log.info("sweep_stranded_items", requeued=requeued, failed=failed)
+    return {"requeued": requeued, "failed": failed}
 
 
 @celery_app.task(name="app.queue.tasks.sweep_stale_runs")

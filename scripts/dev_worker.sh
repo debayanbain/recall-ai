@@ -15,23 +15,33 @@
 # that is a Telegram user being told the service is restarting.
 #
 # Celery's prefork pool does not tolerate being reloaded in place, so watchfiles is told
-# to restart the whole process. `--concurrency` stays low here on purpose: this is a
-# laptop, and the API, the reloader and two workers already share it.
+# to restart the whole process.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
 
-CONCURRENCY="${CELERY_CONCURRENCY:-2}"
 LOGLEVEL="${CELERY_LOGLEVEL:-info}"
+
+# `--autoscale=MAX,MIN` instead of a fixed `--concurrency`: the pool adds child processes
+# while tasks are waiting and retires idle ones after a minute, so an empty queue costs
+# one process and a burst costs as many as the bounds allow. On a laptop that matters in
+# both directions -- the old fixed pool held its processes open all day next to uvicorn,
+# the reloader and Flower.
+AUTOSCALE_MAX="${CELERY_AUTOSCALE_MAX:-8}"
+AUTOSCALE_MIN="${CELERY_AUTOSCALE_MIN:-1}"
 
 # A worker with no broker does not fail: it retries the connection forever, quietly, and
 # looks exactly like a worker that is running fine. Say so once, up front, rather than
 # leaving it to be discovered when a message goes unanswered.
-if ! redis-cli ping >/dev/null 2>&1; then
-  echo "worker    WARNING: redis is not answering on the default port." >&2
-  echo "worker    Start it (brew services start redis) or the queue will never drain." >&2
+#
+# Checked against the container's port, not the default one -- a host Redis answering on
+# 6379 is not this project's queue and a green ping against it would be a lie.
+REDIS_PORT="${REDIS_PORT:-6380}"
+if ! docker exec recall-redis redis-cli ping >/dev/null 2>&1; then
+  echo "worker    WARNING: the recall-redis container is not answering." >&2
+  echo "worker    Run 'make redis' (needs Docker running) or the queue will never drain." >&2
 fi
 
 exec uv run watchfiles \
-  "celery -A app.queue.celery_app.celery_app worker --loglevel=$LOGLEVEL --concurrency=$CONCURRENCY" \
+  "celery -A app.queue.celery_app.celery_app worker --loglevel=$LOGLEVEL --autoscale=$AUTOSCALE_MAX,$AUTOSCALE_MIN" \
   app

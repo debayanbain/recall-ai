@@ -1,0 +1,121 @@
+# The queue's infrastructure. Postgres is NOT here -- it is hosted on Neon.
+#
+# Default `docker compose up -d` starts **Redis only**, because in development the API
+# and the worker run on the host under `make dev` (uvicorn --reload and watchfiles both
+# need the source tree, and a containerised worker would quietly double-consume the
+# queue alongside the host one). The worker and beat live behind the `workers` profile
+# for when you actually want to scale out:
+#
+#   docker compose up -d                          # Redis only -- what `make dev` uses
+#   docker compose --profile workers up -d        # + containerised worker and beat
+#   docker compose --profile workers up -d --scale worker=6
+#
+# `scripts/autoscale.sh` drives that last line from live queue depth.
+
+name: recall
+
+services:
+  redis:
+    image: redis:7-alpine
+    container_name: recall-redis
+    restart: unless-stopped
+    # 6380 on the host, not 6379. Another project on this machine already owns 6379, and
+    # binding over it would either fail or silently steal its queue. Inside the compose
+    # network the port is the normal 6379, so only REDIS_URL on the host knows about it.
+    ports:
+      - "${REDIS_PORT:-6380}:6379"
+    command:
+      - redis-server
+      # The broker holds user captures between "saved" and "processed". A restart with
+      # only RDB snapshots drops whatever was queued since the last one; AOF at everysec
+      # bounds that loss to about a second.
+      - --appendonly
+      - "yes"
+      - --appendfsync
+      - everysec
+      # Without a floor, Redis rewrites the AOF whenever it has grown 100% -- which on a
+      # nearly empty broker is constantly ("Starting automatic rewriting of AOF on
+      # 84224304% growth"). Each rewrite forks, and a fork is the moment RSS can double,
+      # so a hair-trigger rewrite is the thing most likely to walk a tight container
+      # limit into an abrupt kill.
+      - --auto-aof-rewrite-min-size
+      - 64mb
+      - --auto-aof-rewrite-percentage
+      - "100"
+      # RDB off: AOF is the durability story here, and the background fork RDB needs
+      # doubles RSS on a write-heavy keyspace, which is the opposite of shrinking on idle.
+      - --save
+      - ""
+      # A ceiling, not an allocation -- Redis grows into it as work arrives and frees as
+      # tasks are consumed. `scripts/autoscale.sh` raises and lowers this at runtime.
+      - --maxmemory
+      - "${REDIS_MAXMEMORY:-256mb}"
+      # NOT negotiable, and not a tuning knob: any `allkeys-*` policy lets Redis delete
+      # keys of its own accord under pressure. On a Celery broker those keys ARE queued
+      # tasks, so an eviction is a user's capture acknowledged and then silently never
+      # processed. With `noeviction` the *producer* gets an error instead, which
+      # `VaultService._enqueue` already handles fail-soft: the row stays `pending` and
+      # `sweep_stranded_items` re-queues it. Losing the message has no such recovery.
+      - --maxmemory-policy
+      - noeviction
+      # What actually makes memory come back down after a spike. Without it jemalloc
+      # holds on to fragmented pages, `used_memory_rss` stays at the high-water mark, and
+      # the container looks like it never shrinks even though the queue drained.
+      - --activedefrag
+      - "yes"
+      - --loglevel
+      - notice
+    volumes:
+      - redis-data:/data
+    # Floor and ceiling for the container itself. The autoscaler moves the ceiling with
+    # `docker update`; the reservation keeps a working set from being reclaimed the
+    # moment the host is under pressure.
+    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+    mem_reservation: ${REDIS_MEM_RESERVATION:-64m}
+    healthcheck:
+      # `depends_on: condition: service_healthy` is what stops a worker from racing the
+      # broker on a cold start and spending its first seconds retrying a refused socket.
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 3s
+
+  worker:
+    build: .
+    restart: unless-stopped
+    profiles: ["workers"]
+    env_file: .env
+    environment:
+      # .env points the host at localhost:6380; inside the network it is the service name
+      # on the standard port. `environment` outranks `env_file`, so this wins.
+      REDIS_URL: redis://redis:6379/0
+    # --autoscale is the elastic part *inside* one worker: the prefork pool adds child
+    # processes when tasks are waiting and retires idle ones after a minute, between the
+    # two bounds. Scaling the container count on top of this (see `scripts/autoscale.sh`)
+    # is what adds capacity a single machine cannot.
+    command: >
+      celery -A app.queue.celery_app.celery_app worker
+      --loglevel=info
+      --autoscale=${CELERY_AUTOSCALE_MAX:-8},${CELERY_AUTOSCALE_MIN:-1}
+    depends_on:
+      redis:
+        condition: service_healthy
+
+  beat:
+    build: .
+    restart: unless-stopped
+    profiles: ["workers"]
+    env_file: .env
+    environment:
+      REDIS_URL: redis://redis:6379/0
+    # Exactly one, always. Beat is a scheduler, not a worker: two of them fire every
+    # periodic task twice, which for `sweep_stranded_items` means two verdicts racing on
+    # the same row. Never give this service `--scale`.
+    command: celery -A app.queue.celery_app.celery_app beat --loglevel=info
+    depends_on:
+      redis:
+        condition: service_healthy
+
+volumes:
+  redis-data:

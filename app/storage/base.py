@@ -18,6 +18,16 @@ class ObjectStorage(Protocol):
 
     async def upload(self, key: str, data: bytes, content_type: str) -> None: ...
 
+    async def download(self, key: str) -> bytes:
+        """Read an object back into the process.
+
+        The worker needs the bytes themselves -- to read an image, it hands them to the
+        model inline rather than handing over a presigned URL, which would send a live
+        bearer credential to a third party and make a private object externally
+        fetchable for the length of its TTL.
+        """
+        ...
+
     async def presigned_get(
         self, key: str, *, filename: str, content_type: str, expires: int
     ) -> str: ...

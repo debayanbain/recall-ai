@@ -29,6 +29,7 @@ from sqlmodel import SQLModel
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 import app.models  # noqa: F401  -- populates SQLModel.metadata
+from app.api.deps import clear_user_cache
 from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.session import get_session
@@ -94,8 +95,18 @@ def _no_startup_network(monkeypatch: pytest.MonkeyPatch) -> None:
     worker. Both are real outbound calls, and every `TestClient(app)` runs the lifespan --
     so left on, the suite talks to api.telegram.org once per test and waits out a
     broadcast timeout on top of it. The self-check has its own tests, calls stubbed.
+
+    Pool warm-up is off for the same reason: it opens connections to the *configured*
+    database, which in a test run is not the one the fixtures are talking to.
+
+    The current-user cache is cleared per test as well. It is keyed by access-token
+    digest, and tests reuse tokens across users and mutate rows behind the dependency --
+    exactly the two things the cache is allowed to be blind to for 30 seconds in
+    production and must not be for a moment in a test.
     """
     monkeypatch.setattr(settings, "STARTUP_SELF_CHECK", False)
+    monkeypatch.setattr(settings, "DB_POOL_WARMUP", 0)
+    clear_user_cache()
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")

@@ -9,6 +9,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.middleware.gzip import GZipMiddleware
 
 from app.api.health import router as health_router
 from app.api.v1.router import api_router
@@ -24,6 +25,7 @@ from app.core.middleware import (
     RequestContextMiddleware,
     SecurityHeadersMiddleware,
 )
+from app.db.session import warm_pool
 from app.queue.client import close_pool
 from app.services.telegram.webhook import can_register, ensure_registered_quietly
 
@@ -62,7 +64,11 @@ async def lifespan(app: FastAPI) -> AsyncGenerator[None, None]:
     configure_logging(source="api")
     # Opens logs/api-<date>.jsonl and prunes expired files. No-op outside ENV=dev.
     start_log_sink()
-    startup: dict[str, str] = {"env": settings.ENV}
+    # Opened before the first request so nobody pays the TLS handshake to a managed
+    # database (~1.85s measured) just for arriving first after a deploy or an idle period.
+    warmed = await warm_pool()
+
+    startup: dict[str, str] = {"env": settings.ENV, "db_pool_warmed": str(warmed)}
     if app.docs_url and app.openapi_url:
         base = settings.BACKEND_URL.rstrip("/")
         startup["docs"] = f"{base}{app.docs_url}"
@@ -106,6 +112,10 @@ def create_app() -> FastAPI:
 
     # Order matters: outermost first.
     app.add_middleware(SecurityHeadersMiddleware)
+    # Vault listings are summaries, tags and labels -- text that compresses roughly 4:1 --
+    # and on a phone the transfer is a real share of the wait. Outside the rate limiter so
+    # a 429 body is not compressed for nothing.
+    app.add_middleware(GZipMiddleware, minimum_size=settings.GZIP_MIN_BYTES)
     app.add_middleware(RateLimitMiddleware)
     app.add_middleware(RequestContextMiddleware)
     app.add_middleware(

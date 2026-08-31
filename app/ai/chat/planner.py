@@ -19,6 +19,7 @@ from pydantic import BaseModel, Field
 
 from app.ai.chat.factory import get_chat_model
 from app.ai.chat.usage import UsageLogger
+from app.core import scripts
 from app.core.logging import get_logger
 from app.models.base import ContentType
 
@@ -99,12 +100,24 @@ def looks_like_question(text: str) -> bool:
 
     Runs on every plain-text message, so it must not cost a token. The planner is only
     reached once this returns True.
+
+    Two signals, and the second exists because the first is English-only: a trailing `?`
+    or an English opening word, else a non-Latin script (see `app/core/scripts.py`).
     """
     stripped = text.strip()
     if not stripped or stripped.startswith("/"):
         return False
     lowered = stripped.lower()
     if lowered.endswith("?"):
+        return True
+    # Every test below this line reads English words, so a message in another script
+    # matched none of them and fell through to the conversation lane -- which cannot see
+    # the vault. "আমার নোট দেখাও" ("show my notes") was answered by a model that had
+    # never been given a memory. Anything longer than a greeting in a non-Latin script is
+    # therefore treated as a question: retrieval is the lane that can be wrong safely,
+    # since with no matching memory it says so instead of answering from general
+    # knowledge.
+    if scripts.is_non_latin(stripped) and not scripts.is_short_reaction(stripped):
         return True
     if any(phrase in lowered for phrase in _QUESTION_PHRASES):
         return True

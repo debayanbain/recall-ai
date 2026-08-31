@@ -164,15 +164,23 @@ def test_object_key_is_entirely_server_generated() -> None:
 # --- saving --------------------------------------------------------------------------
 
 
-async def test_image_is_stored_but_not_sent_to_the_ai() -> None:
-    """No OCR yet, so an image is `skipped` -- calling the model would burn tokens."""
+async def test_image_is_queued_for_the_vision_pass(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An image carries no text but is not therefore unreadable.
+
+    The worker hands it to a vision model and the description becomes the body that gets
+    summarised, tagged and embedded -- which is the difference between a screenshot you
+    can find by asking about it and a file you have to remember the name of.
+    """
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "sk-test")
     repo, storage = _Repo(), _Storage()
     user_id = uuid.uuid4()
 
     item = await vs.VaultService(repo, storage).save_document(user_id, PNG, "holiday.png")
 
     assert item.type is ContentType.image
-    assert item.processing_status is ProcessingStatus.skipped
+    assert item.processing_status is ProcessingStatus.pending
     assert item.file_name == "holiday.png"
     assert item.mime_type == "image/png"
     assert item.file_size == len(PNG)
@@ -180,6 +188,22 @@ async def test_image_is_stored_but_not_sent_to_the_ai() -> None:
     assert key.startswith(f"users/{user_id}/{item.id}/")
     assert data == PNG
     assert content_type == "image/png"
+
+
+async def test_image_is_skipped_when_nothing_can_read_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Decided at save time, not in the worker: a round trip to be skipped buys nothing."""
+    from app.core.config import settings
+
+    monkeypatch.setattr(settings, "OPENAI_API_KEY", "")
+    repo, storage = _Repo(), _Storage()
+
+    item = await vs.VaultService(repo, storage).save_document(uuid.uuid4(), PNG, "a.png")
+
+    assert item.processing_status is ProcessingStatus.skipped
+    # Still stored and downloadable -- unreadable is not the same as unwanted.
+    assert item.storage_key is not None
 
 
 async def test_text_file_is_stored_and_indexed() -> None:

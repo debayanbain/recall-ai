@@ -1,4 +1,5 @@
 .PHONY: install migrate revision dev dev-tunnel tunnel worker flower beat api openapi lint typecheck test check \
+	redis redis-down redis-logs redis-stats autoscale workers workers-down \
 	telegram-webhook telegram-webhook-info telegram-webhook-delete
 
 install:            ## sync deps incl. dev extras
@@ -29,6 +30,7 @@ revision:           ## autogenerate a migration: make revision m="add x"
 # variable may never be set. The final `pkill` catches celery's prefork children, which
 # outlive a plain kill of the parent often enough to matter.
 define START_SERVICES
+./scripts/redis_up.sh || exit 1; \
 ./scripts/dev_worker.sh > /tmp/recall-worker.log 2>&1 & \
 WORKER_PID=$$!; \
 ./scripts/dev_flower.sh > /tmp/recall-flower.log 2>&1 & \
@@ -110,9 +112,48 @@ tunnel:             ## https tunnel on its own, without the API
 flower:             ## Celery web UI on http://127.0.0.1:5555
 	@./scripts/dev_flower.sh
 
+# The queue runs in Docker and only in Docker. The host may well have a Redis of its own
+# -- another project's -- and pointing at it means two applications sharing one keyspace
+# with no idea about each other. `.env` therefore names port 6380, which is this
+# container and nothing else.
+#
+# `make dev` brings this up itself and waits for the healthcheck, so these targets are for
+# running the broker on its own or looking at it.
+redis:              ## start the queue's Redis container and wait for it
+	@./scripts/redis_up.sh
+
+redis-down:         ## stop it (the AOF volume survives)
+	@docker compose stop redis
+
+redis-logs:         ## follow the broker's log
+	@docker compose logs -f redis
+
+# The two numbers worth watching: how much work is waiting, and how much room is left.
+redis-stats:        ## queue depth and memory, once
+	@docker exec recall-redis redis-cli info memory \
+		| grep -E '^(used_memory_human|used_memory_rss_human|maxmemory_human|mem_fragmentation_ratio)'
+	@echo "celery queue depth: $$(docker exec recall-redis redis-cli llen celery)"
+
+# Grows and shrinks the broker's memory with real load, and the worker container count
+# with real backlog. Read the header of the script before changing the thresholds -- the
+# hysteresis is what stops it resizing on every gap between bursts.
+autoscale:          ## watch load; resize Redis and the worker pool to match
+	@./scripts/autoscale.sh
+
+# Containerised workers, for when the host pool under `make dev` is not enough. Do not
+# run these at the same time as `make dev`: two pools on one queue is not more throughput,
+# it is two things claiming the same messages.
+workers:            ## containerised worker + beat (docker compose profile)
+	@./scripts/redis_up.sh
+	@docker compose --profile workers up -d --scale worker=$${WORKER_REPLICAS:-2}
+	@docker compose --profile workers ps
+
+workers-down:       ## stop the containerised workers
+	@docker compose --profile workers down
+
 worker:             ## Celery prefork worker -- needs Redis; saves work without it
-	uv run celery -A app.queue.celery_app.celery_app worker \
-		--loglevel=info --concurrency=$${CELERY_CONCURRENCY:-4}
+	uv run celery -A app.queue.celery_app.celery_app worker --loglevel=info \
+		--autoscale=$${CELERY_AUTOSCALE_MAX:-8},$${CELERY_AUTOSCALE_MIN:-1}
 
 # Own terminal. Runs the sweeper that rescues Apify runs whose webhook never arrived;
 # without it a lost callback leaves an item stuck in `processing` indefinitely.

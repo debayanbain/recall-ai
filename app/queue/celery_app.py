@@ -62,6 +62,14 @@ celery_app.conf.update(
             "task": "app.queue.tasks.sweep_stale_runs",
             "schedule": crontab(minute="*/5"),
         },
+        # The dead-letter sweep. Celery retries only cover a task that ran and raised;
+        # a worker that is killed mid-task, or an enqueue that never happened, leaves a
+        # row nothing will ever touch again. This is what turns both into a state the
+        # owner can see and retry, instead of a permanent spinner.
+        "sweep-stranded-items": {
+            "task": "app.queue.tasks.sweep_stranded_items",
+            "schedule": crontab(minute="*/5"),
+        },
         # Expired sessions are dead weight, not evidence: once a row is past its
         # expiry it can neither be redeemed nor prove a replay. Daily is plenty --
         # nothing depends on the cleanup being timely.

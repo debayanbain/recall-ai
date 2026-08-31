@@ -90,6 +90,20 @@ class B2Storage:
             log.warning("b2_upload_failed", key=key, error=type(exc).__name__)
             raise StorageError("We couldn't store that file. Please try again.") from None
 
+    async def download(self, key: str) -> bytes:
+        """Read an object's bytes. Used by the worker, never on a request path."""
+
+        def _get() -> bytes:
+            response = _client().get_object(Bucket=self.bucket, Key=key)
+            body: bytes = response["Body"].read()
+            return body
+
+        try:
+            return await asyncio.to_thread(_get)
+        except Exception as exc:  # noqa: BLE001 - provider errors carry live HTTP handles
+            log.warning("b2_download_failed", key=key, error=type(exc).__name__)
+            raise StorageError("We couldn't read that file back from storage.") from None
+
     async def presigned_get(
         self, key: str, *, filename: str, content_type: str, expires: int
     ) -> str:

@@ -41,6 +41,7 @@ from app.ai.chat.planner import MemoryQuery, resolved_content_types
 from app.ai.chat.retriever import to_document
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.core.scripts import script_of
 from app.models.vault import VaultItem
 from app.repositories.vault import VaultRepository
 from app.services.chat_engine.cards import DETAIL_MAX_ITEMS, build_detail_card
@@ -215,12 +216,72 @@ def _created_after(plan: MemoryQuery) -> datetime | None:
     return datetime.now(UTC) - timedelta(days=plan.days)
 
 
+@dataclass(frozen=True)
+class _NoMatchPhrasing:
+    """The four strings needed to say "nothing found" in one language."""
+
+    #: Takes {subject} and {window}; {window} may be empty.
+    with_subject: str
+    #: Takes {window}, which is non-empty here.
+    without_subject: str
+    #: No window at all -- the "yet" form, where English says "Nothing saved yet."
+    without_subject_ever: str
+    #: Takes {days}. Rendered first, then interpolated into the two above.
+    window: str
+
+
+#: This reply is produced with **no model call** -- an empty context is the one input the
+#: answer prompt has no honest response to, and paying a provider to say "nothing" is the
+#: wrong trade. That is exactly why it needs a table: there is nothing in the loop that
+#: could translate it.
+#:
+#: Keyed by *script*, not language, because script is all `script_of` can honestly tell
+#: us. That has a consequence worth stating: `devanagari` covers Hindi, Marathi and
+#: Nepali, and a Marathi speaker gets the Hindi sentence. Better than English for them,
+#: and not something character counting can improve on.
+#:
+#: **Deliberately short.** Every entry is a sentence a real person reads at the moment
+#: their search failed, and a machine-translated one that reads as broken is worse than
+#: plain English -- it makes the product look careless in exactly the language it was
+#: trying to respect. Anything not listed falls back to English on purpose. Adding a
+#: language is one entry, and it should be written by someone who speaks it.
+_NO_MATCH: dict[str, _NoMatchPhrasing] = {
+    "bengali": _NoMatchPhrasing(
+        with_subject="{window}আপনার ভল্টে “{subject}” সম্পর্কে কিছু পাইনি।",
+        without_subject="{window}কিছু সেভ করা হয়নি।",
+        without_subject_ever="এখনও কিছু সেভ করা হয়নি।",
+        window="গত {days} দিনে ",
+    ),
+    "devanagari": _NoMatchPhrasing(
+        with_subject="{window}आपके वॉल्ट में “{subject}” के बारे में कुछ नहीं मिला।",
+        without_subject="{window}कुछ भी सेव नहीं किया गया।",
+        without_subject_ever="अभी तक कुछ भी सेव नहीं किया गया।",
+        window="पिछले {days} दिनों में ",
+    ),
+}
+
+_NO_MATCH_ENGLISH = _NoMatchPhrasing(
+    with_subject="I couldn't find anything about “{subject}” in your vault{window}.",
+    without_subject="Nothing saved{window}.",
+    without_subject_ever="Nothing saved yet.",
+    window=" in the last {days} days",
+)
+
+
 def _nothing_found(plan: MemoryQuery) -> str:
+    """The fixed reply for a search that matched nothing, in the asker's script.
+
+    The subject is echoed back verbatim -- it is the user's own words, and translating it
+    would hand them back a term they never searched for.
+    """
     subject = plan.search_text.strip()
-    window = f" in the last {plan.days} days" if plan.days else ""
+    phrasing = _NO_MATCH.get(script_of(subject) or "", _NO_MATCH_ENGLISH)
+    window = phrasing.window.format(days=plan.days) if plan.days else ""
     if subject:
-        return f"I couldn't find anything about “{subject}” in your vault{window}."
-    return f"Nothing saved{window or ' yet'}."
+        return phrasing.with_subject.format(subject=subject, window=window)
+    if window:
+        return phrasing.without_subject.format(window=window)
+    return phrasing.without_subject_ever
 
 
 def build_recall_responder(repo: VaultRepository) -> RecallChatService | None:

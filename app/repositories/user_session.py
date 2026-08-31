@@ -32,9 +32,17 @@ class UserSessionRepository:
         return result.first()
 
     async def add(self, row: UserSession) -> UserSession:
+        """Persist a session row. Deliberately does NOT `refresh()`.
+
+        A refresh is a second statement -- a full network round trip -- and it exists to
+        read back values the database generated. This model generates none that the
+        caller uses: `id`, `family_started_at`, `last_used_at` and `created_at` all come
+        from Python `default_factory`, and `expires_at` is passed in. Rotation calls this
+        twice, so the two refreshes were two wasted round trips on the endpoint that was
+        already the slowest one (~3.5s p50 against a database in another region).
+        """
         self.session.add(row)
         await self.session.flush()
-        await self.session.refresh(row)
         return row
 
     async def list_active_for_user(self, user_id: uuid.UUID) -> list[UserSession]:

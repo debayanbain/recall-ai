@@ -29,7 +29,10 @@ def label_prompt(text: str) -> str:
         "in a reading list. Be concrete: say what it is actually about — the product, "
         "place, method, claim or number at its centre. A generic subject area "
         '("technology", "career advice") is wrong; two different items must never get '
-        "the same name. No quotes, no trailing period, no prefix like 'Title:'.\n\n"
+        "the same name. No quotes, no trailing period, no prefix like 'Title:'. "
+        # The label is the line that tells two memories apart in a list, so it has to be
+        # readable by the person whose list it is.
+        "Write it in the SAME LANGUAGE as the content.\n\n"
         "CONTENT:\n" + text[:LABEL_MAX_INPUT]
     )
 

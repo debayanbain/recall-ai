@@ -21,6 +21,17 @@ class CreateNoteRequest(BaseModel):
     content: str = Field(min_length=1)
 
 
+class ReprocessRequest(BaseModel):
+    """Optional knobs on a retry. Only voice notes have one so far.
+
+    `language` is validated against a closed allowlist in `services/transcription.py`
+    rather than here: an unknown code means auto-detect, not a rejected request, because
+    a client bug must not stand between someone and a fixed transcript.
+    """
+
+    language: str | None = Field(default=None, max_length=8)
+
+
 class UpdateContentRequest(BaseModel):
     """A manual rewrite of an item's body, as EditorJS blocks.
 
@@ -51,6 +62,10 @@ class VaultItemRead(BaseModel):
     #: tags are identical, which for topical tags is the common case rather than the edge.
     ai_label: str | None = None
     processing_status: ProcessingStatus
+    #: Why the pipeline gave up, scrubbed of anything credential-shaped before storage
+    #: (`app/core/errors.py`). Present so the owner is told what happened rather than
+    #: shown a spinner that never resolves; absent on every healthy item.
+    processing_error: str | None = None
     created_at: datetime
 
     # Uploaded-file metadata. `storage_key` is deliberately absent: the bucket layout is

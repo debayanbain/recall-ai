@@ -52,13 +52,23 @@ class GeminiProvider(AIProvider):
     async def generate_summary(self, text: str) -> str:
         prompt = (
             "Summarize the following content in 2-3 concise sentences. "
-            "Be factual and neutral.\n\nCONTENT:\n" + text[:12000]
+            "Be factual and neutral. "
+            # Without this the summary comes back in English whatever the note was
+            # written in, so a Bengali voice note gets an English card and the person
+            # who recorded it reads their own memory in translation.
+            "Write the summary in the SAME LANGUAGE as the content."
+            "\n\nCONTENT:\n" + text[:12000]
         )
         return await self._generate(prompt)
 
     async def generate_tags(self, text: str) -> list[str]:
         prompt = (
             "Extract 3-7 short topical tags from this content. "
+            # Tags are shown on the person's own card and typed into their own search
+            # box, so they belong in the language they wrote in. The cost is a split tag
+            # space -- "jobs" and "চাকরি" never match -- which is real but is the same
+            # split their notes already have.
+            "Use the SAME LANGUAGE as the content. "
             'Respond ONLY with a JSON array of lowercase strings, e.g. ["ai","startups"].'
             "\n\nCONTENT:\n" + text[:12000]
         )
@@ -77,7 +87,13 @@ class GeminiProvider(AIProvider):
         prompt = (
             "Classify this content into exactly one category from: "
             + ", ".join(_CATEGORIES)
-            + ". Respond with ONLY the category word.\n\nCONTENT:\n"
+            # The answer is checked against that exact list and anything else becomes
+            # "Other", so a model that helpfully translates the category for Bengali
+            # content silently drops the item into the catch-all. This is the one field
+            # that must stay English -- it is an enum, not prose.
+            + ". Answer with the English word from that list exactly as written, "
+            "whatever language the content is in. Respond with ONLY the category word."
+            "\n\nCONTENT:\n"
             + text[:8000]
         )
         raw = (await self._generate(prompt)).strip().strip(".")

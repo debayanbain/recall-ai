@@ -75,6 +75,42 @@ class Settings(BaseSettings):
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
     DB_ECHO: bool = False
+    #: `pool_pre_ping` sends a `SELECT 1` on every checkout to prove the connection is
+    #: still alive. Against a database on the same host that is free; against a managed
+    #: one across a region it is a **full extra round trip on every request** -- measured
+    #: at ~290ms to Neon ap-southeast-1, which doubled the latency of endpoints whose
+    #: only query was the session lookup. It is off by default and `DB_POOL_RECYCLE`
+    #: covers the case it existed for: a connection older than the idle timeout is thrown
+    #: away before it is handed out, rather than tested one round trip at a time. Turn it
+    #: back on only if stale-connection errors actually appear in the logs.
+    DB_POOL_PRE_PING: bool = False
+    #: Seconds before a pooled connection is discarded and reopened. Must stay BELOW the
+    #: shortest idle timeout in front of Postgres -- Neon suspends an idle compute at
+    #: 300s and PgBouncer closes idle server connections on its own schedule -- because
+    #: the whole point is to never hand out a connection the other end has already
+    #: dropped. Set to -1 to disable recycling entirely (not recommended).
+    DB_POOL_RECYCLE: int = 240
+    #: Connections opened during startup so the first real request does not pay the TLS
+    #: handshake. Measured at ~1.85s cold against Neon, which is why a first page load
+    #: after a deploy or an idle period felt broken. 0 disables warm-up.
+    DB_POOL_WARMUP: int = 2
+
+    # --- Response tuning ---
+    #: Responses at least this large are gzipped. Vault listings are mostly summaries and
+    #: tags, which compress about 4:1, and on a mobile connection the transfer is a real
+    #: share of the wait. Below the threshold compression costs more than it saves.
+    GZIP_MIN_BYTES: int = 1024
+    #: How long an authenticated request may reuse the `users` row fetched for a previous
+    #: request with the *same* access token, instead of re-reading it. This removes one
+    #: database round trip from every authenticated endpoint.
+    #:
+    #: Security note: this does not widen the revocation window that already exists. An
+    #: access token is verified by signature alone and nothing consults the database
+    #: while it is valid, so `logout-all` and account deletion already take up to
+    #: `ACCESS_TOKEN_EXPIRE_MINUTES` (<= 60, enforced at boot) to take effect. This TTL
+    #: is orders of magnitude shorter than that ceiling and is capped against it in
+    #: `validate_deployment_config`. Set to 0 to disable the cache.
+    AUTH_USER_CACHE_SECONDS: int = 30
 
     # --- Redis / Queue ---
     REDIS_URL: RedisDsn = "redis://localhost:6379/0"  # type: ignore[assignment]
@@ -246,6 +282,33 @@ class Settings(BaseSettings):
     OPENAI_API_KEY: str = ""
     OPENAI_TEXT_MODEL: str = "gpt-4o-mini"
     OPENAI_EMBED_MODEL: str = "text-embedding-3-small"
+    # Speech-to-text for voice notes. Its own switch, not AI_PROVIDER: transcription is
+    # OpenAI-only here, so a vault summarising with Gemini still records voice notes and
+    # a vault with no OpenAI key reports voice as unavailable instead of failing after
+    # someone has already spoken. Only the whisper-* models return the detected language
+    # and the real duration (`verbose_json`); the gpt-4o transcribers do not.
+    # gpt-4o-transcribe, not whisper-1. whisper-1's language identification is decided
+    # from the first window of audio and is unreliable on short or noisy clips in a
+    # non-Latin script -- observed here returning a Bengali voice note as fluent
+    # Traditional Chinese. The gpt-4o transcribers are materially better at both the
+    # transcription and the identification, and gpt-4o-mini-transcribe is cheaper than
+    # whisper-1 as well. The one thing they do not do is `verbose_json`, so the duration
+    # now comes from the recorder (see TRANSCRIBE_LANGUAGE below and the `duration` form
+    # field) rather than from the provider.
+    OPENAI_TRANSCRIBE_MODEL: str = "gpt-4o-transcribe"
+    # Deployment-wide default language for voice notes, ISO-639-1 (e.g. "bn"). Empty means
+    # auto-detect, which is right for a multilingual vault. A per-recording choice from the
+    # UI overrides it. Pinning removes the detection step entirely, which is the only
+    # completely reliable fix for a language the model keeps mishearing.
+    TRANSCRIBE_LANGUAGE: str = ""
+    # Reading uploaded images: what is in them, plus any text they contain. Same switch
+    # as transcription (the OpenAI key), for the same reason -- it is a capability, not a
+    # method every AIProvider owes an implementation of.
+    OPENAI_VISION_MODEL: str = "gpt-4o-mini"
+    # Images above this are stored and downloadable but not read. Base64 inflates the
+    # payload by a third on the way to the provider, and a 25MB photo is a bill, not a
+    # better description.
+    MAX_VISION_IMAGE_MB: int = 10
     GEMINI_API_KEY: str = ""
     GEMINI_TEXT_MODEL: str = "gemini-2.0-flash"
     GEMINI_EMBED_MODEL: str = "text-embedding-004"
@@ -266,8 +329,33 @@ class Settings(BaseSettings):
     # Hard ceiling on one upload. Enforced by reading one byte past it, not by trusting
     # Content-Length, which the client writes.
     MAX_UPLOAD_MB: int = 25
+    # Voice notes are capped lower and separately. The provider's own hard limit is 25MB,
+    # a retry re-uploads the whole clip, and every megabyte past a few minutes of speech
+    # is a recording nobody meant to make -- a button held down in a pocket.
+    MAX_VOICE_NOTE_MB: int = 20
+    # What the recorder stops itself at. Advisory: the size cap above is what the server
+    # actually enforces, since duration is not knowable until the audio is decoded.
+    MAX_VOICE_NOTE_SECONDS: int = 300
     # Download links are minted on demand, so they only have to outlive the click.
     DOWNLOAD_LINK_TTL_SECONDS: int = 300
+
+    # --- Recovering stranded work ---
+    # An item left `processing` for this long has no worker behind it: the process died
+    # mid-task, was OOM-killed, or lost its host. The sweeper marks it failed so the
+    # owner is told and offered a retry, instead of watching a spinner forever.
+    # Comfortably longer than CELERY_TASK_TIME_LIMIT, or it would condemn live work.
+    STUCK_PROCESSING_MINUTES: int = 15
+    # An item left `pending` for this long was never picked up at all -- the usual cause
+    # is an enqueue that failed against an unreachable Redis (`vault_enqueue_failed`).
+    # That is re-drivable, so the sweeper re-queues it rather than failing it.
+    STUCK_PENDING_MINUTES: int = 10
+    # How many times the sweeper will re-queue one item before calling it failed. Without
+    # a ceiling, an item that crashes the worker on load is re-driven forever.
+    MAX_SWEEP_REQUEUES: int = 3
+    # Minimum gap between manual reprocess requests for one item. The button disables
+    # itself once the item goes back to `pending`, so this only has to stop a double
+    # click and a script.
+    REPROCESS_COOLDOWN_SECONDS: int = 30
 
     # --- Rate limiting ---
     RATE_LIMIT_PER_MINUTE: int = 60
@@ -309,6 +397,22 @@ class Settings(BaseSettings):
             and self.B2_APPLICATION_KEY
             and self.B2_ENDPOINT_URL
         )
+
+    @property
+    def transcription_enabled(self) -> bool:
+        """True when voice notes can actually be transcribed.
+
+        Gated on the OpenAI key alone rather than on AI_PROVIDER: the key is what the
+        speech call needs, and summarising with Gemini says nothing about whether it is
+        set. The client reads this to keep the record button out of a UI that could only
+        answer with an error.
+        """
+        return bool(self.OPENAI_API_KEY)
+
+    @property
+    def vision_enabled(self) -> bool:
+        """True when uploaded images can be read. Same key as transcription."""
+        return bool(self.OPENAI_API_KEY)
 
     @property
     def telegram_enabled(self) -> bool:
@@ -443,6 +547,17 @@ def validate_deployment_config(config: Settings) -> None:
             f"{config.ACCESS_TOKEN_EXPIRE_MINUTES}); revocation only takes effect when "
             "the access token expires."
         )
+    # The user cache lets an authenticated request skip re-reading `users`. It must stay
+    # far shorter than the access token itself, or it would start extending the window in
+    # which a deleted account keeps working -- the one thing the database read is for.
+    if config.AUTH_USER_CACHE_SECONDS > config.ACCESS_TOKEN_EXPIRE_MINUTES * 60 // 4:
+        raise RuntimeError(
+            "AUTH_USER_CACHE_SECONDS must stay under a quarter of the access token "
+            f"lifetime when ENV={config.ENV} (got {config.AUTH_USER_CACHE_SECONDS}s "
+            f"against {config.ACCESS_TOKEN_EXPIRE_MINUTES * 60}s); a longer cache "
+            "delays account deletion taking effect."
+        )
+
     if config.SECRET_KEY == DEFAULT_SECRET_KEY:
         raise RuntimeError(
             f"SECRET_KEY is still the built-in placeholder but ENV={config.ENV}. "
