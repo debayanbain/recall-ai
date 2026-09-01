@@ -7,9 +7,10 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.gzip import GZipMiddleware
+from fastapi.responses import JSONResponse
 
 from app.api.health import router as health_router
 from app.api.v1.router import api_router
@@ -27,6 +28,7 @@ from app.core.middleware import (
 )
 from app.db.session import warm_pool
 from app.queue.client import close_pool
+from app.services.space_service import SpaceForbidden, SpaceNotFound
 from app.services.telegram.webhook import can_register, ensure_registered_quietly
 
 log = get_logger("app")
@@ -126,9 +128,36 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
     )
 
+    _register_domain_errors(app)
+
     app.include_router(health_router)
     app.include_router(api_router, prefix=settings.API_V1_PREFIX)
     return app
+
+
+def _register_domain_errors(app: FastAPI) -> None:
+    """Turn the Space domain's two refusals into HTTP, in one place.
+
+    Without this every route repeats the same try/except, and the route that forgets it
+    answers a 500 with a traceback -- which is both an unhelpful reply and a disclosure.
+
+    The split is deliberate. `SpaceNotFound` is 404 and covers "no such Space", "not
+    yours" and every invite rejection alike, so nothing here confirms that an id or a
+    token exists to someone who may not use it. `SpaceForbidden` is 403 and is only ever
+    raised *after* the caller has been shown the Space, so naming the missing role
+    discloses nothing they did not already know and tells them what to ask for.
+
+    Neither handler echoes the exception's own text unless it was written here: a
+    message built from user input is how a reflected value ends up in a response body.
+    """
+
+    @app.exception_handler(SpaceNotFound)
+    async def _space_not_found(_: Request, __: SpaceNotFound) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "Space not found"})
+
+    @app.exception_handler(SpaceForbidden)
+    async def _space_forbidden(_: Request, exc: SpaceForbidden) -> JSONResponse:
+        return JSONResponse(status_code=403, content={"detail": str(exc) or "Not allowed"})
 
 
 app = create_app()

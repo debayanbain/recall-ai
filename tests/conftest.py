@@ -34,8 +34,8 @@ from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.session import get_session
 from app.main import create_app
-from app.models.base import ContentType, ProcessingStatus, Visibility
-from app.models.collection import Collection
+from app.models.base import ContentType, ProcessingStatus, SpaceRole, Visibility
+from app.models.space import Space, SpaceMember
 from app.models.user import User
 from app.models.vault import VaultItem
 
@@ -46,10 +46,12 @@ TEST_DATABASE_URL = os.getenv(
 
 # Order matters: children before parents so the cascade never fires mid-truncate.
 _TABLES = [
-    "collection_items",
+    "space_invites",
+    "space_members",
+    "space_items",
     "vault_chunks",
     "vault_items",
-    "collections",
+    "spaces",
     "subscriptions",
     "audit_log",
     "user_sessions",
@@ -183,22 +185,37 @@ async def make_item(session: AsyncSession, owner: User, title: str) -> VaultItem
     return item
 
 
-async def make_collection(
+async def make_space(
     session: AsyncSession,
     owner: User,
     name: str,
     visibility: Visibility = Visibility.private,
-) -> Collection:
-    collection = Collection(
+) -> Space:
+    space = Space(
         user_id=owner.id,
         name=name,
         slug=f"{name.lower().replace(' ', '-')}-{uuid.uuid4().hex[:6]}",
         visibility=visibility,
     )
-    session.add(collection)
+    session.add(space)
     await session.commit()
-    await session.refresh(collection)
-    return collection
+    await session.refresh(space)
+    return space
+
+
+async def make_member(
+    session: AsyncSession, space: Space, user: User, role: SpaceRole
+) -> SpaceMember:
+    """Put someone in a Space directly, bypassing the invite round trip.
+
+    The invite flow has its own tests; every *other* membership test would otherwise have
+    to mint and spend a token before it could assert anything about roles.
+    """
+    member = SpaceMember(space_id=space.id, user_id=user.id, role=role.value)
+    session.add(member)
+    await session.commit()
+    await session.refresh(member)
+    return member
 
 
 def authenticate(client: AsyncClient, user: User) -> None:

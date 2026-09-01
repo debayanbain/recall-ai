@@ -273,6 +273,39 @@ class Settings(BaseSettings):
     # the recall cap -- an answer here has no evidence behind it to be long about.
     CHAT_REPLY_MAX_CHARS: int = 600
 
+    # --- Spaces ---
+    # An invite is a bearer link someone pastes into a chat. Long enough to be useful
+    # across a weekend, short enough that a link forgotten in a group thread stops
+    # working. Single-use regardless, so this is the ceiling and not the expectation.
+    SPACE_INVITE_EXPIRE_DAYS: int = 7
+    # Two memories are "connected" when their vectors are this close. Read the long note
+    # on RECALL_MIN_SCORE before touching this: it is the same kind of number and it has
+    # the same failure mode. It is NOT the same number, though, and must not be copied
+    # from it -- that threshold answers "is this memory about the question", which is a
+    # comparison between a short query and a document, while this one compares two
+    # documents. Document-to-document similarities sit systematically higher, so a floor
+    # borrowed from the query side draws an edge between every pair in the Space and the
+    # graph becomes a solid block that says nothing. **Measure it against the configured
+    # embedding provider on a Space you can eyeball**, and check the result on a Space of
+    # deliberately unrelated memories: that one should come back nearly empty.
+    SPACE_CONNECTION_MIN_SCORE: float = 0.62
+    # The pairwise scan is O(n^2). At 150 items that is ~11k comparisons, which Postgres
+    # does inside the request; at 1000 it is half a million and the request is gone. Past
+    # the cap the API answers `truncated` rather than timing out, because a Space that
+    # large is exactly the one someone will open first.
+    SPACE_CONNECTION_MAX_ITEMS: int = 150
+    # How many memories a single Space proposal may be built from. A proposal over more
+    # than this is both a worse proposal -- the model averages away what made the
+    # selection coherent -- and a bigger bill.
+    SPACE_PROPOSAL_MAX_ITEMS: int = 25
+    # Per-user hourly cap on the endpoints that call a model (propose, overview, ask).
+    # The in-memory RateLimitMiddleware is per-process and per-IP, which is the wrong key
+    # for a per-account cost; this one is keyed by user id in Redis.
+    SPACE_AI_CALLS_PER_HOUR: int = 40
+    # Regenerating a Space overview re-reads every card in it. Cheap to ask for, not
+    # cheap to serve, and nothing about the answer changes second to second.
+    SPACE_OVERVIEW_COOLDOWN_SECONDS: int = 300
+
     # --- AI (Gemini) ---
     AI_PROVIDER: Literal["gemini", "openai", "claude"] = "gemini"
 

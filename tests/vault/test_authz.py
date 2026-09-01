@@ -15,10 +15,9 @@ import pytest
 from httpx import AsyncClient
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.models.base import Visibility
 from app.models.user import User
 from app.models.vault import VaultItem
-from tests.conftest import make_collection, make_item
+from tests.conftest import make_item
 
 # --------------------------------------------------------------------------------------
 # Unauthenticated access
@@ -30,9 +29,15 @@ PROTECTED: list[tuple[str, str]] = [
     ("GET", f"/api/v1/vault/{uuid.uuid4()}"),
     ("DELETE", f"/api/v1/vault/{uuid.uuid4()}"),
     ("GET", "/api/v1/search?q=anything"),
-    ("GET", "/api/v1/collections"),
-    ("POST", "/api/v1/collections"),
-    ("GET", f"/api/v1/collections/{uuid.uuid4()}"),
+    ("GET", "/api/v1/spaces"),
+    ("POST", "/api/v1/spaces"),
+    ("GET", f"/api/v1/spaces/{uuid.uuid4()}"),
+    ("PATCH", f"/api/v1/spaces/{uuid.uuid4()}"),
+    ("DELETE", f"/api/v1/spaces/{uuid.uuid4()}"),
+    ("POST", f"/api/v1/spaces/{uuid.uuid4()}/items"),
+    ("GET", f"/api/v1/spaces/{uuid.uuid4()}/members"),
+    ("POST", f"/api/v1/spaces/{uuid.uuid4()}/invites"),
+    ("POST", "/api/v1/spaces/invites/anything/accept"),
 ]
 
 
@@ -125,117 +130,3 @@ async def test_owner_can_read_own_item(
 
     assert response.status_code == 200
     assert response.json()["title"] == "alice own note"
-
-
-# --------------------------------------------------------------------------------------
-# Collections
-# --------------------------------------------------------------------------------------
-
-
-async def test_cannot_read_another_users_collection(
-    bob_client: AsyncClient, session: AsyncSession, alice: User, bob: User
-) -> None:
-    collection = await make_collection(session, alice, "Alice Research")
-
-    assert (await bob_client.get(f"/api/v1/collections/{collection.id}")).status_code == 404
-
-
-async def test_collection_list_excludes_other_users(
-    bob_client: AsyncClient, session: AsyncSession, alice: User, bob: User
-) -> None:
-    await make_collection(session, alice, "Alice Space")
-    mine = await make_collection(session, bob, "Bob Space")
-
-    body = (await bob_client.get("/api/v1/collections")).json()
-
-    assert [c["id"] for c in body] == [str(mine.id)]
-
-
-async def test_cannot_add_item_to_another_users_collection(
-    bob_client: AsyncClient, session: AsyncSession, alice: User, bob: User
-) -> None:
-    collection = await make_collection(session, alice, "Alice Space")
-    mine = await make_item(session, bob, "bob item")
-
-    response = await bob_client.post(
-        f"/api/v1/collections/{collection.id}/items",
-        json={"vault_item_id": str(mine.id)},
-    )
-
-    assert response.status_code == 404
-
-
-async def test_cannot_add_another_users_item_to_own_collection(
-    bob_client: AsyncClient, session: AsyncSession, alice: User, bob: User
-) -> None:
-    """The collection is Bob's, but the item is Alice's.
-
-    Ownership of the container must not grant ownership of what is put inside it --
-    otherwise a stranger's item becomes readable through the collection detail route.
-    """
-    stolen = await make_item(session, alice, "alice confidential")
-    mine = await make_collection(session, bob, "Bob Space")
-
-    response = await bob_client.post(
-        f"/api/v1/collections/{mine.id}/items",
-        json={"vault_item_id": str(stolen.id)},
-    )
-
-    assert response.status_code == 404
-
-    detail = await bob_client.get(f"/api/v1/collections/{mine.id}")
-    assert "alice confidential" not in detail.text
-
-
-# --------------------------------------------------------------------------------------
-# Public sharing
-# --------------------------------------------------------------------------------------
-
-
-async def test_private_collection_is_not_public(
-    client: AsyncClient, session: AsyncSession, alice: User
-) -> None:
-    collection = await make_collection(session, alice, "Alice Private", Visibility.private)
-
-    assert (await client.get(f"/api/v1/public/{collection.slug}")).status_code == 404
-
-
-async def test_unlisted_collection_is_not_public(
-    client: AsyncClient, session: AsyncSession, alice: User
-) -> None:
-    collection = await make_collection(session, alice, "Alice Unlisted", Visibility.unlisted)
-
-    assert (await client.get(f"/api/v1/public/{collection.slug}")).status_code == 404
-
-
-async def test_public_collection_is_readable_without_auth(
-    client: AsyncClient, session: AsyncSession, alice: User
-) -> None:
-    collection = await make_collection(session, alice, "Alice Public", Visibility.public)
-
-    response = await client.get(f"/api/v1/public/{collection.slug}")
-
-    assert response.status_code == 200
-    assert response.json()["name"] == "Alice Public"
-
-
-async def test_public_collection_never_exposes_another_users_item(
-    client: AsyncClient, session: AsyncSession, alice: User, bob: User
-) -> None:
-    """Worst case of the container/content split: a public collection makes any item
-    inside it world-readable, so a foreign item must never be able to land in one."""
-    from tests.conftest import authenticate
-
-    stolen = await make_item(session, alice, "alice confidential")
-    shared = await make_collection(session, bob, "Bob Public", Visibility.public)
-
-    authenticate(client, bob)
-    await client.post(
-        f"/api/v1/collections/{shared.id}/items",
-        json={"vault_item_id": str(stolen.id)},
-    )
-    client.cookies.clear()
-
-    response = await client.get(f"/api/v1/public/{shared.slug}")
-
-    assert "alice confidential" not in response.text

@@ -39,17 +39,32 @@ _COLUMNS = [
 ]
 
 
-def upgrade() -> None:
+def _convert(to_type: str) -> None:
+    """Retype each column, skipping any table this database does not have.
+
+    `collections` / `collection_items` are renamed to `spaces` / `space_items` by
+    `0013_spaces`, and `0001_initial` builds the schema from the *current* models -- so on
+    a fresh database those two names never exist and an unguarded ALTER aborts the whole
+    upgrade inside Alembic's single transaction. The pairs stay listed because a database
+    created before the rename still has to pass through here.
+    """
     for table, column in _COLUMNS:
         op.execute(
-            f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TIMESTAMPTZ "
-            f"USING {column} AT TIME ZONE 'UTC'"
+            f"""
+            DO $$
+            BEGIN
+                IF to_regclass('public.{table}') IS NOT NULL THEN
+                    ALTER TABLE {table} ALTER COLUMN {column} TYPE {to_type}
+                    USING {column} AT TIME ZONE 'UTC';
+                END IF;
+            END $$;
+            """
         )
+
+
+def upgrade() -> None:
+    _convert("TIMESTAMPTZ")
 
 
 def downgrade() -> None:
-    for table, column in _COLUMNS:
-        op.execute(
-            f"ALTER TABLE {table} ALTER COLUMN {column} TYPE TIMESTAMP "
-            f"USING {column} AT TIME ZONE 'UTC'"
-        )
+    _convert("TIMESTAMP")

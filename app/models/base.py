@@ -44,6 +44,20 @@ class Plan(StrEnum):
     team = "team"
 
 
+class SpaceRole(StrEnum):
+    """What a person may do inside a Space they did not create.
+
+    Ordered least-to-most on purpose so `_RANK` in the service is a comparison rather than
+    a table of cases. `owner` is never stored in `space_members` -- it is `spaces.user_id`
+    -- but it appears here because the API reports a caller's effective role and the
+    owner's answer has to be sayable.
+    """
+
+    viewer = "viewer"
+    editor = "editor"
+    owner = "owner"
+
+
 class Visibility(StrEnum):
     private = "private"
     unlisted = "unlisted"

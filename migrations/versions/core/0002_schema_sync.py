@@ -87,15 +87,31 @@ def upgrade() -> None:
         ON vault_chunks USING hnsw (embedding vector_cosine_ops)
     """)
 
-    # ---- collections ---------------------------------------------------------
-    op.execute("ALTER TABLE collections ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now()")
-    op.execute("ALTER TABLE collections ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ")
+    # ---- collections -> spaces -----------------------------------------------
+    # Guarded on the table still existing. `0013_spaces` renames `collections` to
+    # `spaces`, and `0001_initial` builds the schema from the *current* models via
+    # `create_all` -- so on a fresh database this table is called `spaces` before this
+    # revision ever runs, and an unguarded ALTER here aborts the whole upgrade. The
+    # statements are kept rather than deleted because a database that predates the rename
+    # still needs them on its way through.
+    op.execute("""
+        DO $$
+        BEGIN
+            IF to_regclass('public.collections') IS NOT NULL THEN
+                ALTER TABLE collections ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ NOT NULL DEFAULT now();
+                ALTER TABLE collections ADD COLUMN IF NOT EXISTS deleted_at TIMESTAMPTZ;
+            END IF;
+        END $$;
+    """)
 
     # ---- collection_items ---------------------------------------------------
     # Old schema had id UUID PK; new schema uses composite PK (collection_id, vault_item_id)
     op.execute("""
         DO $$
         BEGIN
+            IF to_regclass('public.collection_items') IS NULL THEN
+                RETURN;
+            END IF;
             IF EXISTS (SELECT 1 FROM information_schema.columns
                        WHERE table_name='collection_items' AND column_name='id') THEN
                 ALTER TABLE collection_items DROP CONSTRAINT IF EXISTS collection_items_pkey;
@@ -104,9 +120,9 @@ def upgrade() -> None:
                 -- Re-add composite PK only if not yet primary key
                 ALTER TABLE collection_items ADD PRIMARY KEY (collection_id, vault_item_id);
             END IF;
+            ALTER TABLE collection_items ADD COLUMN IF NOT EXISTS position INT NOT NULL DEFAULT 0;
         END $$;
     """)
-    op.execute("ALTER TABLE collection_items ADD COLUMN IF NOT EXISTS position INT NOT NULL DEFAULT 0")
 
     # ---- subscriptions -------------------------------------------------------
     op.execute("ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS current_period_start TIMESTAMPTZ")
@@ -153,8 +169,15 @@ def downgrade() -> None:
     op.execute("ALTER TABLE users DROP COLUMN IF EXISTS deleted_at")
     op.execute("ALTER TABLE users DROP COLUMN IF EXISTS provider_account_id")
     op.execute("ALTER TABLE users DROP COLUMN IF EXISTS auth_provider")
-    op.execute("ALTER TABLE collections DROP COLUMN IF EXISTS deleted_at")
-    op.execute("ALTER TABLE collections DROP COLUMN IF EXISTS updated_at")
+    op.execute("""
+        DO $$
+        BEGIN
+            IF to_regclass('public.collections') IS NOT NULL THEN
+                ALTER TABLE collections DROP COLUMN IF EXISTS deleted_at;
+                ALTER TABLE collections DROP COLUMN IF EXISTS updated_at;
+            END IF;
+        END $$;
+    """)
     op.execute("ALTER TABLE subscriptions DROP COLUMN IF EXISTS updated_at")
     op.execute("ALTER TABLE subscriptions DROP COLUMN IF EXISTS cancel_at_period_end")
     op.execute("ALTER TABLE subscriptions DROP COLUMN IF EXISTS current_period_end")

@@ -458,12 +458,109 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/vault/voice:
+    post:
+      tags:
+      - vault
+      summary: Save Voice Note
+      description: 'Transcribe a spoken note and save what was said.
+
+
+        The transcript is the memory: it is summarised, tagged and embedded like any other
+
+        item, so a voice note is searchable by its words rather than by its filename. The
+
+        recording is filed alongside it when a bucket is configured, and its absence never
+
+        costs the user the transcript.
+
+
+        Read with an explicit cap rather than trusting `audio.size` -- the client writes
+
+        Content-Length, so a small declared size can still stream a large body. The container
+
+        is decided from the bytes in `services/transcription.py`; the filename a browser
+
+        invents for a `MediaRecorder` blob is never consulted.
+
+
+        `language` (ISO-639-1) pins the transcription instead of letting the model detect it.
+
+        Auto-detection is the default and is right for a multilingual vault, but it *is* a
+
+        guess -- a short Bengali clip has been observed coming back as fluent Traditional
+
+        Chinese -- so the recorder offers the choice and this removes the guess entirely.
+
+        Unknown codes fall back to auto-detect rather than being refused: the value is
+
+        forwarded to a provider and rendered on a page, so it is re-derived from a closed
+
+        allowlist, and a client bug must not cost the user their words.
+
+
+        `duration` is the recorder''s own measurement, kept because only the whisper-* models
+
+        report one and the player needs a length regardless.
+
+
+        `peaks` is the amplitude shape the recorder measured while recording, used to draw the
+
+        waveform on the memory page. It is client-written data bound for a JSONB column, so
+
+        `parse_waveform` re-derives it rather than trusting it and answers None for anything
+
+        malformed -- the picture is decoration beside a transcript and must never cost the
+
+        user the words.'
+      operationId: save_voice_note_api_v1_vault_voice_post
+      parameters:
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              $ref: '#/components/schemas/Body_save_voice_note_api_v1_vault_voice_post'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultItemRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/vault/uploads/limits:
     get:
       tags:
       - vault
       summary: Upload Limits
-      description: What the client may send, so the picker can filter before a 25MB round-trip.
+      description: 'What the client may send, so the picker can filter before a 25MB round-trip.
+
+
+        This is deployment configuration -- it changes when the server restarts, never
+
+        between two requests -- but the picker asks for it on every mount, and against a
+
+        database in another region that was a ~600ms wait before the user could choose a
+
+        file. `private` keeps it out of shared caches (it is behind a session cookie and
+
+        describes that user''s own limits); the max-age is short enough that a config change
+
+        is picked up within a minute of a deploy.'
       operationId: upload_limits_api_v1_vault_uploads_limits_get
       parameters:
       - name: recall_session
@@ -655,6 +752,80 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/vault/{item_id}/reprocess:
+    post:
+      tags:
+      - vault
+      summary: Reprocess Item
+      description: 'Put a failed or skipped item back on the queue.
+
+
+        The pipeline can fail for reasons that have nothing to do with the item -- a provider
+
+        timeout, a rate limit, a worker that was killed mid-job -- and until now the only
+
+        thing a person could do about it was delete the memory and save it again, losing the
+
+        id, the link and anything they had edited. This is the same work, re-driven.
+
+
+        404 covers "no such item" and "not yours" alike: the repository scopes on `user_id`,
+
+        so a guessed id from another account is indistinguishable from a missing one.
+
+
+        409 is the honest answer for an item that is already queued or already finished --
+
+        the client hides the button in both states, so reaching here means a double click.
+
+        429 is the cooldown. Neither is an error worth a stack trace.
+
+
+        A **voice note** is the one kind that may be re-driven after it *succeeded*, because
+
+        its transcript is the one output that can be confidently and fluently wrong, and its
+
+        audio is still in the bucket to redo it from. `language` (ISO-639-1) pins that re-run,
+
+        which is the point: repeating a failed auto-detection unchanged is the same coin flip.'
+      operationId: reprocess_item_api_v1_vault__item_id__reprocess_post
+      parameters:
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Item Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      requestBody:
+        content:
+          application/json:
+            schema:
+              anyOf:
+              - $ref: '#/components/schemas/ReprocessRequest'
+              - type: 'null'
+              title: Body
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/VaultItemRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
   /api/v1/vault/{item_id}/file:
     get:
       tags:
@@ -751,45 +922,12 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/collections:
-    post:
-      tags:
-      - collections
-      summary: Create Collection
-      operationId: create_collection_api_v1_collections_post
-      parameters:
-      - name: recall_session
-        in: cookie
-        required: false
-        schema:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Recall Session
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              $ref: '#/components/schemas/CreateCollectionRequest'
-      responses:
-        '201':
-          description: Successful Response
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/CollectionRead'
-        '422':
-          description: Validation Error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces:
     get:
       tags:
-      - collections
-      summary: List Collections
-      operationId: list_collections_api_v1_collections_get
+      - spaces
+      summary: List Spaces
+      operationId: list_spaces_api_v1_spaces_get
       parameters:
       - name: recall_session
         in: cookie
@@ -807,28 +945,76 @@ paths:
               schema:
                 type: array
                 items:
-                  $ref: '#/components/schemas/CollectionRead'
-                title: Response List Collections Api V1 Collections Get
+                  $ref: '#/components/schemas/SpaceRead'
+                title: Response List Spaces Api V1 Spaces Get
         '422':
           description: Validation Error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/collections/{collection_id}:
+    post:
+      tags:
+      - spaces
+      summary: Create Space
+      operationId: create_space_api_v1_spaces_post
+      parameters:
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateSpaceRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpaceRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/for-item/{item_id}:
     get:
       tags:
-      - collections
-      summary: Get Collection
-      operationId: get_collection_api_v1_collections__collection_id__get
+      - spaces
+      summary: Spaces For Item
+      description: 'Which of the caller''s Spaces already contain this memory.
+
+
+        Drives the checkmarks in a card''s "+" menu. Answers with ids only, and only for
+
+        Spaces the caller is in, so it cannot be used to probe whether a stranger filed
+
+        something. An id the caller cannot see is simply absent -- there is no 404 here
+
+        because "this memory is in none of your Spaces" is a real answer.
+
+
+        Declared above the `/{space_id}` routes for the same reason the invite route is: a
+
+        literal segment that could be read as a parameter has to be matched first.'
+      operationId: spaces_for_item_api_v1_spaces_for_item__item_id__get
       parameters:
-      - name: collection_id
+      - name: item_id
         in: path
         required: true
         schema:
           type: string
           format: uuid
-          title: Collection Id
+          title: Item Id
       - name: recall_session
         in: cookie
         required: false
@@ -843,27 +1029,118 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/CollectionDetail'
+                type: array
+                items:
+                  type: string
+                  format: uuid
+                title: Response Spaces For Item Api V1 Spaces For Item  Item Id  Get
         '422':
           description: Validation Error
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/HTTPValidationError'
-  /api/v1/collections/{collection_id}/items:
+  /api/v1/spaces/invites/{invite_token}/accept:
     post:
       tags:
-      - collections
-      summary: Add Item
-      operationId: add_item_api_v1_collections__collection_id__items_post
+      - spaces
+      summary: Accept Invite
+      description: 'Spend an invite link.
+
+
+        Every rejection is the same 404 -- unknown token, spent token, expired token, deleted
+
+        Space. Distinguishing them tells whoever found the link in a screenshot exactly what
+
+        they are holding.
+
+
+        Declared **above** the `/{space_id}` routes, like `GET /vault/uploads/limits` is: a
+
+        literal segment that could be read as a parameter has to be matched first. The path
+
+        parameter is `invite_token` rather than `token` because FastAPI resolves path-parameter
+
+        names across the whole dependency tree, and `get_current_user` already takes a `token`
+
+        -- from a cookie, with a default, which a path parameter may not have.'
+      operationId: accept_invite_api_v1_spaces_invites__invite_token__accept_post
       parameters:
-      - name: collection_id
+      - name: invite_token
+        in: path
+        required: true
+        schema:
+          type: string
+          title: Invite Token
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpaceRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}:
+    get:
+      tags:
+      - spaces
+      summary: Get Space
+      operationId: get_space_api_v1_spaces__space_id__get
+      parameters:
+      - name: space_id
         in: path
         required: true
         schema:
           type: string
           format: uuid
-          title: Collection Id
+          title: Space Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpaceDetail'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    patch:
+      tags:
+      - spaces
+      summary: Update Space
+      operationId: update_space_api_v1_spaces__space_id__patch
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
       - name: recall_session
         in: cookie
         required: false
@@ -877,7 +1154,237 @@ paths:
         content:
           application/json:
             schema:
-              $ref: '#/components/schemas/AddItemRequest'
+              $ref: '#/components/schemas/UpdateSpaceRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SpaceRead'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+    delete:
+      tags:
+      - spaces
+      summary: Delete Space
+      operationId: delete_space_api_v1_spaces__space_id__delete
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}/items:
+    post:
+      tags:
+      - spaces
+      summary: Add Items
+      operationId: add_items_api_v1_spaces__space_id__items_post
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/AddItemsRequest'
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AddItemsResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}/items/{item_id}:
+    delete:
+      tags:
+      - spaces
+      summary: Remove Item
+      operationId: remove_item_api_v1_spaces__space_id__items__item_id__delete
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: item_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Item Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      responses:
+        '204':
+          description: Successful Response
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}/members:
+    get:
+      tags:
+      - spaces
+      summary: List Members
+      operationId: list_members_api_v1_spaces__space_id__members_get
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      responses:
+        '200':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SpaceMemberRead'
+                title: Response List Members Api V1 Spaces  Space Id  Members Get
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}/invites:
+    post:
+      tags:
+      - spaces
+      summary: Create Invite
+      operationId: create_invite_api_v1_spaces__space_id__invites_post
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateInviteRequest'
+      responses:
+        '201':
+          description: Successful Response
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/InviteResponse'
+        '422':
+          description: Validation Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HTTPValidationError'
+  /api/v1/spaces/{space_id}/members/{member_id}:
+    delete:
+      tags:
+      - spaces
+      summary: Remove Member
+      operationId: remove_member_api_v1_spaces__space_id__members__member_id__delete
+      parameters:
+      - name: space_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Space Id
+      - name: member_id
+        in: path
+        required: true
+        schema:
+          type: string
+          format: uuid
+          title: Member Id
+      - name: recall_session
+        in: cookie
+        required: false
+        schema:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Recall Session
       responses:
         '204':
           description: Successful Response
@@ -1116,8 +1623,8 @@ paths:
     get:
       tags:
       - public
-      summary: Public Collection
-      operationId: public_collection_api_v1_public__slug__get
+      summary: Public Space
+      operationId: public_space_api_v1_public__slug__get
       parameters:
       - name: slug
         in: path
@@ -1131,7 +1638,7 @@ paths:
           content:
             application/json:
               schema:
-                $ref: '#/components/schemas/PublicCollection'
+                $ref: '#/components/schemas/PublicSpace'
         '422':
           description: Validation Error
           content:
@@ -1213,16 +1720,71 @@ paths:
                 $ref: '#/components/schemas/HTTPValidationError'
 components:
   schemas:
-    AddItemRequest:
+    AddItemsRequest:
       properties:
-        vault_item_id:
-          type: string
-          format: uuid
-          title: Vault Item Id
+        item_ids:
+          items:
+            type: string
+            format: uuid
+          type: array
+          maxItems: 100
+          minItems: 1
+          title: Item Ids
       type: object
       required:
-      - vault_item_id
-      title: AddItemRequest
+      - item_ids
+      title: AddItemsRequest
+    AddItemsResponse:
+      properties:
+        added:
+          type: integer
+          title: Added
+        skipped:
+          type: integer
+          title: Skipped
+      type: object
+      required:
+      - added
+      - skipped
+      title: AddItemsResponse
+      description: '`skipped` counts what was already there or was not the caller''s to add.
+
+
+        Reported rather than raised: re-adding a memory is the normal outcome of "add all
+
+        suggestions", not an error, and the old behaviour -- a primary-key violation surfacing
+
+        as a 500 -- made the obvious user action look like a broken server.'
+    Body_save_voice_note_api_v1_vault_voice_post:
+      properties:
+        audio:
+          type: string
+          contentMediaType: application/octet-stream
+          title: Audio
+        title:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Title
+        peaks:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Peaks
+        language:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Language
+        duration:
+          anyOf:
+          - type: number
+          - type: 'null'
+          title: Duration
+      type: object
+      required:
+      - audio
+      title: Body_save_voice_note_api_v1_vault_voice_post
     Body_upload_document_api_v1_vault_upload_post:
       properties:
         file:
@@ -1233,75 +1795,6 @@ components:
       required:
       - file
       title: Body_upload_document_api_v1_vault_upload_post
-    CollectionDetail:
-      properties:
-        id:
-          type: string
-          format: uuid
-          title: Id
-        name:
-          type: string
-          title: Name
-        slug:
-          type: string
-          title: Slug
-        description:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Description
-        visibility:
-          $ref: '#/components/schemas/Visibility'
-        created_at:
-          type: string
-          format: date-time
-          title: Created At
-        items:
-          items:
-            $ref: '#/components/schemas/VaultItemRead'
-          type: array
-          title: Items
-      type: object
-      required:
-      - id
-      - name
-      - slug
-      - description
-      - visibility
-      - created_at
-      title: CollectionDetail
-    CollectionRead:
-      properties:
-        id:
-          type: string
-          format: uuid
-          title: Id
-        name:
-          type: string
-          title: Name
-        slug:
-          type: string
-          title: Slug
-        description:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Description
-        visibility:
-          $ref: '#/components/schemas/Visibility'
-        created_at:
-          type: string
-          format: date-time
-          title: Created At
-      type: object
-      required:
-      - id
-      - name
-      - slug
-      - description
-      - visibility
-      - created_at
-      title: CollectionRead
     ContentType:
       type: string
       enum:
@@ -1317,25 +1810,13 @@ components:
       - voice
       - image
       title: ContentType
-    CreateCollectionRequest:
+    CreateInviteRequest:
       properties:
-        name:
-          type: string
-          maxLength: 255
-          minLength: 1
-          title: Name
-        description:
-          anyOf:
-          - type: string
-          - type: 'null'
-          title: Description
-        visibility:
-          $ref: '#/components/schemas/Visibility'
-          default: private
+        role:
+          $ref: '#/components/schemas/SpaceRole'
+          default: viewer
       type: object
-      required:
-      - name
-      title: CreateCollectionRequest
+      title: CreateInviteRequest
     CreateNoteRequest:
       properties:
         title:
@@ -1352,6 +1833,45 @@ components:
       - title
       - content
       title: CreateNoteRequest
+    CreateSpaceRequest:
+      properties:
+        name:
+          type: string
+          maxLength: 255
+          minLength: 1
+          title: Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 2000
+          - type: 'null'
+          title: Description
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+          default: private
+        emoji:
+          anyOf:
+          - type: string
+            maxLength: 16
+          - type: 'null'
+          title: Emoji
+        accent:
+          anyOf:
+          - type: string
+            maxLength: 24
+          - type: 'null'
+          title: Accent
+        item_ids:
+          items:
+            type: string
+            format: uuid
+          type: array
+          maxItems: 100
+          title: Item Ids
+      type: object
+      required:
+      - name
+      title: CreateSpaceRequest
     FileLinkResponse:
       properties:
         url:
@@ -1460,6 +1980,29 @@ components:
       - available
       - accounts
       title: InstagramConnectionsResponse
+    InviteResponse:
+      properties:
+        url:
+          type: string
+          title: Url
+        role:
+          $ref: '#/components/schemas/SpaceRole'
+        expires_at:
+          type: string
+          format: date-time
+          title: Expires At
+      type: object
+      required:
+      - url
+      - role
+      - expires_at
+      title: InviteResponse
+      description: 'The raw token exists only in this response and in the link the user copies.
+
+
+        Treat it as a credential: anyone holding it can join the Space until it is spent or
+
+        expires. It is never stored -- only its SHA-256 is.'
     OAuthProviderInfo:
       properties:
         id:
@@ -1504,7 +2047,7 @@ components:
       required:
       - providers
       title: ProvidersResponse
-    PublicCollection:
+    PublicSpace:
       properties:
         name:
           type: string
@@ -1514,6 +2057,21 @@ components:
           - type: string
           - type: 'null'
           title: Description
+        emoji:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Emoji
+        accent:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Accent
+        ai_overview:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ai Overview
         items:
           items:
             $ref: '#/components/schemas/VaultItemRead'
@@ -1523,8 +2081,19 @@ components:
       required:
       - name
       - description
+      - emoji
+      - accent
+      - ai_overview
       - items
-      title: PublicCollection
+      title: PublicSpace
+      description: 'The unauthenticated share page.
+
+
+        Hand-built and narrower than `SpaceRead` on purpose: no id, no slug echo, no
+
+        visibility, no member list, no role. A public page is read by people who are not in
+
+        the Space, and the shape of what it returns is the whole access-control boundary.'
     RefreshResponse:
       properties:
         ok:
@@ -1551,6 +2120,24 @@ components:
         `expires_in` lets the SPA schedule a refresh slightly before the access token dies
 
         instead of discovering it through a failed request.'
+    ReprocessRequest:
+      properties:
+        language:
+          anyOf:
+          - type: string
+            maxLength: 8
+          - type: 'null'
+          title: Language
+      type: object
+      title: ReprocessRequest
+      description: 'Optional knobs on a retry. Only voice notes have one so far.
+
+
+        `language` is validated against a closed allowlist in `services/transcription.py`
+
+        rather than here: an unknown code means auto-detect, not a rejected request, because
+
+        a client bug must not stand between someone and a fixed transcript.'
     SaveUrlRequest:
       properties:
         url:
@@ -1613,6 +2200,210 @@ components:
         Carries no credential: `id` is a row id whose only power is `DELETE /auth/sessions/
 
         {id}`, and that is ownership-checked.'
+    SpaceDetail:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          title: Name
+        slug:
+          type: string
+          title: Slug
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        emoji:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Emoji
+        accent:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Accent
+        pinned:
+          type: boolean
+          title: Pinned
+        ai_overview:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ai Overview
+        ai_topics:
+          items:
+            type: string
+          type: array
+          title: Ai Topics
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        role:
+          $ref: '#/components/schemas/SpaceRole'
+        memory_count:
+          type: integer
+          title: Memory Count
+        member_count:
+          type: integer
+          title: Member Count
+        connection_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Connection Count
+        items:
+          items:
+            $ref: '#/components/schemas/VaultItemRead'
+          type: array
+          title: Items
+        members:
+          items:
+            $ref: '#/components/schemas/SpaceMemberRead'
+          type: array
+          title: Members
+      type: object
+      required:
+      - id
+      - name
+      - slug
+      - description
+      - visibility
+      - emoji
+      - accent
+      - pinned
+      - ai_overview
+      - ai_topics
+      - created_at
+      - role
+      - memory_count
+      - member_count
+      title: SpaceDetail
+    SpaceMemberRead:
+      properties:
+        user_id:
+          type: string
+          format: uuid
+          title: User Id
+        name:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Name
+        avatar_url:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Avatar Url
+        role:
+          $ref: '#/components/schemas/SpaceRole'
+      type: object
+      required:
+      - user_id
+      - name
+      - avatar_url
+      - role
+      title: SpaceMemberRead
+    SpaceRead:
+      properties:
+        id:
+          type: string
+          format: uuid
+          title: Id
+        name:
+          type: string
+          title: Name
+        slug:
+          type: string
+          title: Slug
+        description:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Description
+        visibility:
+          $ref: '#/components/schemas/Visibility'
+        emoji:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Emoji
+        accent:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Accent
+        pinned:
+          type: boolean
+          title: Pinned
+        ai_overview:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Ai Overview
+        ai_topics:
+          items:
+            type: string
+          type: array
+          title: Ai Topics
+        created_at:
+          type: string
+          format: date-time
+          title: Created At
+        role:
+          $ref: '#/components/schemas/SpaceRole'
+        memory_count:
+          type: integer
+          title: Memory Count
+        member_count:
+          type: integer
+          title: Member Count
+        connection_count:
+          anyOf:
+          - type: integer
+          - type: 'null'
+          title: Connection Count
+      type: object
+      required:
+      - id
+      - name
+      - slug
+      - description
+      - visibility
+      - emoji
+      - accent
+      - pinned
+      - ai_overview
+      - ai_topics
+      - created_at
+      - role
+      - memory_count
+      - member_count
+      title: SpaceRead
+    SpaceRole:
+      type: string
+      enum:
+      - viewer
+      - editor
+      - owner
+      title: SpaceRole
+      description: 'What a person may do inside a Space they did not create.
+
+
+        Ordered least-to-most on purpose so `_RANK` in the service is a comparison rather than
+
+        a table of cases. `owner` is never stored in `space_members` -- it is `spaces.user_id`
+
+        -- but it appears here because the API reports a caller''s effective role and the
+
+        owner''s answer has to be sayable.'
     TelegramAccountRead:
       properties:
         telegram_user_id:
@@ -1707,6 +2498,52 @@ components:
         them, so `content` and the stored document can never disagree about what the user
 
         actually wrote.'
+    UpdateSpaceRequest:
+      properties:
+        name:
+          anyOf:
+          - type: string
+            maxLength: 255
+            minLength: 1
+          - type: 'null'
+          title: Name
+        description:
+          anyOf:
+          - type: string
+            maxLength: 2000
+          - type: 'null'
+          title: Description
+        visibility:
+          anyOf:
+          - $ref: '#/components/schemas/Visibility'
+          - type: 'null'
+        emoji:
+          anyOf:
+          - type: string
+            maxLength: 16
+          - type: 'null'
+          title: Emoji
+        accent:
+          anyOf:
+          - type: string
+            maxLength: 24
+          - type: 'null'
+          title: Accent
+        pinned:
+          anyOf:
+          - type: boolean
+          - type: 'null'
+          title: Pinned
+      type: object
+      title: UpdateSpaceRequest
+      description: 'Every field optional, and every field one a caller is allowed to set.
+
+
+        `None` means "leave it alone" rather than "clear it", except for `emoji` and `accent`
+
+        where the empty string is the way to clear -- a nullable field with two meanings for
+
+        null is a field nobody can use correctly.'
     UserRead:
       properties:
         id:
@@ -1817,6 +2654,11 @@ components:
           title: Ai Label
         processing_status:
           $ref: '#/components/schemas/ProcessingStatus'
+        processing_error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Processing Error
         created_at:
           type: string
           format: date-time
@@ -1909,6 +2751,11 @@ components:
           title: Ai Label
         processing_status:
           $ref: '#/components/schemas/ProcessingStatus'
+        processing_error:
+          anyOf:
+          - type: string
+          - type: 'null'
+          title: Processing Error
         created_at:
           type: string
           format: date-time

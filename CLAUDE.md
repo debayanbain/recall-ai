@@ -800,6 +800,73 @@ catch-all and must stay last, so new extractors get appended *before* it.
   .txt's text goes through the normal AI pipeline; an image or a .docx is stored and
   downloadable but never sent to the model -- there is no OCR and no OOXML parser, and
   calling the model on an empty string spends tokens to hallucinate about a filename.
+- **A Space is a context, not a folder, and it is the one place a user reads someone
+  else's rows.** `Space` / `SpaceItem` (`app/models/space.py`) are the renamed
+  `Collection` / `CollectionItem`; the old word is gone from Python, SQL and the UI.
+  Membership is a plain many-to-many and nothing enforces exclusivity -- a `VaultItem`
+  belongs to as many Spaces as it belongs to. Four rules hold the sharing boundary and
+  none of them should be relaxed casually:
+  * **A member sees cards, not bodies.** `GET /spaces/{id}` serialises every member's
+    items as `VaultItemRead` -- title, summary, tags, thumbnail. `GET /vault/{id}`,
+    `content`, `ai_highlights`, `item_metadata` and the file route stay owner-only and
+    were not widened. Being in a shared Space is not a grant on the memory itself. The
+    line lives at one `VaultItemRead.model_validate` call in `app/api/v1/spaces.py`.
+  * **You may only add your own memories.** `SpaceService._attach` filters every id
+    through `vault_repo.get(item_id, actor_id)`, per item and not per request. Owning
+    the container has never granted access to its contents -- that was a real
+    cross-tenant IDOR here once, and editors make it worse rather than better: a person
+    with write access to someone else's Space must still not be able to pull a third
+    party's memory into it, least of all into a *public* one.
+  * **Ownership is `spaces.user_id`, never a `space_members` row.** One source of truth,
+    so a role row can never contradict the column that gates deletion and publishing.
+    `SpaceRepository.get_for_viewer` is the only way into a Space and returns the
+    caller's effective role with it, so a new route cannot skip the check by forgetting
+    an argument -- the signature has nowhere to put one that would be ignored.
+    `_RANK` orders viewer < editor < owner so a gate is a comparison, not a case list,
+    and an unrecognised stored role reads as `viewer` rather than as anything more.
+  * **Deleting a Space is soft**, unlike `VaultRepository.delete`. It can hold other
+    people's contributions and can be someone's only route to a shared page.
+- **Adding a memory to a Space is idempotent, and that is load-bearing.**
+  `SpaceRepository.add_items` uses `ON CONFLICT DO NOTHING` on the composite PK and
+  returns a count. The previous implementation issued a bare INSERT, so re-adding raised
+  a `UniqueViolation` and the request 500'd -- and the batch paths ("add all suggestions",
+  a selection that overlaps the Space) hit that as the *normal* outcome. The route
+  answers `{added, skipped}`; `skipped` counts what was already there **and** what was
+  not the caller's to add, so it is reported rather than swallowed.
+- **A Space invite is a link, not an email.** There is no mailer in this service, and
+  inviting by address would need an oracle for "does this person have a Recall account",
+  which every other surface here refuses to provide. So `space_invites` mints a token
+  exactly like `telegram_link_tokens` does: 32 random bytes handed over once, only the
+  SHA-256 stored, single-use, and **unknown / spent / expired / deleted-Space all answer
+  the same 404**. `owner` is not grantable by invite -- transferring a Space is a
+  different operation and must not be reachable from a dropdown. The token is spent
+  before the membership is written, so a failure between the two cannot leave a live
+  credential. `/spaces/invites/{invite_token}/accept` is declared **above** the
+  `/{space_id}` routes, and its parameter is `invite_token` rather than `token`, because
+  FastAPI resolves path-parameter names across the whole dependency tree and
+  `get_current_user` already takes a `token` -- from a cookie, with a default, which a
+  path parameter may not have.
+- **Every mutating Space route carries `assert_same_site`**, like the auth and
+  integrations routes and unlike the vault ones. Worth knowing in development: the guard
+  compares `Origin` against `CORS_ORIGINS` + `FRONTEND_URL`, so browsing
+  `http://localhost:3000` while those are set to a tunnel gets a **403 on writes** while
+  reads and the whole vault keep working. That is the guard doing its job, not a bug --
+  browse the configured origin, or add localhost to `CORS_ORIGINS`.
+- **`accent` stores a key, never a CSS class.** A `spaces.accent` of `"violet"` is
+  resolved to a gradient by the frontend (`lib/space-accent.ts`). A column holding
+  `from-violet-200 via-indigo-100` is a column coupled to a Tailwind version, and it
+  breaks silently on their next major -- the class stops existing, the card renders with
+  no background, and nothing errors. `connection_count` is nullable for a related
+  reason: NULL means *never computed*, which the UI renders as nothing rather than as a
+  zero, because "no connections" and "not measured" are different claims.
+- **`0013_spaces` renames tables, which made two historical migrations wrong.**
+  `0001_initial` builds the schema from the *current* models via `create_all`, so on a
+  fresh database the table is called `spaces` before `0002_schema_sync` and
+  `0003_timestamptz` ever run -- and both of them named `collections` outright, aborting
+  the whole upgrade. Both are now guarded with `to_regclass`, and their statements are
+  kept rather than deleted because a database created before the rename still has to pass
+  through them. **Any future table rename has to sweep the earlier migrations the same
+  way.**
 - **`item_metadata` maps to a DB column literally named `metadata`** (renamed because `metadata` is
   reserved on SQLModel classes). Raw SQL must use `metadata`; Python must use `item_metadata`.
 - **`EMBEDDING_DIM = 1536` is a padded lie under Gemini, exact under OpenAI.** `text-embedding-004`
@@ -954,6 +1021,13 @@ allow prepared statements at the cost of a much smaller connection ceiling.
   hard `session.delete()`. Reads assume soft delete; writes do not implement it.
 - Rate limiting (`core/middleware.py`) is per-process in-memory — correct only for a single API
   replica.
+- **Spaces are built; the AI half of them is not.** `/api/v1/spaces` does CRUD,
+  membership, invites and the public page. Not built yet, and named here so nobody
+  assumes otherwise: the AI *proposal* for a Space (`app/ai/chat/curator.py`), the
+  derived connection graph (`SPACE_CONNECTION_MIN_SCORE` is configured but nothing reads
+  it), the "memories that may belong here" suggestions, and Space-scoped Ask AI. The
+  settings for all four are in `app/core/config.py` with their reasoning; the UI shows
+  honest empty states rather than placeholders.
 - `GET /search` is still `ILIKE` over title/summary/content. Vector search now exists —
   `VaultRepository.search_semantic` orders by `embedding <=> $1` over the HNSW index — but
   only the Telegram bot calls it; the HTTP search endpoint has not been switched over, so

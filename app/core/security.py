@@ -39,6 +39,7 @@ _REFRESH_TOKEN_BYTES = 48
 # [A-Za-z0-9_-]; token_urlsafe(32) is 43 of exactly those characters. 48 bytes would be
 # 64 and leave no margin, which is why this is not simply _REFRESH_TOKEN_BYTES.
 _LINK_TOKEN_BYTES = 32
+_INVITE_TOKEN_BYTES = 32
 
 
 def create_access_token(
@@ -115,5 +116,26 @@ def hash_link_token(token: str) -> str:
     Separate from `hash_refresh_token` despite the identical algorithm: these are
     different credentials with different lifetimes, and a shared helper is how one of
     them quietly inherits a change meant for the other.
+    """
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def new_invite_token() -> str:
+    """A fresh Space invite token.
+
+    Lives in a URL the inviter copies and sends by whatever channel they like, so it will
+    end up pasted into chats and screenshots. That is why it is 32 random bytes and
+    single-use rather than a guessable Space id.
+    """
+    return secrets.token_urlsafe(_INVITE_TOKEN_BYTES)
+
+
+def hash_invite_token(token: str) -> str:
+    """Digest stored in `space_invites.token_hash`.
+
+    A third copy of the same two lines, for the third time on purpose: refresh tokens,
+    Telegram link tokens and Space invites are different credentials with different
+    lifetimes and different blast radii. Folding them into one helper is how a change
+    meant for one of them silently reaches the other two.
     """
     return hashlib.sha256(token.encode("utf-8")).hexdigest()
