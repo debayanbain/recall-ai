@@ -34,14 +34,10 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.services.chat_engine import status
 from app.services.chat_engine.engine import ChatEngine, RecallLanes, classify
 from app.services.chat_engine.router import Intent
-from app.services.chat_engine.types import (
-    ErrorBlock,
-    ErrorKind,
-    InboundMessage,
-    OutboundReply,
-)
+from app.services.chat_engine.types import InboundMessage
 from app.services.surfaces.telegram.parse import parse_message
 from app.services.surfaces.telegram.render import render
 from app.services.telegram import formatting, limits
@@ -142,6 +138,11 @@ class TelegramDispatcher:
             return DispatchResult(formatting.disconnected(), chat_id=identity.chat_id)
         if command == "recent":
             return await self._handle_recent(account.user_id, identity.chat_id)
+        if command == "status":
+            # The same lane "is it saved?" takes, reachable by typing rather than by
+            # phrasing. Worth having explicitly: the phrase list is English-first, and a
+            # command is the one form that works in every language.
+            return await self._handle_status(account.user_id, identity.chat_id)
         if command == "note":
             return await self._handle_note(account.user_id, identity, message, argument)
 
@@ -178,6 +179,11 @@ class TelegramDispatcher:
         items, total = await self.vault.list_recent(user_id, _RECENT_LIMIT)
         return DispatchResult(formatting.recent(items, total), chat_id=chat_id)
 
+    async def _handle_status(self, user_id: uuid.UUID, chat_id: str) -> DispatchResult:
+        return DispatchResult(
+            render(await status.reply(self.vault, user_id, "")), chat_id=chat_id
+        )
+
     async def _handle_message(
         self,
         user_id: uuid.UUID,
@@ -200,17 +206,12 @@ class TelegramDispatcher:
             outcome = await self.capture.capture(user_id, message, identity.chat_id)
             return _capture_reply(outcome, identity.chat_id)
 
-        if self.recall is None:
-            # No chat model. Say so -- the old behaviour of filing unanswerable text as
-            # a note is exactly the silent save this routing exists to remove.
-            return DispatchResult(
-                render(OutboundReply([ErrorBlock(ErrorKind.chat_unavailable)])),
-                chat_id=identity.chat_id,
-            )
-
         # The user is resolved by now, and that lookup is the authorisation. The engine
-        # is handed the result, never the means to do it.
-        engine = ChatEngine(self.recall, user_id)
+        # is handed the result, never the means to do it. `recall` may be None -- no chat
+        # model configured -- and the engine says so itself rather than this surface
+        # second-guessing which lanes need a provider: the status lane needs none, and a
+        # check here would have taken it away.
+        engine = ChatEngine(self.recall, user_id, saves=self.vault)
         return DispatchResult(
             render(await engine.handle(inbound)), chat_id=identity.chat_id
         )

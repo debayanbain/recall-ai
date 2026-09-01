@@ -19,6 +19,7 @@ from __future__ import annotations
 import base64
 import json
 import re
+from html import unescape as _unescape
 from html.parser import HTMLParser
 from typing import Any
 
@@ -116,6 +117,48 @@ def _parse_stats(chunk: str) -> dict[str, int]:
     return out
 
 
+
+#: Facebook's own player URLs, carried in the inline JSON the page ships with. There is no
+#: `og:video` on a reel -- verified against a live one -- so this is the only free route
+#: to the actual video, and without it a Facebook memory is its caption and nothing else.
+#:
+#: SD is preferred over HD deliberately: the frames are downscaled to
+#: VIDEO_FRAME_MAX_EDGE before they reach the model, and the audio is stream-copied rather
+#: than re-encoded, so HD buys nothing and costs several times the download.
+_PLAYER_URL_RE = re.compile(
+    r'"(browser_native_sd_url|browser_native_hd_url)"\s*:\s*"((?:[^"\\]|\\.)*)"'
+)
+
+
+def _video_url(page: str) -> str | None:
+    r"""The reel's mp4, or None.
+
+    Undocumented internal JSON, so treat a miss as normal rather than as a fault: the key
+    names can change without notice, and when they do a Facebook capture must quietly go
+    back to being caption-only. `ProcessingService._read_video` already no-ops on a
+    missing `video_url`, so returning None here is the whole degradation path.
+
+    The value is decoded twice because it arrives escaped twice -- JSON (`\/`, `\uXXXX`)
+    inside HTML (`&amp;`). The scheme is then checked here as well as in `fetch_video`:
+    this string is scraped from a page we do not control and ends up in `item_metadata`,
+    which *is* serialized to the browser, so a `javascript:` value must not get that far
+    even though nothing renders it as a link today.
+    """
+    found: dict[str, str] = {}
+    for match in _PLAYER_URL_RE.finditer(page):
+        raw = match.group(2)
+        if not raw or raw == "null":
+            continue
+        try:
+            url = _unescape(json.loads(f'"{raw}"'))
+        except (ValueError, json.JSONDecodeError):
+            continue
+        if url.startswith(("http://", "https://")):
+            found.setdefault(match.group(1), url)
+
+    return found.get("browser_native_sd_url") or found.get("browser_native_hd_url")
+
+
 class FacebookReelExtractor(Extractor):
     """Free path: the reel's own Open Graph tags."""
 
@@ -168,7 +211,18 @@ class FacebookReelExtractor(Extractor):
             "source": "opengraph",
             **_parse_stats(stats),
         }
-        log.info("facebook_og_extracted", url=canonical[:120], chars=len(content or ""))
+        # What turns a Facebook capture from a caption into a read video. Set only when it
+        # was really found: the key is what `ProcessingService._read_video` branches on,
+        # so an absent one is the honest way to say "there is no video to read".
+        video_url = _video_url(html)
+        if video_url:
+            metadata["video_url"] = video_url
+        log.info(
+            "facebook_og_extracted",
+            url=canonical[:120],
+            chars=len(content or ""),
+            has_video_url=bool(video_url),
+        )
         return ExtractedContent(
             type=self.content_type,
             title=title,

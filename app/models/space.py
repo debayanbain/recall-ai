@@ -59,6 +59,10 @@ class Space(SQLModel, table=True):
     description: str | None = None
     visibility: Visibility = Field(default=Visibility.private)
 
+    #: A Lucide icon *name* ("book-open"), never markup. Kept alongside `emoji` rather
+    #: than replacing it: a Space created before the picker existed has a glyph its owner
+    #: chose, and the renderer prefers `icon`, then `emoji`, then a neutral mark.
+    icon: str | None = Field(default=None, max_length=48)
     emoji: str | None = Field(default=None, max_length=16)
     #: An accent *key* ("violet", "rose", ...), never a CSS class. The gradient strings
     #: live in the frontend; a column holding `from-violet-200 via-indigo-100` is a

@@ -30,6 +30,7 @@ async def public_space(slug: str, service: SpaceServiceDep) -> PublicSpace:
     return PublicSpace(
         name=space.name,
         description=space.description,
+        icon=space.icon,
         emoji=space.emoji,
         accent=space.accent,
         ai_overview=space.ai_overview,

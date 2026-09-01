@@ -121,6 +121,7 @@ def connected_help() -> str:
         "Anything else you type is just chat — I won't save it.\n\n"
         "<b>Shortcuts</b>\n"
         "/recent — your last saves\n"
+        "/status — did my last one save?\n"
         "/help — this message\n"
         "/disconnect — unlink this chat"
     )

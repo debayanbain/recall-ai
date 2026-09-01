@@ -279,3 +279,60 @@ async def test_handle_takes_the_lane_classify_predicts(
     assert getattr(recall, lane) == [text]
     other = "chatted" if lane == "answered" else "answered"
     assert getattr(recall, other) == []
+
+
+# --- the status lane -------------------------------------------------------------------
+
+
+class FakeSaves:
+    def __init__(self) -> None:
+        self.reads: list[tuple[uuid.UUID, int]] = []
+
+    async def recent_saves(
+        self, user_id: uuid.UUID, limit: int
+    ) -> tuple[list[VaultItem], int]:
+        self.reads.append((user_id, limit))
+        return [_item()], 1
+
+
+async def test_a_status_question_calls_no_model_at_all() -> None:
+    """The lane's whole justification. "Did that save?" is a question about a row, and
+    a generator asked it will answer plausibly whatever the row says."""
+    recall = FakeRecall()
+    saves = FakeSaves()
+    reply = await ChatEngine(recall, _USER, saves=saves).handle(_msg("Is it saved?"))
+    assert recall.answered == []
+    assert recall.chatted == []
+    assert saves.reads == [(_USER, 5)]
+    assert isinstance(reply.blocks[0], TextBlock)
+
+
+async def test_the_status_lane_reads_the_engines_own_user() -> None:
+    """`user_id` comes from the constructor -- the caller's resolved account -- and
+    never from the message."""
+    saves = FakeSaves()
+    other = uuid.UUID("22222222-2222-2222-2222-222222222222")
+    await ChatEngine(FakeRecall(), other, saves=saves).handle(_msg("did it save?"))
+    assert saves.reads == [(other, 5)]
+
+
+async def test_status_works_with_no_chat_model_configured() -> None:
+    saves = FakeSaves()
+    reply = await ChatEngine(None, _USER, saves=saves).handle(_msg("Is it saved?"))
+    assert saves.reads == [(_USER, 5)]
+    assert isinstance(reply.blocks[0], TextBlock)
+
+
+async def test_status_without_a_reader_degrades_to_retrieval_not_to_chat() -> None:
+    """The safe direction. Retrieval answers from the vault or says it found nothing;
+    the conversation lane has no vault access and would say it cannot check -- which is
+    the exact answer this whole lane exists to stop."""
+    recall = FakeRecall()
+    await ChatEngine(recall, _USER).handle(_msg("Is it saved?"))
+    assert recall.answered == ["Is it saved?"]
+    assert recall.chatted == []
+
+
+async def test_a_lane_that_needs_a_model_says_so_when_there_is_none() -> None:
+    reply = await ChatEngine(None, _USER, saves=FakeSaves()).handle(_msg("Hii"))
+    assert reply == OutboundReply([ErrorBlock(ErrorKind.chat_unavailable)])

@@ -194,6 +194,11 @@ async def upload_limits(user: CurrentUser, response: Response) -> dict[str, obje
             ],
             "default_language": settings.TRANSCRIBE_LANGUAGE or None,
         },
+        # Read by the detail page to decide whether to offer a re-read of a memory whose
+        # video was never looked at. Same reasoning as `voice.enabled`: the alternative
+        # is a button whose only possible outcome is the server refusing it, on a page
+        # where the refusal costs a round trip to learn.
+        "video": {"enabled": settings.video_understanding_enabled},
     }
 
 

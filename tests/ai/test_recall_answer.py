@@ -83,6 +83,10 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def _append(session_id: str, q: str, a: str) -> None:
         seen["stored"].append(a)
 
+    # These tests are about the single-shot lane. The tool lane has its own file, and
+    # leaving it on here would route every case below through a different code path than
+    # the one each of them was written to pin.
+    monkeypatch.setattr(settings, "RECALL_TOOLS_ENABLED", False)
     monkeypatch.setattr("app.services.recall_chat.planner.plan", _plan)
     monkeypatch.setattr(chain, "answer", _answer)
     monkeypatch.setattr(history, "load", _load)

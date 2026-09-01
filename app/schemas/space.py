@@ -13,10 +13,11 @@ one a disclosure.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from datetime import datetime
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from app.models.base import SpaceRole, Visibility
 from app.schemas.vault import VaultItemRead
@@ -25,12 +26,19 @@ from app.schemas.vault import VaultItemRead
 #: emoji with a skin-tone modifier and a variation selector is already several.
 _EMOJI_MAX = 16
 _ACCENT_MAX = 24
+#: Matches `Space.icon`. The pattern is the validation: the value is a *name* from the
+#: frontend's icon set, so it can only ever be lowercase words joined by hyphens. Anything
+#: else is rejected here rather than stored and rendered as a fallback later -- a column
+#: that accepts arbitrary text is one somebody eventually puts markup in.
+_ICON_MAX = 48
+_ICON_PATTERN = r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
 
 
 class CreateSpaceRequest(BaseModel):
     name: str = Field(min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=2000)
     visibility: Visibility = Visibility.private
+    icon: str | None = Field(default=None, max_length=_ICON_MAX, pattern=_ICON_PATTERN)
     emoji: str | None = Field(default=None, max_length=_EMOJI_MAX)
     accent: str | None = Field(default=None, max_length=_ACCENT_MAX)
     #: Fill the Space in the same request. This is what makes accepting an AI proposal
@@ -42,17 +50,29 @@ class CreateSpaceRequest(BaseModel):
 class UpdateSpaceRequest(BaseModel):
     """Every field optional, and every field one a caller is allowed to set.
 
-    `None` means "leave it alone" rather than "clear it", except for `emoji` and `accent`
-    where the empty string is the way to clear -- a nullable field with two meanings for
-    null is a field nobody can use correctly.
+    `None` means "leave it alone" rather than "clear it", except for `icon`, `emoji` and
+    `accent` where the empty string is the way to clear -- a nullable field with two
+    meanings for null is a field nobody can use correctly. That is also why `icon` carries
+    no pattern here: `""` has to be accepted, and a pattern that allows the empty string
+    allows it everywhere. `_validate_icon` does the check instead.
     """
 
     name: str | None = Field(default=None, min_length=1, max_length=255)
     description: str | None = Field(default=None, max_length=2000)
     visibility: Visibility | None = None
+    icon: str | None = Field(default=None, max_length=_ICON_MAX)
     emoji: str | None = Field(default=None, max_length=_EMOJI_MAX)
     accent: str | None = Field(default=None, max_length=_ACCENT_MAX)
     pinned: bool | None = None
+
+    @field_validator("icon")
+    @classmethod
+    def _validate_icon(cls, value: str | None) -> str | None:
+        if value is None or value == "":
+            return value
+        if not re.fullmatch(_ICON_PATTERN, value):
+            raise ValueError("icon must be a lowercase hyphenated name")
+        return value
 
 
 class AddItemsRequest(BaseModel):
@@ -106,6 +126,7 @@ class SpaceRead(BaseModel):
     slug: str
     description: str | None
     visibility: Visibility
+    icon: str | None
     emoji: str | None
     accent: str | None
     pinned: bool
@@ -139,6 +160,7 @@ class PublicSpace(BaseModel):
 
     name: str
     description: str | None
+    icon: str | None
     emoji: str | None
     accent: str | None
     ai_overview: str | None

@@ -25,7 +25,11 @@ Order is the whole design, and it is checked top to bottom:
 5. **Questions about the assistant** are answered by the assistant, not searched for.
    "what can you do" retrieves nothing, and searching for it spends an embedding to
    return an empty result the user reads as a broken feature.
-6. **Retrieval phrasing is recall**, and everything else is chat.
+6. **"Is it saved?" is a question about a row**, not about the vault's contents, and is
+   answered from the database with no model call at all (`status.py`). It is checked
+   *before* recall because "did i save it" carries a retrieval phrase and is not a
+   retrieval question -- there is no subject to search for, only an outcome to report.
+7. **Retrieval phrasing is recall**, and everything else is chat.
 
 `RECALL` is matched on phrases, never on a trailing `?`. A question mark is the single
 most common character in ordinary conversation with an assistant -- "what is the capital
@@ -51,6 +55,7 @@ class Intent(StrEnum):
     COMMAND = "command"
     CAPTURE = "capture"
     META = "meta"
+    STATUS = "status"
     RECALL = "recall"
     CHAT = "chat"
 
@@ -89,6 +94,48 @@ _RECALL_PATTERNS = (
     r"\byesterday\b",
 )
 
+# Asking what became of the thing just sent. Every pattern is anchored to the START of
+# the message, which is what keeps this lane from stealing searches: a status question is
+# short and has no subject in it ("did it save?"), while "did i save the perfume link?"
+# names what to look for and belongs to recall. Anchoring also means no pattern here can
+# backtrack across an unbounded body -- the alternation either matches the opening or
+# stops immediately.
+#
+# The anaphor is the whole signal. "it", "that", "this", "my last one" point at something
+# the conversation already has, which for this surface is always the most recent capture;
+# a message that names its object is asking the vault a question instead.
+_STATUS_PATTERNS = (
+    # "is it saved", "was that stored yet", "has this been added"
+    r"^(?:so |and |ok |okay |but )?(?:is|was|has|have)\s+"
+    r"(?:it|that|this|they|my last \w+|the last \w+)\s+"
+    r"(?:been\s+)?(?:saved|stored|added|kept|processed|uploaded|done|finished)\b",
+    # "did it save", "did that go through", "did this work"
+    r"^(?:so |and |ok |okay |but )?did\s+"
+    r"(?:it|that|this|they|my last \w+|the last \w+)\s+"
+    r"(?:save|store|upload|work|process|go through|get (?:saved|added|stored))\b",
+    # "did you save it", "have you kept that"
+    r"^(?:so |and |ok |okay |but )?(?:did|do|have)?\s*(?:you|u)\s+"
+    r"(?:saved?|stored?|keep|kept|add(?:ed)?|get|got|process(?:ed)?|upload(?:ed)?)\s+"
+    r"(?:it|that|this|them|my last \w+|the last \w+)\b",
+    # "is it still processing", "are they still saving"
+    r"^(?:is|are)\s+(?:it|that|this|they|my last \w+)\s+still\s+"
+    r"(?:processing|saving|loading|working|going)\b",
+    # "what's the status", "status of my last save"
+    r"^what(?:'s| is| was)?\s+(?:the\s+)?status\b",
+    r"^status\b",
+    # Bare acknowledgement-shaped checks.
+    r"^saved[!?. ]*$",
+    r"^(?:done yet|is it done|did it work|any luck)\b",
+    # Bengali and Hindi, in their own scripts and in the Latin transliteration people
+    # actually type. Listed because the person most likely to ask "did that save?" in
+    # their own language is the one who just sent something in it -- and a miss here is
+    # not silent failure, it falls through to retrieval, which answers honestly from the
+    # vault. Worth a native speaker's eye before more are added.
+    r"^(?:সেভ হয়েছে|সেভ হয়ে গেছে|সেভ হল|হয়েছে কি)",
+    r"^(?:सेव हो गया|सेव हुआ|हो गया क्या)",
+    r"^(?:save ho(?:ye|ye?che|gaya|gaye)|save hoyeche|hoyeche ki)\b",
+)
+
 #: "help" on its own is someone asking what the assistant can do. It is deliberately
 #: anchored to the whole message rather than added to `_META_PATTERNS`: as a bare
 #: substring it would swallow "help me find my notes about docker", which is a search.
@@ -111,6 +158,7 @@ _DETAIL_PATTERNS = (
 )
 
 _META_RE = re.compile("|".join(_META_PATTERNS))
+_STATUS_RE = re.compile("|".join(_STATUS_PATTERNS))
 _RECALL_RE = re.compile("|".join(_RECALL_PATTERNS))
 _DETAIL_RE = re.compile("|".join(_DETAIL_PATTERNS))
 
@@ -151,6 +199,12 @@ def route(
 
     if _META_RE.search(lowered) or _BARE_HELP_RE.match(lowered):
         return Intent.META
+
+    # Before RECALL on purpose: "did i save it" matches a retrieval phrase and is not a
+    # retrieval question. Answering it from a vector search costs an embedding to rank
+    # memories against the word "it".
+    if _STATUS_RE.search(lowered):
+        return Intent.STATUS
 
     if _RECALL_RE.search(lowered) or _asks_for_a_kind(lowered):
         return Intent.RECALL

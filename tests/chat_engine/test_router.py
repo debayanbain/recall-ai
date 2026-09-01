@@ -191,7 +191,14 @@ def test_a_recall_word_inside_another_word_does_not_match() -> None:
 def test_intent_is_a_str_enum() -> None:
     """Values are compared and logged as text, so they are part of the contract."""
     assert Intent.RECALL == "recall"
-    assert {i.value for i in Intent} == {"command", "capture", "meta", "recall", "chat"}
+    assert {i.value for i in Intent} == {
+        "command",
+        "capture",
+        "meta",
+        "status",
+        "recall",
+        "chat",
+    }
 
 
 # --- "help" ---------------------------------------------------------------------------
@@ -256,3 +263,70 @@ def test_detail_is_orthogonal_to_the_lane() -> None:
     question = "what exactly did that article say?"
     assert route(question) is Intent.CHAT or route(question) is Intent.RECALL
     assert wants_detail(question) is True
+
+
+# --- "did that save?" -----------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "Is it saved?",
+        "is that saved",
+        "was this stored",
+        "has it been added",
+        "did it save",
+        "did that go through?",
+        "did you save it",
+        "have you kept that",
+        "is it still processing?",
+        "what's the status",
+        "status",
+        "saved?",
+        "did it work",
+        "any luck?",
+        "is my last link saved",
+    ],
+)
+def test_asking_what_became_of_the_last_save_is_status(text: str) -> None:
+    """A question with no subject in it is about an outcome, not about the vault."""
+    assert route(text) is Intent.STATUS
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "did i save the perfume link?",
+        "did i save anything about docker",
+        "show me what I saved yesterday",
+        "find my saved articles",
+        "what did I save this week?",
+    ],
+)
+def test_a_question_that_names_its_subject_is_still_recall(text: str) -> None:
+    """The whole reason STATUS is anchored to the start of the message.
+
+    "did i save X" carries a retrieval phrase *and* something to search for. Letting the
+    status patterns claim it would answer "your last save was a reel" to someone asking
+    about a perfume.
+    """
+    assert route(text) is Intent.RECALL
+
+
+def test_status_beats_recall_when_both_would_match() -> None:
+    """"did it save" contains no subject; ranking recall first would spend an embedding
+    ranking the user's memories against the word "it"."""
+    assert route("did it save?") is Intent.STATUS
+
+
+def test_a_link_is_still_a_capture_even_when_phrased_as_a_status_check() -> None:
+    """Capture outranks every phrasing. Answering would drop the link on the floor."""
+    assert (
+        route("did you save it?", url="https://example.com/post") is Intent.CAPTURE
+    )
+
+
+def test_a_status_question_in_bengali_is_status() -> None:
+    """The phrase list is English-first; a small non-Latin set covers the commonest
+    case, and anything missed falls through to retrieval rather than to the chat lane."""
+    assert route("সেভ হয়েছে?") is Intent.STATUS

@@ -105,3 +105,62 @@ class OutboundReply:
     """What to say back. Empty means say nothing at all, which is a real answer."""
 
     blocks: list[Block] = field(default_factory=list)
+
+
+# --- the same reply, delivered as it is written ------------------------------------------
+#
+# A second shape rather than a stream of `Block`s, because a block is a finished thing --
+# a list of memories, an error -- and the only part of a reply that arrives gradually is
+# prose. Everything else is emitted whole, as one event, exactly as it is today.
+
+
+@dataclass(frozen=True, slots=True)
+class Delta:
+    """A fragment of prose that is safe to display *now*.
+
+    Already validated. Nothing reaches this type that has not been through the same
+    checks the non-streaming reply gets -- the point of streaming is that the reader sees
+    the answer sooner, not that they see it before it has been checked.
+    """
+
+    text: str
+
+
+@dataclass(frozen=True, slots=True)
+class StatusEvent:
+    """What the answer is doing right now, for a reader who is waiting on it.
+
+    A retrieval is a database round trip and a provider call, and during it a streaming
+    surface shows nothing at all -- which reads as a hang rather than as work. This says
+    which step is running, and deliberately carries no arguments: what the model decided
+    to search for is its own output derived from the person's question, and echoing it
+    back as a status line would show them a guess as though it were a fact.
+    """
+
+    stage: str
+
+
+@dataclass(frozen=True, slots=True)
+class ItemsEvent:
+    """A listing, emitted whole. The streaming counterpart of `ItemListBlock`."""
+
+    items: Sequence[VaultItem]
+    total: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class StreamEnd:
+    """The terminal event. Always sent, including after a failure.
+
+    `memory_ids` carries the evidence the answer was built from, so a surface can cite
+    sources without the answer path being rebuilt to remember what it read. `corrected`
+    says whether anything was stripped on the way out -- the clearest fabrication signal
+    the system has, and a thing worth showing a developer rather than burying in a log.
+    """
+
+    memory_ids: tuple[str, ...] = ()
+    corrected: bool = False
+    error: ErrorKind | None = None
+
+
+StreamEvent: TypeAlias = Delta | StatusEvent | ItemsEvent | StreamEnd

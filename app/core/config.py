@@ -199,6 +199,29 @@ class Settings(BaseSettings):
     # A run that has neither called back nor finished by now is swept by the beat task.
     EXTRACTION_RUN_TIMEOUT_MINUTES: int = 20
 
+    # --- YouTube ---
+    # oEmbed is keyless and returns four fields: title, author, thumbnail and an embed
+    # snippet. It does NOT return the description, which is where a creator puts every
+    # link they mention on screen -- so without a Data API key a YouTube memory is one
+    # line of text and the AI pipeline is summarising a title.
+    # Quota is 10,000 units/day and `videos.list` costs 1, so a personal vault will not
+    # approach it. Empty means "stay on oEmbed alone" rather than fail: a missing key
+    # must degrade the memory, never refuse the save.
+    YOUTUBE_API_KEY: str = ""
+    # Caption tracks are fetched from YouTube's own player endpoints, keyless, and are
+    # blocked from datacenter IPs often enough that this has to be best-effort: a failure
+    # is logged and the description alone carries the item. Off in a deployment that gets
+    # blocked, rather than paying an ASR bill per video to work around it.
+    YOUTUBE_TRANSCRIPT_ENABLED: bool = True
+    # Preference order for the caption track. The first available wins; failing all of
+    # them, whatever track the video does have is taken, because a transcript in the
+    # wrong language still carries the URLs and product names that are the point here.
+    YOUTUBE_TRANSCRIPT_LANGUAGES: str = "en"
+    # A description can run to thousands of characters of affiliate boilerplate and a
+    # transcript to tens of thousands. Both are clipped before they reach a prompt.
+    YOUTUBE_MAX_DESCRIPTION_CHARS: int = 5000
+    YOUTUBE_MAX_TRANSCRIPT_CHARS: int = 12000
+
     # --- Telegram capture bot ---
     # From @BotFather. The token is the bot's whole identity: anyone holding it can read
     # every message sent to the bot and reply as it.
@@ -266,6 +289,47 @@ class Settings(BaseSettings):
     # answer that runs away from its evidence is the shape a fabrication takes. Clipped
     # rather than rejected -- the first sentences are the answer.
     RECALL_ANSWER_MAX_CHARS: int = 1500
+    # --- the tool lane ---
+    # When true, a RECALL question is answered by a model that runs the searches itself
+    # (`ai/chat/tools.py`) instead of by one planner call and one fixed search. It buys
+    # a second look -- "did I save the docker talk, and what did the speaker claim?" is
+    # find-then-read, which one MemoryQuery cannot express -- and it costs a model call
+    # per round. Off is the older, cheaper, fully deterministic path, and it is still
+    # what runs whenever the tool loop fails, so this is a preference rather than a
+    # dependency. Only the RECALL lane is affected: capture, commands and "is it saved?"
+    # never consult a model about what to do, and must not start.
+    # When the operator has configured a second provider -- both keys present, both paid
+    # for -- a 500 from the first one should not cost the user their reply. Applies to
+    # the CHAT model only and can never apply to embeddings: vectors from two providers
+    # are not comparable, so a query embedded by the alternate would rank against a space
+    # it was not drawn from. With one provider configured this does nothing at all.
+    # One schema-checked call for summary, tags, category and label instead of four
+    # prose ones (`app/ai/enrichment.py`). The saving is input tokens: each of the four
+    # shipped the whole item again, so the combined call costs roughly a quarter. It also
+    # removes the string-handling that recovered tags from prose. Turning it off falls
+    # back to the four `AIProvider` calls, which is also what happens automatically
+    # whenever the combined call fails.
+    # Per-user hourly cap on `POST /chat/ask`. The middleware limiter keys on client IP,
+    # which throttles a whole office behind one NAT and nobody behind a botnet; what
+    # costs money is a person asking a question. Counted separately from the bot's
+    # allowance because they are separate costs. Zero disables it.
+    ASK_PER_HOUR: int = 60
+    ENRICHMENT_COMBINED: bool = True
+    CHAT_PROVIDER_FALLBACK: bool = True
+    RECALL_TOOLS_ENABLED: bool = True
+    # Hard ceilings on that loop, because an agent loop with no ceiling is an unbounded
+    # bill reachable through a text box. Rounds are model calls; calls are tool
+    # executions. Four calls is two searches, a listing and one memory opened in full,
+    # which is more steps than any question observed here has needed.
+    # Which driver runs the tool lane when the answer is being streamed. The graph
+    # (`ai/chat/agent.py`) can stream the model's words while tool rounds run underneath;
+    # the hand-rolled loop cannot, because it has to receive a whole turn to know whether
+    # it was tool calls or the answer. Off falls back to the single-shot streamed path,
+    # which is also what happens automatically whenever the graph fails before saying
+    # anything.
+    RECALL_AGENT_ENABLED: bool = True
+    RECALL_MAX_TOOL_CALLS: int = 4
+    RECALL_MAX_TOOL_ROUNDS: int = 3
     # The conversation lane answers greetings and questions about the bot itself, and
     # nothing it can honestly say needs more room than this. It is the last gate in front
     # of a model that has been told to stay in scope and asked politely: a jailbroken
@@ -342,6 +406,35 @@ class Settings(BaseSettings):
     # payload by a third on the way to the provider, and a 25MB photo is a bill, not a
     # better description.
     MAX_VISION_IMAGE_MB: int = 10
+
+    # --- Reading a video (Instagram reels, and any source that hands us a video URL) ---
+    # A reel's caption is not its content. The links a creator actually wants you to
+    # follow are burned into the frames ("link in bio", a domain on a title card) or
+    # spoken aloud, and neither reaches the caption. This samples frames and reads them
+    # with the vision model, and sends the clip's audio to the transcription model.
+    # OpenAI-only, like vision and transcription, and gated on the same key.
+    VIDEO_UNDERSTANDING_ENABLED: bool = True
+    # Hard ceiling on the download. Enforced while streaming, not from Content-Length --
+    # the CDN writes that header and a lie there is a memory-exhaustion bug.
+    MAX_VIDEO_MB: int = 30
+    # Longer than this is a livestream or a podcast episode, not a reel. Refused rather
+    # than sampled, because eight frames spread over an hour describe nothing.
+    MAX_VIDEO_SECONDS: int = 600
+    # Frames sent to the vision model in one call. Eight covers a reel's title card,
+    # its body and its end card; more is a linear bill for diminishing signal.
+    VIDEO_FRAME_COUNT: int = 8
+    # Longest edge each sampled frame is scaled to before it is sent. On-screen text has
+    # to stay legible, so this is not as small as it could be -- but a 1080x1920 frame
+    # base64-encoded eight times over is most of the cost of this feature for detail the
+    # model does not use.
+    VIDEO_FRAME_MAX_EDGE: int = 768
+    # Whether to spend a transcription call on the clip's audio as well as its frames.
+    # Both halves matter: a spoken URL is invisible to the frames, an on-screen one is
+    # invisible to the audio.
+    VIDEO_TRANSCRIBE_AUDIO: bool = True
+    # Upper bound on links kept from one item. These are model-read strings from
+    # attacker-authored frames; an unbounded list is a JSONB column anyone can grow.
+    MAX_EXTRACTED_LINKS: int = 25
     GEMINI_API_KEY: str = ""
     GEMINI_TEXT_MODEL: str = "gemini-2.0-flash"
     GEMINI_EMBED_MODEL: str = "text-embedding-004"
@@ -446,6 +539,22 @@ class Settings(BaseSettings):
     def vision_enabled(self) -> bool:
         """True when uploaded images can be read. Same key as transcription."""
         return bool(self.OPENAI_API_KEY)
+
+    @property
+    def video_understanding_enabled(self) -> bool:
+        """True when a video can be read for on-screen text and speech.
+
+        Same OpenAI key as vision and transcription -- it is those two capabilities
+        pointed at frames and an audio track, not a third provider. The switch is
+        separate so a deployment that does not want to pay per reel can turn it off
+        without losing image reading.
+        """
+        return bool(self.OPENAI_API_KEY and self.VIDEO_UNDERSTANDING_ENABLED)
+
+    @property
+    def youtube_api_enabled(self) -> bool:
+        """True when the Data API can be called for a video's real description."""
+        return bool(self.YOUTUBE_API_KEY)
 
     @property
     def telegram_enabled(self) -> bool:

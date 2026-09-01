@@ -153,3 +153,80 @@ def test_field_names_are_probed_leniently() -> None:
 def test_empty_result_is_permanent() -> None:
     with pytest.raises(PermanentExtractionError, match="private"):
         FacebookReelApifyExtractor().build([])
+
+
+# --- finding the video itself --------------------------------------------------------
+#
+# A reel serves no `og:video` -- verified against a live one -- so the only free route to
+# the actual video is the player URL Facebook ships in the page's inline JSON. Without it
+# a Facebook memory is its caption and nothing else, which is exactly the gap the video
+# reading pass exists to close.
+
+from app.extractors.facebook import _video_url  # noqa: E402
+
+PLAYER_JSON = (
+    r'{"browser_native_sd_url":"https:\/\/video.fb.net\/sd.mp4?a=1&amp;b=2",'
+    r'"browser_native_hd_url":"https:\/\/video.fb.net\/hd.mp4"}'
+)
+
+
+def test_the_sd_url_is_preferred_over_hd() -> None:
+    """Frames are downscaled to VIDEO_FRAME_MAX_EDGE before they reach the model and the
+    audio is stream-copied rather than re-encoded, so HD buys nothing and costs several
+    times the download."""
+    assert _video_url(PLAYER_JSON) == "https://video.fb.net/sd.mp4?a=1&b=2"
+
+
+def test_the_url_is_unescaped_twice() -> None:
+    """It arrives JSON-escaped inside HTML-escaped markup. Decoding once leaves either
+    literal `\\/` separators or a query string broken at `&amp;`."""
+    got = _video_url(PLAYER_JSON)
+    assert got is not None
+    assert "\\/" not in got and "&amp;" not in got
+
+
+def test_hd_is_used_when_sd_is_missing() -> None:
+    assert _video_url(r'{"browser_native_hd_url":"https:\/\/v.fb.net\/hd.mp4"}') == (
+        "https://v.fb.net/hd.mp4"
+    )
+
+
+@pytest.mark.parametrize(
+    "page",
+    [
+        r'{"browser_native_sd_url":"javascript:alert(1)"}',
+        r'{"browser_native_sd_url":"data:video/mp4;base64,AAAA"}',
+        r'{"browser_native_sd_url":null}',
+        r'{"browser_native_sd_url":""}',
+        "<html>no player json at all</html>",
+        "",
+    ],
+)
+def test_anything_unusable_yields_no_url(page: str) -> None:
+    """A miss is normal, not a fault: these key names are undocumented internals and can
+    change without notice, at which point a capture must quietly go back to caption-only.
+
+    The scheme check matters separately -- this string is scraped from a page we do not
+    control and lands in `item_metadata`, which *is* serialized to the browser.
+    """
+    assert _video_url(page) is None
+
+
+async def test_a_page_with_a_player_url_offers_it_for_reading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    extracted = await _og(monkeypatch, PAGE + f"<script>{PLAYER_JSON}</script>").extract(
+        "https://www.facebook.com/reel/1"
+    )
+    assert extracted.metadata["video_url"] == "https://video.fb.net/sd.mp4?a=1&b=2"
+
+
+async def test_a_page_without_one_sets_no_key_at_all(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Absent rather than None. `ProcessingService._read_video` branches on the key, and
+    an absent one is the honest way to say there is no video to read."""
+    extracted = await _og(monkeypatch, PAGE).extract("https://www.facebook.com/reel/1")
+    assert "video_url" not in extracted.metadata
+    # The caption path is untouched by any of this.
+    assert extracted.content is not None and "GLOBAL JOB SERIES" in extracted.content

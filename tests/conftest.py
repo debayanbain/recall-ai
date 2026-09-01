@@ -111,6 +111,41 @@ def _no_startup_network(monkeypatch: pytest.MonkeyPatch) -> None:
     clear_user_cache()
 
 
+@pytest.fixture(autouse=True)
+def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may reach a chat provider, even by accident.
+
+    `.env` carries a real key on a developer machine, so a code path that reaches
+    `get_chat_model()` without a test having stubbed it does not fail -- it *works*,
+    slowly, over the network, and charges for the privilege. That happened: a new lane
+    called the model directly and a suite of tests written to be offline started billing
+    per run while still passing.
+
+    Every outbound AI capability is closed here, not just the chat model: each one has
+    its own client and its own switch, so each is its own way out to the network.
+    Both the factory's own name and every module that imported it directly are patched.
+    A single patch of `factory.get_chat_model` covers the chains that reach it through
+    `resilient`, and misses any module holding its own reference from
+    `from ... import get_chat_model` -- so both are done rather than reasoned about.
+    A test that wants a model stubs its own over the top of this.
+    """
+
+    def _refuse(*args: object, **kwargs: object) -> object:
+        raise RuntimeError("tests must not call a chat provider")
+
+    monkeypatch.setattr("app.ai.chat.factory.get_chat_model", _refuse)
+    monkeypatch.setattr("app.ai.chat.factory.build_chat_model", _refuse)
+    monkeypatch.setattr("app.ai.chat.factory.fallback_models", tuple)
+    monkeypatch.setattr("app.ai.chat.tools.get_chat_model", _refuse)
+
+    # Combined enrichment is its own client and its own switch, so it is its own way out
+    # to the network. Turned off *and* stubbed: off is what the pipeline's own tests
+    # want (they assert on the four-call path through their fake provider), and the stub
+    # is what catches a future caller that reaches past the switch.
+    monkeypatch.setattr(settings, "ENRICHMENT_COMBINED", False)
+    monkeypatch.setattr("app.ai.enrichment._call_provider", _refuse)
+
+
 @pytest_asyncio.fixture(scope="session", loop_scope="session")
 async def engine() -> AsyncGenerator[AsyncEngine, None]:
     """Session-wide engine with the schema built once. Skips if no database answers."""

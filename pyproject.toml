@@ -35,9 +35,20 @@ dependencies = [
     "langchain-core>=0.3",
     "langchain-openai>=0.3",
     "langchain-google-genai>=2.1",
+    # The tool lane's driver. Taken for exactly one reason: a hand-rolled loop over
+    # `ainvoke` cannot stream, because it must inspect a whole turn to know whether it
+    # was tool calls or the answer -- so the surface that most needs streaming (a web
+    # page, where the reader is watching the spot) was the one surface that could not
+    # have the tools. `stream_mode="messages"` solves that and nothing else here does.
+    # Checkpointers, interrupts and human-in-the-loop are deliberately unused: this graph
+    # answers one question and ends.
+    "langgraph>=0.2",
     "celery[redis]>=5.4",
     "pypdf>=6.16.2",
     "python-multipart>=0.0.32",
+    "av>=13.0",
+    "youtube-transcript-api>=0.6",
+    "pillow>=11.0",
 ]
 
 [project.optional-dependencies]

@@ -182,6 +182,7 @@ class SpaceService:
         *,
         description: str | None = None,
         visibility: Visibility = Visibility.private,
+        icon: str | None = None,
         emoji: str | None = None,
         accent: str | None = None,
         item_ids: Sequence[uuid.UUID] | None = None,
@@ -199,6 +200,7 @@ class SpaceService:
                 slug=await self._unique_slug(name),
                 description=description,
                 visibility=visibility,
+                icon=icon,
                 emoji=emoji,
                 accent=accent,
             )
@@ -217,6 +219,7 @@ class SpaceService:
         name: str | None = None,
         description: str | None = None,
         visibility: Visibility | None = None,
+        icon: str | None = None,
         emoji: str | None = None,
         accent: str | None = None,
         pinned: bool | None = None,
@@ -236,6 +239,8 @@ class SpaceService:
             space.name = name
         if description is not None:
             space.description = description
+        if icon is not None:
+            space.icon = icon or None
         if emoji is not None:
             space.emoji = emoji or None
         if accent is not None:

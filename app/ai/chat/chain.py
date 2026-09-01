@@ -15,7 +15,7 @@ confidently wrong about their vault, which is worse than saying it found nothing
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 
 from langchain_core.documents import Document
 from langchain_core.messages import BaseMessage
@@ -23,7 +23,7 @@ from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables import Runnable
 
-from app.ai.chat.factory import get_chat_model
+from app.ai.chat.factory import resilient
 from app.ai.chat.usage import UsageLogger
 from app.ai.prompts import BOT_IDENTITY
 from app.models.vault import VaultItem
@@ -143,20 +143,47 @@ def format_context(documents: Sequence[Document]) -> str:
         # the evidence that produced it. A positional index cannot be: "memory 3" is a
         # different row on the next question, so an invented one is indistinguishable
         # from a real one. `services/chat_engine/validation.py` does the checking.
-        block_id = meta.get("short_id") or str(index)
-        header_bits = [f'title="{meta.get("title")}"']
-        if meta.get("ai_category"):
-            header_bits.append(f'category="{meta["ai_category"]}"')
-        if meta.get("created_at"):
-            header_bits.append(f'saved="{str(meta["created_at"])[:10]}"')
-        if meta.get("source_url"):
-            header_bits.append(f'url="{meta["source_url"]}"')
         blocks.append(
-            f"<memory id=\"{block_id}\" {' '.join(header_bits)}>\n"
-            f"{_neutralize_fence(body)}\n"
-            "</memory>"
+            fence_block(
+                meta.get("short_id") or str(index),
+                body,
+                title=meta.get("title"),
+                category=meta.get("ai_category"),
+                saved=str(meta["created_at"])[:10] if meta.get("created_at") else None,
+                url=meta.get("source_url"),
+            )
         )
     return "\n\n".join(blocks)
+
+
+def fence_block(
+    block_id: str,
+    body: str,
+    *,
+    title: object = None,
+    category: object = None,
+    saved: str | None = None,
+    url: object = None,
+) -> str:
+    """One memory as a delimited, clearly-quoted block.
+
+    Public because the tool lane (`services/chat_engine/toolbox.py`) has to fence exactly
+    the same way this does. Two implementations of the fence is one implementation that
+    stops matching what `_SYSTEM` describes, and the fence is the entire boundary between
+    "material the user saved" and "instructions to follow".
+    """
+    header_bits = [f'title="{title}"']
+    if category:
+        header_bits.append(f'category="{category}"')
+    if saved:
+        header_bits.append(f'saved="{saved}"')
+    if url:
+        header_bits.append(f'url="{url}"')
+    return (
+        f"<memory id=\"{block_id}\" {' '.join(header_bits)}>\n"
+        f"{_neutralize_fence(body)}\n"
+        "</memory>"
+    )
 
 
 #: The fence is what tells the model where quoted material ends, so a memory containing
@@ -223,7 +250,7 @@ _CONVERSE_PROMPT = ChatPromptTemplate.from_messages(
 
 def converse_chain() -> Runnable[dict[str, object], str]:
     """`{message, history}` -> a chat-ready string. No retrieval, no vault access."""
-    return _CONVERSE_PROMPT | get_chat_model() | StrOutputParser()
+    return resilient(lambda model: _CONVERSE_PROMPT | model | StrOutputParser())
 
 
 async def converse(message: str, history: Sequence[BaseMessage]) -> str:
@@ -242,8 +269,13 @@ async def converse(message: str, history: Sequence[BaseMessage]) -> str:
 
 
 def answer_chain() -> Runnable[dict[str, object], str]:
-    """`{question, context, history}` -> a chat-ready string."""
-    return _PROMPT | get_chat_model() | StrOutputParser()
+    """`{question, context, history}` -> a chat-ready string.
+
+    Built through `resilient`, so a provider outage falls through to the other
+    configured provider rather than to a failure the user reads as "something went
+    wrong on my side".
+    """
+    return resilient(lambda model: _PROMPT | model | StrOutputParser())
 
 
 async def answer(
@@ -267,3 +299,43 @@ async def answer(
         },
         config={"callbacks": [UsageLogger("answer")]},
     )
+
+
+async def answer_stream(
+    question: str,
+    documents: Sequence[Document],
+    history: Sequence[BaseMessage],
+    guidance: str = GUIDANCE_SUPPORTED,
+) -> AsyncIterator[str]:
+    """`answer`, delivered as it is written. Same prompt, same evidence, same invariant.
+
+    Nothing about the grounding changes: the caller has already filtered the retrieved
+    memories on relevance, and every fragment yielded here still has to pass the same
+    output checks before anyone sees it (`chat_engine/validation.StreamValidator`).
+
+    One property is genuinely weaker and is worth stating rather than discovering: the
+    provider fallback covers a failure *starting* the stream, not one halfway through it.
+    A provider that dies after ten tokens cannot be retried on the alternate without
+    replaying ten tokens the reader has already read.
+    """
+    async for chunk in answer_chain().astream(
+        {
+            "question": question,
+            "context": format_context(documents),
+            "history": list(history),
+            "guidance": guidance,
+        },
+        config={"callbacks": [UsageLogger("answer_stream")]},
+    ):
+        yield chunk
+
+
+async def converse_stream(
+    message: str, history: Sequence[BaseMessage]
+) -> AsyncIterator[str]:
+    """`converse`, delivered as it is written."""
+    async for chunk in converse_chain().astream(
+        {"message": message, "history": list(history)},
+        config={"callbacks": [UsageLogger("converse_stream")]},
+    ):
+        yield chunk

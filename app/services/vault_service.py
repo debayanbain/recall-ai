@@ -430,6 +430,19 @@ class VaultService:
             category=category,
         )
 
+    async def recent_saves(
+        self, user_id: uuid.UUID, limit: int
+    ) -> tuple[Sequence[VaultItem], int]:
+        """The newest captures and their processing status, for "did that save?".
+
+        Deliberately `list_for_user` and not `list_filtered`: this needs the card columns
+        only. `processing_status` and `created_at` are on that list and `content` is not,
+        so answering "is it saved" costs one indexed page and never drags an article body
+        across the wire. It is one statement, which against a database in another region
+        is the entire cost of the reply.
+        """
+        return await self.repo.list_for_user(user_id, limit=limit)
+
     async def get(self, item_id: uuid.UUID, user_id: uuid.UUID) -> VaultItem | None:
         return await self.repo.get(item_id, user_id)
 
@@ -475,7 +488,31 @@ class VaultService:
         # spoke -- and "finished" is exactly what makes that unfixable otherwise. The
         # audio is still there to redo it from, so it can be redone.
         retranscribable = item.type is ContentType.voice and bool(item.storage_key)
-        if item.processing_status is ProcessingStatus.completed and not retranscribable:
+        # The second carve-out, and the same argument. A reel saved before this
+        # deployment could read video -- or one whose read failed while its caption
+        # carried the item -- is `completed` holding a caption and nothing of what was on
+        # screen or said aloud. That is the useful half of the memory missing, and
+        # "finished" is exactly what would make it permanent.
+        #
+        # Narrow in three ways. It needs `source_url`, because the stored `video_url` is a
+        # signed CDN link that dies within hours -- the only way to a playable one is to
+        # re-run the extractor, so an item with no URL to re-scrape has nothing to offer.
+        # It needs the capability switched on, or the whole round trip reproduces the
+        # current result at the price of a scraper run. And it refuses an item already
+        # read successfully (`video_read is True`), for the reason every other completed
+        # item is refused: re-running it spends the pipeline to replace a result with
+        # itself. A *failed* read (`False`) is re-drivable, which is the case that matters
+        # after a provider outage.
+        metadata = item.item_metadata or {}
+        revideoable = (
+            bool(item.source_url)
+            and bool(metadata.get("video_url"))
+            and metadata.get("video_read") is not True
+            and settings.video_understanding_enabled
+        )
+        if item.processing_status is ProcessingStatus.completed and not (
+            retranscribable or revideoable
+        ):
             raise ReprocessError("This one finished already — there is nothing to retry.")
 
         # The button disables itself the moment the item goes back to `pending`, so this
@@ -506,6 +543,13 @@ class VaultService:
                 item_id=str(item.id),
                 language=pinned,
             )
+
+        if revideoable and item.processing_status is ProcessingStatus.completed:
+            # Nothing is cleared, unlike the voice path. `process` re-runs the extractor
+            # from `source_url`, and `_apply` overwrites `content` and `video_url`
+            # wholesale before `_read_video` sees them -- so clearing here would only
+            # widen the window in which the row holds neither the old body nor the new.
+            log.info("vault_reprocess_revideo", item_id=str(item.id))
 
         item.processing_status = ProcessingStatus.pending
         item.processing_error = None

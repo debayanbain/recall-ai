@@ -31,11 +31,11 @@ of those a Telegram client.
 from __future__ import annotations
 
 import uuid
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 
-from app.ai.chat import chain, history, planner
+from app.ai.chat import agent, chain, history, planner, tools
 from app.ai.chat.factory import chat_available
 from app.ai.chat.planner import MemoryQuery, resolved_content_types
 from app.ai.chat.retriever import to_document
@@ -48,11 +48,28 @@ from app.services.chat_engine.cards import DETAIL_MAX_ITEMS, build_detail_card
 from app.services.chat_engine.evidence import Evidence, EvidenceStatus, assess
 from app.services.chat_engine.retrieval import MemoryFilters, MemoryRetriever
 from app.services.chat_engine.router import wants_detail
-from app.services.chat_engine.validation import validate_answer
+from app.services.chat_engine.toolbox import MemoryToolbox
+from app.services.chat_engine.types import (
+    Delta,
+    ErrorKind,
+    ItemsEvent,
+    StatusEvent,
+    StreamEnd,
+    StreamEvent,
+)
+from app.services.chat_engine.validation import StreamValidator, validate_answer
 
 log = get_logger("recall.chat")
 
 _LIST_LIMIT = 10
+
+#: What to tell a waiting reader each tool is doing. A short phrase per tool rather than
+#: the tool's own name, which is an implementation detail, and never its arguments.
+_STAGES = {
+    "SearchMemories": "searching your memories",
+    "ListMemories": "looking through your saves",
+    "GetMemory": "reading a memory",
+}
 
 
 @dataclass(slots=True)
@@ -113,6 +130,23 @@ class RecallChatService:
     async def answer(
         self, user_id: uuid.UUID, question: str, session_id: str
     ) -> RecallAnswer:
+        """A question about the vault. Two paths to the same guarantees.
+
+        The tool lane lets the model run its own searches, which is what makes a
+        find-then-read question answerable at all; the single-shot lane makes one planned
+        search and answers from it. What does *not* change between them is everything
+        that makes an answer trustworthy: the relevance gate runs on every search either
+        way, the reply is validated against the evidence that produced it either way, and
+        a turn that surfaced nothing gets the fixed sentence with no model call either
+        way. The tool lane is the more capable path, not a laxer one -- and when it fails
+        the single-shot path answers the same question rather than the user seeing an
+        error.
+        """
+        if settings.RECALL_TOOLS_ENABLED:
+            answered = await self._answer_with_tools(user_id, question, session_id)
+            if answered is not None:
+                return answered
+
         plan = await planner.plan(question)
         created_after = _created_after(plan)
 
@@ -183,6 +217,62 @@ class RecallChatService:
         await history.append(session_id, question, checked.text)
         return RecallAnswer(text=checked.text, memory_ids=evidence.ids)
 
+    async def _answer_with_tools(
+        self, user_id: uuid.UUID, question: str, session_id: str
+    ) -> RecallAnswer | None:
+        """The lane where the model chooses the searches. `None` means "fall back".
+
+        The toolbox is built per question and thrown away with it: `allowed_ids` is the
+        set of memories *this* answer may cite, and carrying it forward would let one
+        answer cite evidence retrieved for a different question.
+        """
+        toolbox = MemoryToolbox(
+            user_id, self.repo, top_k=settings.TELEGRAM_RECALL_TOP_K
+        )
+        past = await history.load(session_id)
+        result = await tools.answer_with_tools(
+            question,
+            past,
+            toolbox,
+            max_calls=settings.RECALL_MAX_TOOL_CALLS,
+            max_rounds=settings.RECALL_MAX_TOOL_ROUNDS,
+        )
+        if result is None:
+            return None
+
+        log.info(
+            "recall_tool_answer",
+            rounds=result.rounds,
+            calls=result.calls,
+            surfaced=len(toolbox.allowed_ids),
+        )
+
+        if toolbox.found_nothing:
+            # Not a model's phrasing of "nothing found" but the fixed sentence, for the
+            # same reason the other path uses one: an answer with no evidence behind it
+            # is the exact input a model fills in from its own knowledge. Its own first
+            # search term is the subject to echo back -- that is the model's extraction
+            # of what was asked, which is what the planner would have produced.
+            subject = toolbox.queries[0] if toolbox.queries else question
+            return RecallAnswer(text=_nothing_found(MemoryQuery(search_text=subject)))
+
+        checked = validate_answer(
+            result.text,
+            allowed_ids=toolbox.allowed_ids,
+            allowed_urls=toolbox.allowed_urls,
+            max_chars=settings.RECALL_ANSWER_MAX_CHARS,
+        )
+        if checked.removed:
+            log.warning("recall_answer_corrected", removed=list(checked.removed[:5]))
+        if checked.rejected:
+            # An empty or unusable reply, having already spent the tool calls. Falling
+            # back would spend the whole single-shot path to reach the same model, so
+            # this is reported as the failure it is.
+            return RecallAnswer(failed=True)
+
+        await history.append(session_id, question, checked.text)
+        return RecallAnswer(text=checked.text, memory_ids=toolbox.allowed_ids)
+
     async def _time_only(
         self, user_id: uuid.UUID, plan: MemoryQuery, created_after: datetime | None
     ) -> RecallAnswer:
@@ -196,6 +286,224 @@ class RecallChatService:
         if not items:
             return RecallAnswer(text=_nothing_found(plan))
         return RecallAnswer(items=items, total=total)
+
+
+    # --- the same two lanes, delivered as they are written ------------------------------
+    #
+    # Streaming takes the single-shot path deliberately, not the tool lane. A tool round
+    # is not a token: the model's first turns produce *calls*, not prose, so "stream the
+    # answer" and "let the model search twice" are answers to different questions and
+    # only one of them can be first. The bot, which nobody watches type, keeps the tool
+    # lane; a page, where the wait is visible, gets the words as they arrive. Whichever
+    # runs, the grounding and the output checks are identical.
+
+    async def stream(
+        self, user_id: uuid.UUID, question: str, session_id: str
+    ) -> AsyncIterator[StreamEvent]:
+        """A vault question, answered as it is written. Always ends with a `StreamEnd`.
+
+        Two drivers, in preference order. The graph runs the *tools*, so the model can
+        search, look at what came back and search again -- and streams its words while
+        doing it. When it is off, or fails before saying anything, the single-shot path
+        below answers instead: one planned search, one grounded answer. Both go through
+        the same relevance gate and the same output validation; what differs is how many
+        looks the model gets.
+        """
+        if settings.RECALL_TOOLS_ENABLED and settings.RECALL_AGENT_ENABLED:
+            spoke = False
+            async for event in self._stream_with_tools(user_id, question, session_id):
+                spoke = spoke or isinstance(event, Delta)
+                yield event
+            if spoke:
+                return
+            # Nothing was said, so nothing has been shown to the reader and the question
+            # can still be answered by the other driver. A failure *after* words have
+            # been streamed is not recoverable this way -- repeating them is worse than
+            # the shorter answer they already have.
+
+        plan = await planner.plan(question)
+        created_after = _created_after(plan)
+
+        if not plan.search_text:
+            answer = await self._time_only(user_id, plan, created_after)
+            if answer.items:
+                yield ItemsEvent(items=answer.items, total=answer.total)
+            else:
+                yield Delta(text=answer.text or "")
+            yield StreamEnd()
+            return
+
+        detail = wants_detail(question)
+        memories = await self.memories.recall(
+            user_id,
+            plan.search_text,
+            MemoryFilters(
+                created_after=created_after,
+                content_types=resolved_content_types(plan),
+                category=plan.category,
+            ),
+            limit=DETAIL_MAX_ITEMS if detail else settings.TELEGRAM_RECALL_TOP_K,
+        )
+        evidence = assess(memories)
+        log.info(
+            "recall_evidence",
+            status=evidence.status.value,
+            retrieved=len(memories),
+            kept=len(evidence.memories),
+            best=round(evidence.best_score, 3),
+            detail=detail,
+            streamed=True,
+        )
+        if evidence.status is EvidenceStatus.no_evidence:
+            # No model call, exactly as on the non-streaming path. There is nothing to
+            # stream: the reply is one fixed sentence.
+            yield Delta(text=_nothing_found(plan))
+            yield StreamEnd()
+            return
+
+        documents = [
+            to_document(item, body=build_detail_card(item) if detail else None)
+            for item in evidence.items
+        ]
+        past = await history.load(session_id)
+        checker = StreamValidator(
+            allowed_ids=evidence.ids,
+            allowed_urls=[item.source_url for item in evidence.items],
+            max_chars=settings.RECALL_ANSWER_MAX_CHARS,
+        )
+        async for event in self._pump(
+            chain.answer_stream(question, documents, past, _guidance(evidence)),
+            checker,
+            session_id=session_id,
+            question=question,
+            memory_ids=evidence.ids,
+        ):
+            yield event
+
+    async def _stream_with_tools(
+        self, user_id: uuid.UUID, question: str, session_id: str
+    ) -> AsyncIterator[StreamEvent]:
+        """The tool lane, streamed. Yields nothing at all when the driver is unavailable.
+
+        Yielding nothing rather than an error event is what lets the caller retry on the
+        other driver: an event the reader has already seen cannot be taken back, so this
+        stays silent until it has something it is willing to stand behind.
+        """
+        toolbox = MemoryToolbox(
+            user_id, self.repo, top_k=settings.TELEGRAM_RECALL_TOP_K
+        )
+        past = await history.load(session_id)
+        # The validator is built before the first search, so its allowlist grows as the
+        # toolbox surfaces memories. That ordering is the right way round: a citation can
+        # only be checked against evidence that has already been retrieved, and the model
+        # can only cite what it has already been shown.
+        checker = StreamValidator(
+            allowed_ids=toolbox.allowed_ids,
+            allowed_urls=toolbox.allowed_urls,
+            max_chars=settings.RECALL_ANSWER_MAX_CHARS,
+        )
+        spoken: list[str] = []
+        async for event in agent.stream_with_tools(
+            question, past, toolbox, max_rounds=settings.RECALL_MAX_TOOL_ROUNDS
+        ):
+            if isinstance(event, agent.AgentToolCall):
+                yield StatusEvent(stage=_STAGES.get(event.name, "working"))
+                continue
+            if isinstance(event, agent.AgentDelta):
+                # The allowlist is re-read on every fragment: a search that ran between
+                # two deltas has added to it, and a validator holding a snapshot from
+                # before the search would strip a citation of a memory the model was
+                # legitimately shown.
+                checker.allowed_ids = list(toolbox.allowed_ids)
+                checker.allowed_urls = list(toolbox.allowed_urls)
+                ready = checker.feed(event.text)
+                if ready:
+                    spoken.append(ready)
+                    yield Delta(text=ready)
+                continue
+
+            tail = checker.finish()
+            if tail:
+                spoken.append(tail)
+                yield Delta(text=tail)
+            if event.failed and not spoken:
+                # Silent on purpose. The caller answers by the other route.
+                return
+            if checker.removed:
+                log.warning("recall_answer_corrected", removed=list(checker.removed[:5]))
+            log.info(
+                "recall_agent_answer", calls=event.calls, surfaced=len(toolbox.allowed_ids)
+            )
+            if checker.rejected:
+                yield StreamEnd(error=ErrorKind.provider_failure)
+                return
+            await history.append(session_id, question, "".join(spoken).strip())
+            yield StreamEnd(
+                memory_ids=toolbox.allowed_ids, corrected=bool(checker.removed)
+            )
+
+    async def stream_chat(self, message: str, session_id: str) -> AsyncIterator[StreamEvent]:
+        """Small talk, as it is written. No vault access, so no evidence and no URLs.
+
+        `allowed_urls=()` is not an oversight: this lane is handed no memories, so every
+        link it could emit is unsupported by construction.
+        """
+        past = await history.load(session_id)
+        checker = StreamValidator(
+            allowed_ids=(),
+            allowed_urls=(),
+            max_chars=settings.CHAT_REPLY_MAX_CHARS,
+        )
+        async for event in self._pump(
+            chain.converse_stream(message, past),
+            checker,
+            session_id=session_id,
+            question=message,
+        ):
+            yield event
+
+    async def _pump(
+        self,
+        chunks: AsyncIterator[str],
+        checker: StreamValidator,
+        *,
+        session_id: str,
+        question: str,
+        memory_ids: tuple[str, ...] = (),
+    ) -> AsyncIterator[StreamEvent]:
+        """Drive one provider stream through the validator and out as events.
+
+        Two things are worth knowing about the ending. **The checked text is what reaches
+        history**, exactly as on the non-streaming path -- history is replayed into the
+        next prompt, so storing the raw stream would let a stripped fabrication come back
+        as context and be built on. And a provider that dies mid-stream still ends with a
+        `StreamEnd`, carrying the error: a stream that simply stops leaves a reader
+        watching a cursor that will never move.
+        """
+        spoken: list[str] = []
+        try:
+            async for chunk in chunks:
+                ready = checker.feed(chunk)
+                if ready:
+                    spoken.append(ready)
+                    yield Delta(text=ready)
+            tail = checker.finish()
+            if tail:
+                spoken.append(tail)
+                yield Delta(text=tail)
+        except Exception as exc:  # noqa: BLE001 - never surface a provider traceback
+            log.warning("recall_stream_failed", error=type(exc).__name__)
+            yield StreamEnd(error=ErrorKind.provider_failure)
+            return
+
+        if checker.removed:
+            log.warning("recall_answer_corrected", removed=list(checker.removed[:5]))
+        if checker.rejected:
+            yield StreamEnd(error=ErrorKind.provider_failure)
+            return
+
+        await history.append(session_id, question, "".join(spoken).strip())
+        yield StreamEnd(memory_ids=memory_ids, corrected=bool(checker.removed))
 
 
 def _guidance(evidence: Evidence) -> str:

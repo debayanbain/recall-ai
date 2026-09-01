@@ -17,7 +17,7 @@ import re
 from langchain_core.prompts import ChatPromptTemplate
 from pydantic import BaseModel, Field
 
-from app.ai.chat.factory import get_chat_model
+from app.ai.chat.factory import resilient
 from app.ai.chat.usage import UsageLogger
 from app.core import scripts
 from app.core.logging import get_logger
@@ -132,7 +132,12 @@ def _fallback(question: str) -> MemoryQuery:
 async def plan(question: str) -> MemoryQuery:
     """Extract query parameters, defensively."""
     try:
-        chain = _PLANNER_PROMPT | get_chat_model().with_structured_output(MemoryQuery)
+        # Structured output is bound per model rather than once: the fallback provider
+        # has to produce the same schema, and `with_structured_output` is a property of
+        # the model, not of the chain wrapped around it.
+        chain = resilient(
+            lambda model: _PLANNER_PROMPT | model.with_structured_output(MemoryQuery)
+        )
         result = await chain.ainvoke(
             {"question": question}, config={"callbacks": [UsageLogger("planner")]}
         )

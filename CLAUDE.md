@@ -119,11 +119,21 @@ uv run pytest -q
 uv run pytest tests/extractors/test_extractors.py::test_generic_url_falls_back_to_article   # single test
 ```
 
-Baseline as of this file: `mypy` is clean (85 files) and `pytest -q` is 190 passed / 54 skipped
-(the skips are every DB-backed test — see below), but `ruff check` reports **30 pre-existing
-errors** — 28 `UP045` (`Optional[X]` instead of `X | None`, mostly in `app/models/vault.py`) and
-2 `E501`, all `--fix`-able. Do not read a red ruff run as damage you caused; check whether your
-files are among the offenders.
+Baseline as of this file: `mypy` is clean (138 files) and `pytest -q` is 1075 passed / 104 skipped
+(the skips are every DB-backed test — see below), but `ruff check` reports **28 pre-existing
+errors** — 26 `UP045` (`Optional[X]` instead of `X | None`, mostly in `app/models/vault.py`) and
+2 `E501`, all in `app/models/` and all `--fix`-able. Do not read a red ruff run as damage you
+caused; check whether your files are among the offenders.
+
+**No test may reach an AI provider.** `.env` carries a real key on a developer machine, so a
+code path that reaches `get_chat_model()` (or the enrichment client) without a test having
+stubbed it does not fail — it *works*, slowly, over the network, and bills per run while the
+suite still passes green. That happened twice while the tool lane and combined enrichment were
+being added. `tests/conftest.py`'s autouse `_no_provider_calls` closes every one of them: it
+patches `factory.get_chat_model` / `build_chat_model` / `fallback_models`, the copy
+`ai/chat/tools.py` imported by name, and both the switch and the client for combined
+enrichment. **A new outbound AI capability must be added there in the same commit.** A suite
+that suddenly takes 40s instead of 10s is the symptom.
 
 `tests/conftest.py` needs a real PostgreSQL (pgvector `Vector`, JSONB, `PGUUID`, GIN/HNSW
 indexes rule out SQLite). It skips every DB test when none is reachable, so `pytest -q` stays
@@ -376,6 +386,113 @@ catch-all and must stay last, so new extractors get appended *before* it.
   a **separate chain** from `answer` on purpose: `answer`'s whole rule is "speak only
   from the MEMORY blocks", which holds precisely because it is never handed an empty
   context. `first_url` beats phrasing, so "what is this? <link>" saves rather than asks.
+- **"Did that save?" is answered by the database, and never by the model.** The
+  conversation lane is given no memories by design, so asked whether a capture succeeded
+  it answered the only honest thing it could -- *"I can't check what you've saved"* --
+  while the row sat there `completed`. That is not a prompt bug and no prompt fixes it:
+  the fix is a lane with **no provider call in it at all**. `router.Intent.STATUS`
+  matches save-confirmation phrasing and `chat_engine/status.py` reads the newest rows
+  through `VaultService.recent_saves` and reports `pending`/`processing` as "still
+  processing", `completed` as saved, `failed` as failed and `skipped` as saved-without-a-
+  summary. Five things go with it:
+  * **STATUS is checked BEFORE RECALL**, and every pattern is anchored to the start of
+    the message. "did i save it" carries a retrieval phrase and is not a retrieval
+    question -- there is no subject, only an outcome -- while "did i save the perfume
+    link" names what to look for and must stay a search. Anchoring is what separates
+    them, and it also means no pattern here can backtrack across an unbounded body.
+  * **The anaphor is the whole signal.** "it", "that", "this", "my last one" point at
+    something the conversation already has, which is always the most recent capture.
+  * **The wording is a script-keyed table**, for the same reason `_NO_MATCH` in
+    `recall_chat` is one: with no model call there is nothing in the loop that could
+    translate the reply. Times are **relative** ("2 min ago") because nothing on a chat
+    surface carries the sender's timezone, and an absolute time would be this server's
+    opinion rendered as the user's.
+  * **`processing_error` is never echoed.** It is scrubbed on the way into the database
+    and is still a provider's phrasing about our infrastructure; the user needs the
+    outcome and what to do, not the stack.
+  * **The lane survives a missing chat model.** `ChatEngine` takes `recall: RecallLanes |
+    None` and answers `chat_unavailable` itself for the lanes that need a provider, so a
+    deployment with no chat model still answers "is it saved?". With no vault reader
+    wired up STATUS degrades to *retrieval*, never to the conversation lane -- retrieval
+    answers from the vault or says it found nothing, which is the safe direction.
+  `/status` is the same lane reachable by typing, which matters because the phrase list
+  is English-first.
+- **The RECALL lane can run its own searches, and that is the only place a model chooses
+  what happens next.** `ai/chat/tools.py` binds three tools -- `SearchMemories`,
+  `ListMemories`, `GetMemory` -- and `services/chat_engine/toolbox.py` is what executes
+  them. It buys the question one planner call cannot express: "did I save the docker talk,
+  and what did the speaker claim?" is find-then-read, and a single `MemoryQuery` picks one
+  of the two. Six rules hold the boundary, and none of them is a precaution:
+  * **There is no write tool, and there must not be.** Tool results are scraped captions
+    and page text -- exactly the text an attacker gets to write -- so a `save_memory`
+    bound to a model reading it is one caption away from filing something the user never
+    asked for. Capture stays in the regex `CAPTURE` lane, which no message can argue with.
+  * **`user_id` is not a tool argument.** It is fixed on the toolbox by the caller that
+    resolved the account, so prompt injection has nothing to *ask* another tenant's rows
+    with, and the repository re-applies the predicate underneath. `tests/chat_engine/
+    test_toolbox.py` asserts no schema has such a field.
+  * **`GetMemory` only accepts ids already surfaced this turn.** Not secrecy -- a short id
+    is a prefix of a UUID its owner has -- but a model told by a *memory* to open
+    something did not get that id from the vault.
+  * **`evidence.assess` runs on every search** before its results are rendered, and
+    `validate_answer` still runs on the way out against the ids the toolbox actually
+    surfaced. The model chose the query; it does not choose what counts as a match.
+  * **The loop is bounded** (`RECALL_MAX_TOOL_CALLS`, `RECALL_MAX_TOOL_ROUNDS`), and every
+    tool call gets a `ToolMessage` even past the budget -- a call left unanswered is a
+    malformed conversation and providers reject the *next* request outright.
+  * **Failure degrades to the single-shot path**, which is older and better tested. That
+    is what makes `RECALL_TOOLS_ENABLED` safe to default on.
+- **Enrichment is one call now, not four, and the four that remain run together.**
+  `ai/enrichment.py` asks for summary, tags, category and label in one OpenAI structured
+  output (`strict` JSON schema), which is where the cost actually was: each per-field
+  prompt shipped the whole 12000-character item again, so four calls billed roughly four
+  times the input to produce about 120 tokens. The schema also removes the string
+  handling that recovered tags from prose and mapped an unrecognised category to "Other".
+  It is a module with its own switch rather than a fifth `AIProvider` method, for the same
+  reason `transcription.py` and `vision.py` are: the Protocol is structural, so a provider
+  missing a method fails at runtime inside the pipeline and every fake in `tests/` has to
+  grow it. When it is off or fails, `ProcessingService._card_fields` falls back to the four
+  `AIProvider` calls -- issued with `asyncio.gather`, since none of them reads another's
+  output. Highlights stay separate on purpose: they are verbatim quotes checked against
+  the body afterwards and they need the full `content`.
+- **A second configured provider is a failover, never a fallback for selection.** An
+  `AI_PROVIDER` that cannot be built still raises -- answering with a model the operator
+  did not choose is not a recovery. But when both keys are present, `factory.resilient()`
+  rebuilds the caller's chain on the alternate and tries it once. Three limits:
+  **chat only, never embeddings** (Gemini's 768 padded dims and OpenAI's native 1536 are
+  not comparable, so a query embedded by the alternate ranks against a space it was not
+  drawn from); **only a provider with a key**, because a fallback that provisions itself
+  is a bill nobody agreed to; and the primary always goes first, so a healthy deployment
+  never touches it. `get_chat_model()` deliberately returns a bare `BaseChatModel` --
+  `with_fallbacks` produces a `RunnableWithFallbacks`, which has neither `bind_tools` nor
+  `with_structured_output`, so wrapping in the factory would silently remove the two
+  features the tool lane and the planner are built on.
+- **`POST /chat/ask` streams, and streaming did not cost the output checks.** The bot
+  answers into a window nobody watches type; a web page is the opposite. But "correct it
+  afterwards" is not available here -- the whole point of the URL rule is that a
+  fabricated link is one a person is invited to *tap*. `validation.StreamValidator` works
+  because both checkable things, `[a3f1c920]` and a URL, contain **no whitespace**: it
+  releases only up to the last whitespace it has seen and holds the trailing run back, so
+  everything displayed has been seen whole and put through the same `scrub` the finished
+  path uses. It also enforces the length cap as it goes and collapses the gap a removal
+  leaves, so the streamed and finished answers are identical strings
+  (`tests/chat_engine/test_stream_validation.py` asserts that directly). The route carries
+  `assert_same_site` and a per-user hourly cap (`ASK_PER_HOUR`, `core/rate_limit.py`)
+  because it spends a model call per request, and its request body has exactly two fields
+  -- everything deciding *which rows are read* comes from the session.
+- **The streamed tool lane is driven by a graph, and that is the only reason LangGraph is
+  a dependency.** A loop over `ainvoke` must receive a whole turn to know whether it was
+  tool calls or the answer, so the surface that most needs words as they arrive was the
+  one that could not have tools. `ai/chat/agent.py` uses `create_react_agent` with
+  `stream_mode="messages"`; checkpointers, interrupts and persistence are deliberately
+  unused, since this graph answers one question and ends. Two things to know before
+  editing it: a `ToolMessage` chunk carries the fenced memory blocks and **must never be
+  emitted** (it would put a raw `<memory>` block on the page, and text the model has not
+  read yet in front of the person as though it were the answer); and a failure *before*
+  any words is silent so the caller can answer by the single-shot route, while a failure
+  *after* them is final -- repeating words the reader has already seen is worse than the
+  shorter answer they have. The status events it emits carry the tool's stage and never
+  its arguments, which are the model's own guess at the subject.
 - **The Telegram bot's whole authorisation is one lookup.** An update carries no session,
   so `TelegramUpdateRouter` (`services/telegram/dispatch.py`) turning a sender into a user
   via `telegram_accounts` *is* the access control — everything before that lookup succeeds

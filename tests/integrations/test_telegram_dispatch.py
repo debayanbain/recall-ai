@@ -63,6 +63,10 @@ class FakeVault:
         self.saved_urls: list[tuple[uuid.UUID, str]] = []
         self.notes: list[tuple[uuid.UUID, str, str]] = []
         self.listed: list[uuid.UUID] = []
+        self.status_reads: list[uuid.UUID] = []
+        self.recent: list[VaultItem] = [
+            _item(title="BellaVita White Oud", processing_status=ProcessingStatus.completed)
+        ]
         self.duplicate = False
 
     async def save_url(
@@ -80,6 +84,10 @@ class FakeVault:
     async def list_recent(self, user_id: uuid.UUID, limit: int, **kwargs: Any) -> Any:
         self.listed.append(user_id)
         return [_item(title="Older thing")], 1
+
+    async def recent_saves(self, user_id: uuid.UUID, limit: int) -> Any:
+        self.status_reads.append(user_id)
+        return list(self.recent), len(self.recent)
 
 
 class FakeClient:
@@ -419,3 +427,76 @@ async def test_a_hyperlinked_label_is_captured_by_its_target() -> None:
 
     assert vault.saved_urls == [(_ALICE, "https://www.instagram.com/reel/xyz/")]
     assert recall.asked == []
+
+
+# --- "did that save?" -------------------------------------------------------------------
+
+
+async def test_a_status_question_is_answered_from_the_vault_not_the_model() -> None:
+    """The bug this lane exists for. Asked "is it saved?", the bot used to reach the
+    conversation lane -- which is given no memories on purpose -- and answer "I can't
+    check what you've saved" while the row sat there completed."""
+    vault = FakeVault()
+    recall = FakeRecall()
+    result = await _dispatcher(FakeLinks(_account()), vault, recall).handle(
+        _update("Is it saved?")
+    )
+    assert vault.status_reads == [_ALICE]
+    assert recall.asked == []
+    assert result.reply is not None
+    assert "BellaVita White Oud" in result.reply
+
+
+async def test_a_status_question_writes_nothing() -> None:
+    vault = FakeVault()
+    result = await _dispatcher(FakeLinks(_account()), vault, FakeRecall()).handle(
+        _update("did it save?")
+    )
+    assert vault.saved_urls == []
+    assert vault.notes == []
+    assert result.enqueue_item_ids == []
+
+
+async def test_the_status_command_takes_the_same_lane() -> None:
+    """A typed command is the one form that works in every language; the phrase list is
+    English-first by necessity."""
+    vault = FakeVault()
+    result = await _dispatcher(FakeLinks(_account()), vault, FakeRecall()).handle(
+        _update("/status")
+    )
+    assert vault.status_reads == [_ALICE]
+    assert result.reply is not None
+    assert "BellaVita White Oud" in result.reply
+
+
+async def test_status_is_answered_with_no_chat_model_configured() -> None:
+    """The point of a lane with no provider call: it still works when there is no
+    provider. `recall=None` is a real deployment state, not an error."""
+    vault = FakeVault()
+    result = await _dispatcher(FakeLinks(_account()), vault, None).handle(
+        _update("Is it saved?")
+    )
+    assert vault.status_reads == [_ALICE]
+    assert result.reply is not None
+    assert "BellaVita White Oud" in result.reply
+
+
+async def test_an_unlinked_sender_cannot_read_a_status() -> None:
+    """Authorisation is the `telegram_accounts` lookup, and it runs first. An unlinked
+    sender learns nothing -- not a title, not a count, not whether anything exists."""
+    vault = FakeVault()
+    result = await _dispatcher(FakeLinks(account=None), vault, FakeRecall()).handle(
+        _update("Is it saved?")
+    )
+    assert vault.status_reads == []
+    assert result.reply is not None
+    assert "BellaVita" not in result.reply
+
+
+async def test_a_status_question_in_a_group_is_ignored() -> None:
+    vault = FakeVault()
+    result = await _dispatcher(FakeLinks(_account()), vault, FakeRecall()).handle(
+        _update("Is it saved?", chat_type="group")
+    )
+    assert vault.status_reads == []
+    assert result.reply is None

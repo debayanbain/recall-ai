@@ -337,3 +337,133 @@ async def test_a_quiet_sweep_reports_nothing(monkeypatch: pytest.MonkeyPatch) ->
 
     _install_sweep(monkeypatch, _SweepRepo([], []), [])
     assert await _sweep_stranded_items() == {"requeued": 0, "failed": 0}
+
+
+# --- re-reading a video a memory was saved without ------------------------------------
+
+
+def _reel(
+    *,
+    status: ProcessingStatus = ProcessingStatus.completed,
+    video_url: str | None = "https://cdn.example/v.mp4",
+    video_read: bool | None = None,
+    source_url: str | None = "https://www.instagram.com/reel/x/",
+) -> VaultItem:
+    item = _item(status, kind=ContentType.instagram)
+    item.source_url = source_url
+    item.content = "New drop is live."
+    metadata: dict[str, Any] = {"owner": "someone"}
+    if video_url is not None:
+        metadata["video_url"] = video_url
+    if video_read is not None:
+        metadata["video_read"] = video_read
+    item.item_metadata = metadata
+    return item
+
+
+@pytest.fixture
+def _video_on(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(vs.settings, "OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(vs.settings, "VIDEO_UNDERSTANDING_ENABLED", True)
+
+
+async def test_a_reel_saved_before_video_reading_can_be_re_read(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """The case this exists for: a completed reel holding a caption and nothing of what
+    was on screen or said. `completed` is what would otherwise make that permanent."""
+    item = _reel()
+
+    result = await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+
+    assert result.processing_status is ProcessingStatus.pending
+    assert result.retry_count == 0
+    assert _queue == [item.id]
+
+
+async def test_the_caption_is_not_cleared_on_the_way(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """Unlike the voice path. `_apply` overwrites `content` from the fresh scrape before
+    `_read_video` runs, so clearing here would only widen the window in which the row
+    holds neither the old body nor the new."""
+    item = _reel()
+
+    result = await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+
+    assert result.content == "New drop is live."
+    assert result.item_metadata["video_url"] == "https://cdn.example/v.mp4"
+
+
+async def test_a_failed_video_read_is_re_drivable(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """`video_read: false` is a read that was attempted and did not land -- a provider
+    outage, an expired link. That is exactly the case worth offering again."""
+    item = _reel(video_read=False)
+
+    result = await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+
+    assert result.processing_status is ProcessingStatus.pending
+    assert _queue == [item.id]
+
+
+async def test_a_video_already_read_is_refused(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """Same rule as every other finished item: re-running it spends a scraper run and the
+    whole pipeline to replace a result with itself."""
+    item = _reel(video_read=True)
+
+    with pytest.raises(ReprocessError, match="finished already"):
+        await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+    assert _queue == []
+
+
+async def test_an_item_with_no_video_is_refused(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """A static post carries no video. There is nothing a re-read could add."""
+    item = _reel(video_url=None)
+
+    with pytest.raises(ReprocessError, match="finished already"):
+        await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+    assert _queue == []
+
+
+async def test_an_item_with_no_source_url_is_refused(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """The stored `video_url` is a signed CDN link that dies within hours, so the only
+    route to a playable one is re-running the extractor. With no URL to re-scrape there
+    is nothing to re-read, and offering it would spend a queue trip to fail."""
+    item = _reel(source_url=None)
+
+    with pytest.raises(ReprocessError, match="finished already"):
+        await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+    assert _queue == []
+
+
+async def test_the_capability_being_off_refuses_the_re_read(
+    _queue: list[uuid.UUID], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Without it the whole round trip -- a paid scraper run included -- reproduces the
+    result the item already has."""
+    monkeypatch.setattr(vs.settings, "OPENAI_API_KEY", "sk-test")
+    monkeypatch.setattr(vs.settings, "VIDEO_UNDERSTANDING_ENABLED", False)
+    item = _reel()
+
+    with pytest.raises(ReprocessError, match="finished already"):
+        await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+    assert _queue == []
+
+
+async def test_a_reel_still_being_processed_is_refused(
+    _queue: list[uuid.UUID], _video_on: None
+) -> None:
+    """Reaching here means a double click or a script; the UI disables the button."""
+    item = _reel(status=ProcessingStatus.processing)
+
+    with pytest.raises(ReprocessError, match="already being processed"):
+        await vs.VaultService(_Repo(item), None).reprocess(item.id, item.user_id)  # type: ignore[arg-type]
+    assert _queue == []

@@ -15,13 +15,17 @@ unchanged by the split.
 """
 from __future__ import annotations
 
+import asyncio
 import uuid
+from typing import Any
 
-from app.ai import get_ai_provider
+from app.ai import enrichment, get_ai_provider
 from app.ai.spans import keep_verbatim
 from app.core.config import settings
 from app.core.errors import safe_error_text
+from app.core.links import collect_links
 from app.core.logging import get_logger
+from app.core.net import UnsafeUrlError
 from app.extractors import get_extractor
 from app.extractors.base import ExtractedContent, PermanentExtractionError
 from app.models.base import ContentType, ProcessingStatus
@@ -29,8 +33,13 @@ from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.vault import VaultItem
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
-from app.services import transcription, vision
+from app.services import transcription, video, video_doc, vision
 from app.storage import ObjectStorage, StorageError
+
+#: Ceiling on a body assembled from more than one source (a caption plus a video
+#: reading). Each half is already clipped by whoever produced it; this bounds the
+#: sum, which is what actually reaches a prompt and the embedding input.
+_MAX_COMBINED_CONTENT_CHARS = 16_000
 
 log = get_logger("processing")
 
@@ -81,6 +90,8 @@ class ProcessingService:
 
                 extracted = await extractor.extract(item.source_url)  # type: ignore[union-attr]
                 self._apply(item, extracted)
+                if extracted.enrich:
+                    await self._read_video(item)
                 if not extracted.enrich:
                     # Deliberately unenriched (an Instagram post we do not pay to scrape).
                     # `skipped`, not `failed`: nothing went wrong, there is just nothing
@@ -138,6 +149,9 @@ class ProcessingService:
         try:
             extractor = get_extractor(item.source_url or "")
             self._apply(item, extractor.build(items))  # type: ignore[union-attr]
+            # Before `_enrich`, so the summary, tags, label and embedding are all drawn
+            # from what the video actually said rather than from the caption alone.
+            await self._read_video(item)
             await self._enrich(item)
         except Exception as exc:  # noqa: BLE001 - same policy as phase 1
             await self._fail(item, exc)
@@ -193,20 +207,20 @@ class ProcessingService:
         if not text.strip():
             raise ValueError("No content extracted to process")
 
-        item.summary = await self.ai.generate_summary(text)
-        item.ai_tags = await self.ai.generate_tags(text)
-        item.ai_category = await self.ai.generate_category(text)
-        item.ai_label = await self.ai.generate_label(text) or None
-        # Highlights index into `content` specifically, so they are only asked for when
-        # there is content to index into -- an item enriched from its title alone has
-        # nothing for the reader to mark. Each span is then checked against that text
-        # before storage: one the model paraphrased would either vanish in the UI or be
-        # shown as words the author never wrote.
-        item.ai_highlights = (
-            keep_verbatim(await self.ai.generate_highlights(item.content), item.content)
-            if item.content
-            else []
+        # The card fields and the highlights are independent readings of the same text,
+        # so they are issued together. Highlights index into `content` specifically and
+        # are checked against it afterwards, which is why they are never folded into the
+        # combined call below: a quote that was paraphrased would either vanish in the UI
+        # or be shown as words the author never wrote.
+        fields, highlights = await asyncio.gather(
+            self._card_fields(text),
+            self._highlights_for(item),
         )
+        item.summary = fields.summary
+        item.ai_tags = fields.tags
+        item.ai_category = fields.category
+        item.ai_label = fields.label or None
+        item.ai_highlights = highlights
 
         embed_input = f"{item.title or ''}\n{item.summary or ''}\n{text}"
         vector = await self.ai.generate_embedding(embed_input)
@@ -221,6 +235,153 @@ class ProcessingService:
         item.retry_count = 0
         await self.repo.add(item)
         log.info("process_completed", item_id=str(item.id), type=item.type.value)
+
+    async def _card_fields(self, text: str) -> enrichment.Enrichment:
+        """Summary, tags, category and label -- in one call where that is possible.
+
+        The combined call ships the item once instead of four times, which is where the
+        cost of enrichment actually lives, and its answer is schema-checked rather than
+        recovered from prose. It is never the only path: unconfigured, or failed, and
+        this drops to the four `AIProvider` calls, which is the behaviour that existed
+        before it and is what every provider implements.
+
+        A failure here is logged and swallowed *once*. That is deliberate and narrow: the
+        fallback is a complete implementation of the same job, so paying for it beats
+        failing an item over a capability that is an optimisation.
+        """
+        if enrichment.enrichment_available():
+            try:
+                return await enrichment.enrich(text)
+            except Exception as exc:  # noqa: BLE001 - the fallback below does the job
+                log.warning("enrichment_combined_failed", error=type(exc).__name__)
+
+        # Four calls, issued together. They were sequential, which made enrichment cost
+        # the sum of four provider round trips when it only ever needed the slowest --
+        # none of them reads another's output. `return_exceptions=False` keeps the
+        # original failure behaviour: the first exception propagates, `process` records
+        # it and re-raises, and Celery retries the whole item.
+        summary, tags, category, label = await asyncio.gather(
+            self.ai.generate_summary(text),
+            self.ai.generate_tags(text),
+            self.ai.generate_category(text),
+            self.ai.generate_label(text),
+        )
+        return enrichment.Enrichment(
+            summary=summary, tags=list(tags), category=category, label=label
+        )
+
+    async def _highlights_for(self, item: VaultItem) -> list[str]:
+        """Verbatim quotes from the item's own body, or nothing when there is no body.
+
+        Its own coroutine so the empty case is still awaitable and can sit in the
+        `gather` above beside the other four -- a conditional there would either be a
+        branch around the whole call or an `if` inside an argument list.
+        """
+        if not item.content:
+            return []
+        spans = await self.ai.generate_highlights(item.content)
+        return keep_verbatim(spans, item.content)
+
+    async def _read_video(self, item: VaultItem) -> None:
+        """Read a source's video, when it gave us one, and fold it into the item.
+
+        A caption is not a video. The link a creator wants followed is usually burned into
+        a frame or spoken aloud, and neither reaches the caption -- so without this the
+        useful half of every reel is missing and nothing reports it.
+
+        Appends rather than replaces, because the caption is what its author chose to
+        write and the reading is a machine's account of what it saw. Both are kept, both
+        are labelled, and `content_source` records that a model wrote part of this.
+
+        The failure policy is the interesting part, and it turns on one question: was the
+        video the *only* content?
+
+        * Unreadable, oversized, expired, over-long, or pointing somewhere we refuse to
+          fetch -- all answers, not faults. The item keeps its caption and completes.
+        * A provider or network fault when a caption exists -- degrade. Failing an item
+          whose caption is a perfectly good memory, to retry an enhancement, trades a
+          working memory for a spinner.
+        * The same fault with no caption at all -- re-raised, so Celery retries. There is
+          nothing to degrade *to*, and enriching an empty item is how a memory ends up
+          summarising its own URL.
+        """
+        raw_url = item.item_metadata.get("video_url")
+        if not isinstance(raw_url, str) or not raw_url.strip():
+            return
+        if not video.video_understanding_enabled():
+            log.info("video_unconfigured", item_id=str(item.id))
+            return
+
+        # Captured before anything is appended: this is the author's own text, and it is
+        # the most trustworthy source of links on the item.
+        caption = (item.content or "").strip()
+        reading: video.VideoReading | None = None
+        error: str | None = None
+
+        try:
+            data = await video.fetch_video(raw_url)
+            reading = await video.read_video(data)
+        except (video.VideoError, video.VideoUnavailable, UnsafeUrlError) as exc:
+            error = type(exc).__name__
+            log.info("video_not_read", item_id=str(item.id), error=error)
+        except video.VideoFailed:
+            if not caption:
+                raise
+            error = "VideoFailed"
+            log.warning("video_read_degraded", item_id=str(item.id))
+
+        # Ordered by trust, most trusted first, and `collect_links` keeps the first
+        # source to yield each URL. A link the creator typed is a fact; the same link
+        # read off a blurry frame is a guess that happens to be right, and the reader has
+        # to be able to tell them apart.
+        links = collect_links(
+            [
+                ("caption", caption),
+                ("video", reading.frames_text if reading else None),
+                ("speech", reading.speech if reading else None),
+            ],
+            limit=settings.MAX_EXTRACTED_LINKS,
+        )
+
+        metadata: dict[str, Any] = {
+            **item.item_metadata,
+            "links": links,
+            "video_read": bool(reading and reading.text),
+        }
+        if error:
+            metadata["video_read_error"] = error
+
+        if reading and reading.text:
+            body = "\n\n".join(part for part in (caption, reading.text) if part)
+            item.content = body[:_MAX_COMBINED_CONTENT_CHARS]
+            # The reading has real structure -- a caption, a transcript, an itemised list
+            # of what was on screen -- which the flattening above throws away. Rebuilt as
+            # a block document so the page can render five title cards as five list items
+            # rather than as one paragraph.
+            #
+            # Stored under its OWN key. `editor_doc` means "a person edited this": the
+            # Edit button seeds from it, and a machine-written document landing there
+            # would be indistinguishable from the user's own work and would be silently
+            # overwritten by the next re-read.
+            document = video_doc.build(item.content, links)
+            if document:
+                metadata["video_doc"] = document
+            # The reader shows this. Part of this body is a model's account of a video,
+            # not words a person wrote, and rendering the two identically is the one way
+            # this feature can lie.
+            metadata["content_source"] = "video"
+            metadata["video_model"] = settings.OPENAI_VISION_MODEL
+            metadata["video_frames_read"] = reading.frames_read
+            if reading.duration_seconds is not None:
+                metadata["video_duration_seconds"] = round(reading.duration_seconds, 2)
+
+        item.item_metadata = metadata
+        log.info(
+            "video_pass_done",
+            item_id=str(item.id),
+            read=bool(reading and reading.text),
+            links=len(links),
+        )
 
     async def _transcribe(self, item: VaultItem) -> bool:
         """Re-read a stored recording into `content`. False means "nothing to enrich".
