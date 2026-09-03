@@ -79,7 +79,7 @@ def test_a_url_beats_recall_phrasing() -> None:
 
 def test_link_text_without_a_parsed_url_is_not_a_capture() -> None:
     """The caller finds the link. No url in, no capture out."""
-    assert route("https://x.com/a") is Intent.CHAT
+    assert route("https://x.com/a") is not Intent.CAPTURE
 
 
 # --- meta ----------------------------------------------------------------------------
@@ -152,8 +152,17 @@ def test_any_kind_phrasings(text: str) -> None:
 
 
 def test_a_kind_word_before_any_is_not_recall() -> None:
-    """The kind has to follow "any" -- otherwise every sentence with "post" in it matches."""
-    assert route("videos are fun, got any thoughts") is Intent.CHAT
+    """The kind has to follow "any" -- otherwise every sentence with "post" in it matches.
+
+    Asserted against the helper rather than against `route`, because the fallback is
+    RECALL now: this sentence reaches that lane either way, and a test that could not
+    tell "matched the heuristic" from "matched nothing at all" would keep passing after
+    the heuristic broke.
+    """
+    from app.services.chat_engine.router import _asks_for_a_kind
+
+    assert _asks_for_a_kind("videos are fun, got any thoughts") is False
+    assert _asks_for_a_kind("any cooking videos") is True
 
 
 def test_recall_is_case_insensitive() -> None:
@@ -167,22 +176,47 @@ def test_a_greeting_is_chat() -> None:
     assert route("Hii") is Intent.CHAT
 
 
-def test_general_knowledge_is_chat() -> None:
-    """The load-bearing case: a question mark alone must not mean recall."""
-    assert route("what is the capital of France?") is Intent.CHAT
+def test_general_knowledge_goes_to_retrieval_on_purpose() -> None:
+    """The safe direction, and a deliberate reversal of what this file used to pin.
+
+    It used to be CHAT, on the reasoning that a question mark alone must not mean recall.
+    That was right about the question mark and wrong about the destination: CHAT is the
+    lane with no vault access, so every phrasing nobody had listed -- including real
+    questions about the vault -- was answered by a model that could not see it. Retrieval
+    answers an unknown subject with "I could not find anything about that in your vault",
+    which is true for the capital of France and is what the person asking about their own
+    memories wanted.
+    """
+    assert route("what is the capital of France?") is Intent.RECALL
 
 
-@pytest.mark.parametrize(
-    "text",
-    ["thanks!", "how does pgvector work?", "why is the sky blue?", "ok"],
-)
-def test_chat_phrasings(text: str) -> None:
+@pytest.mark.parametrize("text", ["thanks!", "ok", "hello", "good morning", "👍"])
+def test_social_phrasings_stay_out_of_retrieval(text: str) -> None:
+    """The one thing the fallback must not swallow.
+
+    Answering "thanks!" with "I could not find anything about thanks in your vault" is a
+    worse bot than the one the fallback change exists to fix, so the router keeps a small
+    allowlist of shapes that are plainly not searches. It is an allowlist, not the closed
+    gate: what it does not recognise falls through to retrieval.
+    """
     assert route(text) is Intent.CHAT
 
 
+@pytest.mark.parametrize("text", ["how does pgvector work?", "why is the sky blue?"])
+def test_a_question_that_is_not_social_goes_to_retrieval(text: str) -> None:
+    assert route(text) is Intent.RECALL
+
+
 def test_a_recall_word_inside_another_word_does_not_match() -> None:
-    """Word boundaries, not substrings -- "confined" is not "find"."""
-    assert route("the space felt confined") is Intent.CHAT
+    """Word boundaries, not substrings -- "confined" is not "find".
+
+    Against the pattern, not against `route`: both answers are RECALL now, so only the
+    regex can still say whether it matched for the right reason.
+    """
+    from app.services.chat_engine.router import _RECALL_RE
+
+    assert _RECALL_RE.search("the space felt confined") is None
+    assert _RECALL_RE.search("find my notes") is not None
 
 
 # --- the enum itself -----------------------------------------------------------------
@@ -216,7 +250,8 @@ def test_help_inside_a_search_is_still_recall() -> None:
 
 
 def test_helpful_is_not_help() -> None:
-    assert route("helpful tips please") is Intent.CHAT
+    """`^help$` is anchored so it cannot swallow "help me find my notes about docker"."""
+    assert route("helpful tips please") is not Intent.META
 
 
 def test_slash_help_is_a_command_not_meta() -> None:

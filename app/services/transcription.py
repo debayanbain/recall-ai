@@ -24,6 +24,7 @@ from typing import Any
 from tenacity import retry, stop_after_attempt, wait_exponential
 
 from app.core.config import settings
+from app.core.languages import LANGUAGES as _LANGUAGES
 from app.core.logging import get_logger
 from app.core.scripts import contradicts_script, script_of
 
@@ -51,32 +52,11 @@ _SIGNATURES: tuple[tuple[bytes, int, str, str], ...] = (
 #: memory.
 _MAX_TEXT_CHARS = 100_000
 
-#: Languages a caller may pin, ISO-639-1 as the API wants them, mapped to the display
-#: name stored in metadata. A closed list on purpose: this value is forwarded to a
-#: provider and rendered on a page, so it is re-derived from a key rather than passed
-#: through. "" means auto-detect.
-LANGUAGES: dict[str, str] = {
-    "bn": "bengali",
-    "hi": "hindi",
-    "en": "english",
-    "ur": "urdu",
-    "ta": "tamil",
-    "te": "telugu",
-    "mr": "marathi",
-    "gu": "gujarati",
-    "pa": "punjabi",
-    "ar": "arabic",
-    "es": "spanish",
-    "fr": "french",
-    "de": "german",
-    "pt": "portuguese",
-    "ru": "russian",
-    "ja": "japanese",
-    "ko": "korean",
-    "zh": "chinese",
-    "id": "indonesian",
-    "ne": "nepali",
-}
+#: Languages a caller may pin. Re-exported from `core/languages.py` rather than defined
+#: here: the enrichment prompts pin a language against the same closed list, and a table
+#: written twice is one that gets a language added to one copy. Existing callers import
+#: it from this module, so the name stays.
+LANGUAGES = _LANGUAGES
 
 
 def normalise_language(code: str | None) -> str | None:

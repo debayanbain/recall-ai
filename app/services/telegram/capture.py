@@ -22,12 +22,11 @@ from app.core.logging import get_logger
 from app.models.vault import VaultItem
 from app.services.documents import DocumentError
 from app.services.telegram.client import TelegramApiError, TelegramClient
-from app.services.vault_service import VaultService
+from app.services.vault_service import NOTE_CONTENT_MAX, VaultService, note_title
 
 log = get_logger("telegram")
 
-_MAX_NOTE_CHARS = 20_000
-_MAX_NOTE_TITLE = 120
+_MAX_NOTE_CHARS = NOTE_CONTENT_MAX
 # Mapped only for the types the upload allowlist already accepts. Telegram photos arrive
 # with no filename at all, and `documents.inspect` reads the extension from the filename,
 # so without a synthesised name every photo would be refused as an unsupported type.
@@ -273,10 +272,8 @@ def _int_or_none(value: object) -> int | None:
 
 
 def _note_title(text: str) -> str:
-    first_line = text.strip().splitlines()[0].strip()
-    if len(first_line) <= _MAX_NOTE_TITLE:
-        return first_line or "Note"
-    return first_line[: _MAX_NOTE_TITLE - 1].rstrip() + "…"
+    """The shared derivation. Kept as a name here because the call sites read better."""
+    return note_title(text)
 
 
 def _filename_for(payload: dict[str, Any], file_path: str) -> str:

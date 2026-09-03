@@ -36,6 +36,24 @@ class ReprocessError(ValueError):
 _TITLE_MAX = 512
 
 
+#: A note is titled by its own first line, which is what a person would have called it.
+NOTE_TITLE_MAX = 120
+NOTE_CONTENT_MAX = 20_000
+
+
+def note_title(text: str) -> str:
+    """The first line, clipped. Shared, because two surfaces now create notes.
+
+    A second copy of this is a second answer to "what is this note called", and the two
+    would drift the first time either was adjusted.
+    """
+    lines = text.strip().splitlines()
+    first_line = lines[0].strip() if lines else ""
+    if len(first_line) <= NOTE_TITLE_MAX:
+        return first_line or "Note"
+    return first_line[: NOTE_TITLE_MAX - 1].rstrip() + "…"
+
+
 class VaultService:
     def __init__(self, repo: VaultRepository, storage: ObjectStorage | None = None) -> None:
         self.repo = repo
@@ -310,10 +328,13 @@ class VaultService:
         save into a 500 that loses the user's capture -- the item simply stays `pending`
         until a worker picks it up.
 
-        Note this still fires before the request session commits (see "Known rough edges"
-        in CLAUDE.md): a fast worker can dequeue before the row is visible and log
-        `process_missing_item`. Failing soft here does not fix that race, it only stops a
-        missing queue from breaking capture entirely.
+        On the paths that pass `enqueue=True` this still fires before the request session
+        commits (see "Known rough edges" in CLAUDE.md): a fast worker can dequeue before
+        the row is visible, log `process_missing_item`, and leave the item stuck at
+        `pending`. Failing soft here does not fix that race -- it only stops a missing
+        queue from breaking capture entirely. The fix is the caller's: take `enqueue=False`,
+        commit, then call `enqueue` below, which is what the bot has always done and what
+        the proposal routes do.
         """
         try:
             await enqueue_process_item(item.id)
@@ -325,6 +346,14 @@ class VaultService:
                 detail="saved as pending; nothing processes it until the queue is reachable",
             )
 
+    async def enqueue(self, item: VaultItem) -> None:
+        """Hand a saved row to the worker, after the caller has committed it.
+
+        Public because the ordering is the caller's to get right and cannot be got right
+        from in here: this service does not own the transaction boundary. A caller that
+        wants the safe order takes `enqueue=False`, commits, and calls this.
+        """
+        await self._enqueue(item)
 
     async def create_note(
         self,
@@ -570,6 +599,14 @@ class VaultService:
         return item
 
     async def delete(self, item_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+        """Remove a memory. The row becomes a scrubbed tombstone; the bytes go entirely.
+
+        The key is read *before* the delete because the tombstone clears it -- nothing
+        should be able to mint a presigned URL to an object on its way out. The object is
+        then removed for real, every version of it: the bucket keeps all versions, so a
+        plain S3 DELETE writes a marker and leaves the bytes, which for a person who
+        asked for their document to be removed means it is still stored and still billed.
+        """
         item = await self.repo.get(item_id, user_id)
         if item is None:
             return False

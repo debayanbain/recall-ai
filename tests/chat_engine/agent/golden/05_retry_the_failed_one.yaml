@@ -1,0 +1,22 @@
+name: retry the failed one
+why: >
+  The snapshot carries the failed row, so the agent can name it exactly and offer the
+  retry without searching. The offer is a token and a card; the re-run happens only if a
+  tap arrives, in code with no model in it.
+user_text: "retry the failed one"
+propose: true
+snapshot:
+  - title: "A private reel"
+    type: instagram
+    status: failed
+    age_minutes: 30
+model_turns:
+  - calls:
+      - tool: ProposeRetry
+        args: {memory_id: "{{first_snapshot_id}}"}
+  - text: "That's A private reel, which failed 30m ago. Retry it?"
+expect:
+  tool_calls: [ProposeRetry]
+  reply_contains: ["A private reel"]
+  proposal_preview: "A private reel"
+  failed: false

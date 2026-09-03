@@ -39,7 +39,7 @@ from typing import Any
 
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from app.ai import parsing
+from app.ai import parsing, prompts
 from app.core.config import settings
 from app.core.logging import get_logger
 
@@ -63,23 +63,36 @@ _MAX_OUTPUT_TOKENS = 400
 _MAX_TAGS = 7
 _MAX_TAG_CHARS = 40
 
-_INSTRUCTIONS = (
-    "You are cataloguing one item a person saved to their own memory vault. "
-    "Read the content and fill in every field.\n\n"
-    # Each rule below is the one its per-field prompt carried, kept word for word in
-    # substance: a rule dropped in the move is a regression nothing would report.
-    "summary: 2-3 concise sentences, factual and neutral. Write it in the SAME LANGUAGE "
-    "as the content -- a note written in Bengali must not come back summarised in "
-    "English, or its own author reads their memory in translation.\n"
-    "tags: 3-7 short topical tags, lowercase. Use the SAME LANGUAGE as the content.\n"
-    "category: exactly one value from the list. This one is ALWAYS the English word, "
-    "whatever language the content is in -- it is an enum, not prose.\n"
-    "label: name this specific item in 3 to 7 words, the way a person would name it in "
-    "a reading list. Be concrete: the product, place, method, claim or number at its "
-    "centre. A generic subject area (\"technology\", \"career advice\") is wrong; two "
-    "different items must never get the same name. No quotes, no trailing period, no "
-    "prefix. Write it in the SAME LANGUAGE as the content."
-)
+
+def _instructions() -> str:
+    """The system prompt, built per call because the language rule is configuration.
+
+    A module constant would freeze `ENRICHMENT_LANGUAGE` at import, which is the same
+    value in production and an untestable one in the suite. The concatenation is three
+    string joins against a model call, so the cost of doing it per item is nothing.
+    """
+    return (
+        "You are cataloguing one item a person saved to their own memory vault. "
+        "Read the content and fill in every field.\n\n"
+        # Each rule below is the one its per-field prompt carried, kept word for word in
+        # substance: a rule dropped in the move is a regression nothing would report.
+        "summary: 2-3 concise sentences, factual and neutral. "
+        + prompts.language_rule() + "\n"
+        "tags: 3-7 short topical tags, lowercase. "
+        + prompts.language_rule("them") + "\n"
+        # The one field the setting must never reach. It is checked with
+        # `in CATEGORIES` and written into the schema as an enum, so a model helpfully
+        # translating it drops the item into the catch-all.
+        "category: exactly one value from the list. This one is ALWAYS the English word, "
+        "whatever language the content is in -- it is an enum, not prose.\n"
+        "label: name this specific item in 3 to 7 words, the way a person would name it "
+        "in a reading list. Be concrete: the product, place, method, claim or number at "
+        "its centre. A generic subject area (\"technology\", \"career advice\") is wrong; "
+        "two different items must never get the same name. No quotes, no trailing "
+        "period, no prefix. "
+        + prompts.language_rule()
+    )
+
 
 _SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -158,7 +171,7 @@ async def _call_provider(text: str) -> Any:
     response = await client.chat.completions.create(
         model=settings.OPENAI_TEXT_MODEL,
         messages=[
-            {"role": "system", "content": _INSTRUCTIONS},
+            {"role": "system", "content": _instructions()},
             {"role": "user", "content": text},
         ],
         # Low but non-zero, matching the per-field calls this replaces: tag extraction

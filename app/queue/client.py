@@ -41,6 +41,17 @@ async def enqueue_telegram_delivery(item_id: uuid.UUID) -> None:
     await asyncio.to_thread(deliver_telegram_result.delay, str(item_id))
 
 
+async def enqueue_shadow_agent_turn(
+    user_id: str, question: str, session_id: str, surface: str, router_lane: str
+) -> None:
+    """Queue a shadow agent run for a turn that has already been answered."""
+    from app.queue.tasks import shadow_agent_turn
+
+    await asyncio.to_thread(
+        shadow_agent_turn.delay, user_id, question, session_id, surface, router_lane
+    )
+
+
 async def close_pool() -> None:
     """Kept for the app lifespan hook. Celery holds no connection to close here."""
     return None

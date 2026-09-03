@@ -1,0 +1,17 @@
+name: is it saved, in Bengali
+why: >
+  The status fast-path is anchored English phrasing, so this misses it. The agent answers
+  from the snapshot with no tool call at all -- which is the point of putting the newest
+  rows in every prompt.
+user_text: "এটা কি সেভ হয়েছে?"
+snapshot:
+  - title: "BellaVita White Oud"
+    type: article
+    status: processing
+    age_minutes: 2
+model_turns:
+  - text: "হ্যাঁ, এখনও প্রসেস হচ্ছে — ২ মিনিট আগে সেভ হয়েছে।"
+expect:
+  tool_calls: []
+  reply_contains: ["সেভ"]
+  failed: false

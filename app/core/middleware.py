@@ -6,9 +6,10 @@ import uuid
 
 import structlog
 from fastapi import Request, Response
+from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
-from starlette.types import ASGIApp
 
+from app.core import rate_limit
 from app.core.config import settings
 from app.core.logging import get_logger
 
@@ -62,9 +63,21 @@ class SecurityHeadersMiddleware(BaseHTTPMiddleware):
 
 
 class RateLimitMiddleware(BaseHTTPMiddleware):
-    """In-memory fixed-window rate limiter keyed by client IP.
+    """Per-minute fixed-window request cap, keyed by client IP, counted in Redis.
 
-    Good enough for 10 users. Swap to Redis token-bucket before scaling out.
+    It used to keep its counts in a process dict, which was wrong in two ways and only
+    one of them was written down. The known one: a count per process is a count per
+    *replica* and per uvicorn worker, so the real limit was the configured one multiplied
+    by the concurrency. The unwritten one was worse -- the dict was never pruned, so every
+    distinct client address became a permanent entry and the limiter was a slow memory
+    leak reachable from the internet by changing IP.
+
+    Redis fixes both, and the counting itself is `core/rate_limit.consume`, which the
+    per-user caps already use: one implementation of "count things in a window", one set
+    of fail-open semantics. **Fails open on purpose** -- Redis being unreachable is
+    already an outage of the queue, and turning it into "nobody may make a request"
+    doubles the blast radius of a broker problem to protect against a cost the outage
+    already bounds.
 
     Provider callbacks are exempt. Telegram and Apify deliver from a small pool of their
     own addresses, so every user's traffic collapses onto one key: a busy bot would trip
@@ -74,9 +87,9 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     actually known.
     """
 
-    def __init__(self, app: ASGIApp) -> None:
-        super().__init__(app)
-        self._hits: dict[str, tuple[int, float]] = {}
+    #: Seconds. The window this cap has always used; named rather than inlined because it
+    #: is also the `Retry-After` the client is told to wait.
+    WINDOW = 60
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -84,19 +97,12 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
         if request.url.path.startswith(_WEBHOOK_PREFIX):
             return await call_next(request)
         client = request.client.host if request.client else "anon"
-        now = time.time()
-        window = 60.0
-        count, started = self._hits.get(client, (0, now))
-        if now - started > window:
-            count, started = 0, now
-        count += 1
-        self._hits[client] = (count, started)
-        if count > settings.RATE_LIMIT_PER_MINUTE:
-            from fastapi.responses import JSONResponse
-
+        if not await rate_limit.consume(
+            "ip", client, settings.RATE_LIMIT_PER_MINUTE, window=self.WINDOW
+        ):
             return JSONResponse(
                 {"detail": "Rate limit exceeded"},
                 status_code=429,
-                headers={"Retry-After": "60"},
+                headers={"Retry-After": str(self.WINDOW)},
             )
         return await call_next(request)

@@ -6,6 +6,7 @@ from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
 from typing import Any, cast
 
+from sqlalchemy import delete as sa_delete
 from sqlalchemy.orm import load_only
 from sqlmodel import col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
@@ -30,8 +31,14 @@ class VaultRepository:
         return item
 
     async def get(self, item_id: uuid.UUID, user_id: uuid.UUID) -> VaultItem | None:
+        """One item, if it is this user's and still exists.
+
+        A deleted row answers `None`, exactly as a missing one does -- the same reason
+        "not yours" answers `None` rather than raising: a caller that can tell the three
+        apart is a caller that can enumerate them.
+        """
         item = await self.session.get(VaultItem, item_id)
-        if item is None or item.user_id != user_id:
+        if item is None or item.user_id != user_id or item.deleted_at is not None:
             return None
         return item
 
@@ -49,8 +56,17 @@ class VaultRepository:
         return result.first()
 
     async def get_unscoped(self, item_id: uuid.UUID) -> VaultItem | None:
-        """For workers: fetch without user scoping."""
-        return await self.session.get(VaultItem, item_id)
+        """For workers: fetch without user scoping. Still honours deletion.
+
+        Skipping the tenant check is what this exists for -- the worker has no request
+        user. Skipping the *deletion* check was never part of that: an item deleted while
+        it was queued must not be processed, summarised or replied about, and the caller
+        already treats `None` as "nothing to do here" (`process_missing_item`).
+        """
+        item = await self.session.get(VaultItem, item_id)
+        if item is None or item.deleted_at is not None:
+            return None
+        return item
 
     #: The columns a card needs, which is what `VaultItemRead` serializes. A listing that
     #: selects `*` also drags `content`, `item_metadata` and `ai_highlights` across the
@@ -159,6 +175,7 @@ class VaultRepository:
         content_types: Sequence[ContentType] | None = None,
         category: str | None = None,
         tags: Sequence[str] | None = None,
+        statuses: Sequence[ProcessingStatus] | None = None,
     ) -> tuple[Sequence[VaultItem], int]:
         """Newest-first listing with the filters a natural-language query produces.
 
@@ -178,6 +195,8 @@ class VaultRepository:
         if tags:
             # `@>` on jsonb: the item's tag array must contain every tag asked for.
             base = base.where(col(VaultItem.ai_tags).contains(list(tags)))
+        if statuses:
+            base = base.where(col(VaultItem.processing_status).in_(list(statuses)))
 
         return await self._page(base, limit, offset)
 
@@ -298,8 +317,88 @@ class VaultRepository:
         )
         return result.all()
 
+    async def list_slow_captures(
+        self,
+        source: str,
+        older_than_minutes: int,
+        limit: int = 100,
+    ) -> Sequence[VaultItem]:
+        """Captures from `source` that are still working and have not been nudged.
+
+        Deliberately **not** `list_stranded`, which is the sweeper's query and the wrong
+        one here in two ways. It measures `updated_at`, which is when a worker last
+        touched the row rather than when the person sent it -- and the person is timing
+        their own wait. And it excludes items with a running extraction run, which are
+        the deferred Apify crawls: those legitimately sit in `processing` for minutes and
+        are exactly the captures whose silence gets reported as a bug.
+
+        `nudged_at` is checked in SQL rather than in Python so a backlog of already-nudged
+        rows can never crowd out the ones still waiting for their first message.
+        """
+        cutoff = datetime.now(UTC) - timedelta(minutes=older_than_minutes)
+        metadata = col(VaultItem.item_metadata)
+        result = await self.session.exec(
+            select(VaultItem)
+            .where(
+                col(VaultItem.processing_status).in_(
+                    (ProcessingStatus.pending, ProcessingStatus.processing)
+                ),
+                col(VaultItem.created_at) < cutoff,
+                col(VaultItem.deleted_at).is_(None),
+                metadata["source"].astext == source,
+                metadata["nudged_at"].astext.is_(None),
+            )
+            .order_by(col(VaultItem.created_at))
+            .limit(limit)
+        )
+        return result.all()
+
     async def delete(self, item: VaultItem) -> None:
-        await self.session.delete(item)
+        """Tombstone the row and scrub everything it held.
+
+        Every read in this file already filters `deleted_at`, and has since the column
+        was added -- but the write was a hard `session.delete()`, so the filters could
+        never match anything and a soft-deleted row would have been fully readable
+        through `get()`. Both halves are fixed here: this writes the tombstone, and `get`
+        and `get_unscoped` now honour it.
+
+        **The content is scrubbed, not kept.** A tombstone exists for referential
+        integrity and so a row's absence is explainable; it is not a copy of a memory
+        somebody asked to be rid of. Keeping the title and body around to enable a
+        hypothetical undo is exactly the thing a person deleting a memory does not want,
+        and it would sit in the database until the account was closed. What survives is
+        the id, the owner, the kind and the timestamps -- enough to explain a gap, not
+        enough to reconstruct anything.
+
+        The chunks go with it. They are derived data carrying the same words *and* the
+        vector drawn from them, so leaving them would keep the deleted text searchable in
+        the one index built to find it.
+        """
+        item.deleted_at = datetime.now(UTC)
+        item.title = None
+        item.summary = None
+        item.content = None
+        item.source_url = None
+        item.thumbnail_url = None
+        item.language = None
+        item.ai_tags = []
+        item.ai_highlights = []
+        item.ai_label = None
+        item.ai_category = None
+        item.item_metadata = {}
+        item.processing_error = None
+        # The object itself is removed by `VaultService.delete`, which reads the key
+        # before calling this. Cleared here so nothing can mint a presigned URL to bytes
+        # that are on their way out.
+        item.storage_key = None
+        item.file_name = None
+        item.file_size = None
+        item.mime_type = None
+        self.session.add(item)
+        await self.session.flush()
+        await self.session.execute(
+            sa_delete(VaultChunk).where(col(VaultChunk.vault_item_id) == item.id)
+        )
 
     async def upsert_chunk(
         self,

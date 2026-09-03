@@ -26,13 +26,19 @@ log = get_logger("core.rate_limit")
 WINDOW_SECONDS = 3600
 
 
-async def consume(namespace: str, identity: str, limit: int) -> bool:
+async def consume(
+    namespace: str, identity: str, limit: int, window: int = WINDOW_SECONDS
+) -> bool:
     """Take one unit of `identity`'s hourly allowance. True when the caller may proceed.
 
     `namespace` keeps one surface's counters away from another's -- the same person
     asking through the bot and through the web are two allowances, because they are two
     costs. A limit of zero or less means unlimited, which is how a deployment turns a cap
     off without a second setting to mean "off".
+
+    `window` is a parameter because not every cap is hourly: the per-IP request limiter
+    is per *minute*, and a second implementation of "count things in a window" is a second
+    thing to get the fail-open behaviour wrong in.
     """
     if limit <= 0:
         return True
@@ -46,7 +52,7 @@ async def consume(namespace: str, identity: str, limit: int) -> bool:
         pipe.incr(key)
         # Fixed window, TTL re-set on every hit so the window slides with use. A true
         # sliding count needs a sorted set per identity and is not worth it here.
-        pipe.expire(key, WINDOW_SECONDS)
+        pipe.expire(key, window)
         count, _ = await pipe.execute()
         return int(count) <= limit
     except Exception as exc:  # noqa: BLE001 - an abuse control must not become an outage

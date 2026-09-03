@@ -70,6 +70,12 @@ def chat_id_of(update: dict[str, Any]) -> str | None:
     """
     message = update.get("message")
     if not isinstance(message, dict):
+        # A tapped button carries the message it was attached to, one level down. Read
+        # the same way and subject to the same private-chat rule: acting on a tap in a
+        # room is the same disclosure as answering a question in one.
+        callback = update.get("callback_query")
+        message = callback.get("message") if isinstance(callback, dict) else None
+    if not isinstance(message, dict):
         return None
     chat = message.get("chat")
     if not isinstance(chat, dict) or chat.get("type") != "private":

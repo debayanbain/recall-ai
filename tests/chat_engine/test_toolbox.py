@@ -88,10 +88,19 @@ def test_no_tool_can_write() -> None:
 
 
 def test_no_tool_takes_a_user() -> None:
-    """Prompt injection cannot reach another tenant because there is nothing to ask with."""
-    for tool in tools._TOOLS:
+    """Prompt injection cannot reach another tenant because there is nothing to ask with.
+
+    Every schema, on both lanes. The agent's own tools are checked here rather than only
+    where they are defined, because this is the assertion someone will look for when they
+    add a tool -- and a new schema that lands in the other file is exactly the one that
+    would slip past.
+    """
+    from app.ai.chat.harness.schemas import AskUser, FinalAnswer, GetCaptureStatus
+
+    every = [*tools._TOOLS, GetCaptureStatus, AskUser, FinalAnswer]
+    for tool in every:
         fields = set(tool.model_fields)
-        assert not {"user_id", "user", "owner", "account_id"} & fields
+        assert not {"user_id", "user", "owner", "account", "account_id"} & fields
 
 
 async def test_the_search_runs_against_the_toolboxs_own_user(

@@ -97,7 +97,50 @@ class ErrorBlock:
     kind: ErrorKind
 
 
-Block: TypeAlias = TextBlock | ItemListBlock | ErrorBlock
+@dataclass(frozen=True, slots=True)
+class Choice:
+    """One tappable answer. `token` is what identifies it when it comes back.
+
+    The label is what a person reads and the token is what the surface sends; they are
+    separate because the label is model-written text of arbitrary length and script,
+    while the token has to survive a 64-byte callback payload.
+    """
+
+    label: str
+    token: str
+
+
+@dataclass(frozen=True, slots=True)
+class QuestionBlock:
+    """A question back to the person, with the answers they may tap.
+
+    Structure, not markup: one surface renders these as an inline keyboard, another as
+    chips, and a third -- one that cannot render buttons at all -- as a numbered list.
+    That last case is why the labels travel as text rather than as ids alone.
+    """
+
+    question: str
+    choices: tuple[Choice, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalBlock:
+    """Something the assistant is offering to do, which it will not do unless told.
+
+    `preview` is the **exact text that will be written**, never a summary of it. If a
+    scraped caption talked the model into proposing something, this is where the person
+    sees the real words and taps No.
+    """
+
+    preview: str
+    accept_token: str
+    #: What the tap will do, for the surface to word the buttons with. Values match
+    #: `chat_engine.proposals.Action`; the engine deliberately does not import that enum
+    #: here, so this type stays free of the store's dependencies.
+    action: str = "note"
+
+
+Block: TypeAlias = TextBlock | ItemListBlock | ErrorBlock | QuestionBlock | ProposalBlock
 
 
 @dataclass(frozen=True, slots=True)
@@ -149,6 +192,23 @@ class ItemsEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class QuestionEvent:
+    """The streaming counterpart of `QuestionBlock`. Emitted whole, like a listing."""
+
+    question: str
+    choices: tuple[Choice, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class ProposalEvent:
+    """The streaming counterpart of `ProposalBlock`."""
+
+    preview: str
+    accept_token: str
+    action: str = "note"
+
+
+@dataclass(frozen=True, slots=True)
 class StreamEnd:
     """The terminal event. Always sent, including after a failure.
 
@@ -163,4 +223,6 @@ class StreamEnd:
     error: ErrorKind | None = None
 
 
-StreamEvent: TypeAlias = Delta | StatusEvent | ItemsEvent | StreamEnd
+StreamEvent: TypeAlias = (
+    Delta | StatusEvent | ItemsEvent | QuestionEvent | ProposalEvent | StreamEnd
+)

@@ -62,22 +62,23 @@ class OpenAIProvider(AIProvider):
         prompt = (
             "Summarize the following content in 2-3 concise sentences. "
             "Be factual and neutral. "
-            # Without this the summary comes back in English whatever the note was
-            # written in, so a Bengali voice note gets an English card and the person
-            # who recorded it reads their own memory in translation.
-            "Write the summary in the SAME LANGUAGE as the content."
-            "\n\nCONTENT:\n" + text[:12000]
+            # `ENRICHMENT_LANGUAGE` decides this, and the rule is written once in
+            # `prompts.py` -- a sentence copied into both providers is one that only
+            # gets corrected in whichever file someone opened.
+            + prompts.language_rule("the summary")
+            + "\n\nCONTENT:\n" + text[:12000]
         )
         return await self._generate(prompt)
 
     async def generate_tags(self, text: str) -> list[str]:
         prompt = (
             "Extract 3-7 short topical tags from this content. "
-            # Tags are shown on the person's own card and typed into their own search
-            # box, so they belong in the language they wrote in. The cost is a split tag
-            # space -- "jobs" and "চাকরি" never match -- which is real but is the same
-            # split their notes already have.
-            "Use the SAME LANGUAGE as the content. "
+            # Tags are shown on a card and typed into a search box, so their language is
+            # the one thing that decides whether one search finds the whole vault: under
+            # "content" the tag space splits ("jobs" and "চাকরি" never match), and under
+            # a pinned language it does not.
+            + prompts.language_rule("them")
+            + " "
             'Respond ONLY with a JSON array of lowercase strings, e.g. ["ai","startups"].'
             "\n\nCONTENT:\n" + text[:12000]
         )

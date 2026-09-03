@@ -79,3 +79,75 @@ def test_the_question_is_bounded() -> None:
     except pydantic.ValidationError:
         return
     raise AssertionError("an unbounded question was accepted")
+
+
+# --- the two events a tap needs -------------------------------------------------------
+
+
+def test_a_question_frames_its_options_with_their_tokens() -> None:
+    """The client renders chips; a tapped chip posts its own label as the next question.
+
+    Both halves travel: the label because it is what a person reads, the token because
+    it is what identifies the choice when it comes back.
+    """
+    from app.services.chat_engine.types import Choice, QuestionEvent
+
+    name, payload = _parse(
+        _frame(
+            QuestionEvent(
+                question="Which one did you mean?",
+                choices=(
+                    Choice(label="the docker talk", token="t1"),
+                    Choice(label="the reel", token="t2"),
+                ),
+            )
+        )
+    )
+
+    assert name == "question"
+    assert payload["question"] == "Which one did you mean?"
+    assert payload["options"] == [
+        {"label": "the docker talk", "token": "t1"},
+        {"label": "the reel", "token": "t2"},
+    ]
+
+
+def test_a_proposal_frames_the_exact_text_that_would_be_written() -> None:
+    """Never a summary of it: this is where a person reads what a caption talked the
+    model into proposing, and declines."""
+    from app.services.chat_engine.types import ProposalEvent
+
+    name, payload = _parse(
+        _frame(
+            ProposalEvent(
+                preview="call the landlord about the leak",
+                accept_token="tok",
+                action="note",
+            )
+        )
+    )
+
+    assert name == "proposal"
+    assert payload == {
+        "token": "tok",
+        "action": "note",
+        "preview": "call the landlord about the leak",
+    }
+
+
+def test_the_confirm_routes_do_not_name_their_parameter_token() -> None:
+    """`get_current_user` already takes a `token`, from a cookie, with a default.
+
+    FastAPI resolves path-parameter names across the whole dependency tree, so a path
+    parameter called `token` collides with it -- and a path parameter may not have a
+    default. Same trap as `/spaces/invites/{invite_token}/accept`, and the reason it is
+    pinned here is that the failure is at import time on a route nobody has hit yet.
+    """
+    import inspect
+
+    from app.api.v1.chat import accept_proposal, decline_proposal
+
+    for route in (accept_proposal, decline_proposal):
+        names = set(inspect.signature(route).parameters)
+        assert "proposal_token" in names
+        assert "token" not in names

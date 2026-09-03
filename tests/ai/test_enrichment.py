@@ -83,12 +83,25 @@ def test_the_schema_pins_the_category_to_the_enum() -> None:
     assert enrichment._SCHEMA["additionalProperties"] is False
 
 
-def test_every_per_field_language_rule_survived_the_move() -> None:
+def test_every_per_field_language_rule_survived_the_move(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     """A rule dropped while merging four prompts into one is a regression that nothing
     reports: the output still looks like a summary, just in the wrong language."""
-    text = enrichment._INSTRUCTIONS
+    monkeypatch.setattr(settings, "ENRICHMENT_LANGUAGE", "content")
+    text = enrichment._instructions()
     assert text.count("SAME LANGUAGE") == 3  # summary, tags, label
     assert "ALWAYS the English word" in text  # and the category, which must not be
+
+
+def test_the_category_rule_ignores_the_configured_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`ENRICHMENT_LANGUAGE` reaches three fields. The fourth is an enum written into
+    the schema, so a translated value is not a translated card -- it is "Other"."""
+    for configured in ("en", "bn", "content"):
+        monkeypatch.setattr(settings, "ENRICHMENT_LANGUAGE", configured)
+        assert "ALWAYS the English word" in enrichment._instructions()
 
 
 # --- values still reach a column, so they are still re-derived -------------------------------

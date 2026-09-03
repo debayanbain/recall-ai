@@ -47,6 +47,7 @@ from app.services.chat_engine import scope, status
 from app.services.chat_engine.router import Intent, route
 from app.services.chat_engine.status import SaveStatusReader
 from app.services.chat_engine.types import (
+    Block,
     Delta,
     ErrorBlock,
     ErrorKind,
@@ -54,6 +55,10 @@ from app.services.chat_engine.types import (
     ItemListBlock,
     ItemsEvent,
     OutboundReply,
+    ProposalBlock,
+    ProposalEvent,
+    QuestionBlock,
+    QuestionEvent,
     StreamEnd,
     StreamEvent,
     TextBlock,
@@ -73,6 +78,24 @@ _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 def first_url(text: str | None) -> str | None:
     match = _URL_RE.search(text or "")
     return match.group(0) if match else None
+
+
+def session_id_for(user_id: uuid.UUID, msg: InboundMessage) -> str:
+    """The conversation key: this account, in this chat -- never the chat alone.
+
+    Short-term chat history is stored under this key and fed back into the next prompt, so
+    it carries the titles and summaries the assistant has already spoken aloud. A key made
+    only of the external chat id would survive a change of account on that chat: the same
+    messaging identity, unlinked from one RecallAI account and linked to another, would
+    open its first conversation prefilled with the previous account's memories. Binding
+    the user id into the key makes that impossible by construction rather than by
+    remembering to clear something on disconnect.
+
+    Module-level rather than a method because a caller outside the engine now needs the
+    same key -- the shadow run has to read the same conversation the real turn read -- and
+    two ways of spelling one key is one of them being wrong later.
+    """
+    return f"{user_id}:{msg.external_chat_id}"
 
 
 def classify(msg: InboundMessage) -> Intent:
@@ -99,7 +122,24 @@ class RecallLanes(Protocol):
         self, user_id: uuid.UUID, question: str, session_id: str
     ) -> RecallAnswer: ...
 
-    async def chat(self, message: str, session_id: str) -> RecallAnswer: ...
+
+class AgentLane(Protocol):
+    """The lane that chooses its own steps.
+
+    A third Protocol rather than two more methods on `RecallLanes`, and detected with
+    `hasattr` for exactly the reason `StreamingLanes` is: these Protocols are structural,
+    so widening one breaks every fake in the suite at runtime instead of at type-check
+    time -- and a deployment running with the agent switched off must not be made to care
+    that another one has it.
+    """
+
+    async def agent(
+        self, user_id: uuid.UUID, question: str, session_id: str
+    ) -> RecallAnswer: ...
+
+    def stream_agent(
+        self, user_id: uuid.UUID, question: str, session_id: str
+    ) -> AsyncIterator[StreamEvent]: ...
 
 
 class StreamingLanes(Protocol):
@@ -114,8 +154,6 @@ class StreamingLanes(Protocol):
     def stream(
         self, user_id: uuid.UUID, question: str, session_id: str
     ) -> AsyncIterator[StreamEvent]: ...
-
-    def stream_chat(self, message: str, session_id: str) -> AsyncIterator[StreamEvent]: ...
 
 
 class ChatEngine:
@@ -142,17 +180,8 @@ class ChatEngine:
         self.saves = saves
 
     def _session_id(self, msg: InboundMessage) -> str:
-        """The conversation key: this account, in this chat -- never the chat alone.
-
-        Short-term chat history is stored under this key and fed back into the next
-        prompt, so it carries the titles and summaries the assistant has already spoken
-        aloud. A key made only of the external chat id would survive a change of account
-        on that chat: the same messaging identity, unlinked from one RecallAI account and
-        linked to another, would open its first conversation prefilled with the previous
-        account's memories. Binding the user id into the key makes that impossible by
-        construction rather than by remembering to clear something on disconnect.
-        """
-        return f"{self.user_id}:{msg.external_chat_id}"
+        """This turn's conversation key. See `session_id_for`."""
+        return session_id_for(self.user_id, msg)
 
     async def handle(self, msg: InboundMessage) -> OutboundReply:
         """Route one message and return what to say. Never writes anything."""
@@ -184,49 +213,35 @@ class ChatEngine:
             log.info("chat_engine_no_chat_model", surface=msg.surface)
             return OutboundReply([ErrorBlock(ErrorKind.chat_unavailable)])
 
-        if intent is Intent.RECALL or intent is Intent.STATUS:
-            # STATUS reaches here only with no vault reader wired up. Retrieval is the
-            # safe degradation: it answers from the vault or says it found nothing.
-            if intent is Intent.STATUS:
-                log.warning("chat_engine_status_reader_missing", surface=msg.surface)
-            return _to_reply(await self.recall.answer(self.user_id, text, session_id))
-
-        if intent is Intent.CHAT:
-            # Checked only for CHAT: a CAPTURE is already being saved, a COMMAND is the
-            # caller's own, RECALL has been recognised as a question about the vault,
-            # and META is this assistant being asked about itself -- in scope by
-            # definition. So nothing here can intercept a message that was going to
-            # become a memory or a search.
-            #
-            # The lane is closed by default: `scope.check` allows a recognised social,
-            # self-referential or domain message and refuses everything else. The
-            # reason is logged because it is the one number worth watching -- a rise in
-            # `no_domain_signal` is either an attack surface or a gate that has become
-            # too tight, and the two are told apart by reading the messages.
-            verdict = scope.check(text)
-            if not verdict.allowed:
-                log.info(
-                    "chat_engine_out_of_scope",
-                    surface=msg.surface,
-                    reason=verdict.reason,
-                )
-                return OutboundReply([TextBlock(text=scope.DECLINE)])
+        # Every lane below this point answers from the vault. There is no lane without
+        # vault access any more: the conversation lane was deleted because a prompt that
+        # carries a capability card and a snapshot of the newest saves can answer "what
+        # are you?" *and* "what did I save?", while the old split guaranteed that one of
+        # the two questions reached a model that could not see the answer.
+        if intent is Intent.STATUS:
+            # Reached only with no vault reader wired up. Retrieval is the safe
+            # degradation: it answers from the vault or says it found nothing.
+            log.warning("chat_engine_status_reader_missing", surface=msg.surface)
 
         if intent is Intent.COMMAND or intent is Intent.CAPTURE:
             # The caller claims these through `classify` before it gets here, so what
             # reaches this point is the remainder: a command the caller has no handler
-            # for, `/froobulate`. Answered conversationally rather than raised -- this
-            # runs behind a webhook that redelivers on any non-2xx, so an exception is an
-            # infinite retry loop over a message we could have replied to. Nothing is
-            # lost either way: nothing here can save anything.
+            # for, `/froobulate`. Answered rather than raised -- this runs behind a
+            # webhook that redelivers on any non-2xx, so an exception is an infinite
+            # retry loop over a message we could have replied to. Nothing is lost either
+            # way: nothing here can save anything.
             log.warning(
                 "chat_engine_unexpected_intent",
                 intent=intent.value,
                 surface=msg.surface,
             )
 
-        return _to_reply(await self.recall.chat(text, session_id))
+        _log_scope(text, msg.surface)
 
+        if _has_agent(self.recall):
+            agent = cast("AgentLane", self.recall)
+            return _to_reply(await agent.agent(self.user_id, text, session_id))
+        return _to_reply(await self.recall.answer(self.user_id, text, session_id))
 
     async def stream(self, msg: InboundMessage) -> AsyncIterator[StreamEvent]:
         """The same routing, emitting events instead of one finished reply.
@@ -264,15 +279,7 @@ class ChatEngine:
             yield StreamEnd(error=ErrorKind.chat_unavailable)
             return
 
-        if intent is Intent.CHAT:
-            verdict = scope.check(text)
-            if not verdict.allowed:
-                log.info(
-                    "chat_engine_out_of_scope", surface=msg.surface, reason=verdict.reason
-                )
-                yield Delta(text=scope.DECLINE)
-                yield StreamEnd()
-                return
+        _log_scope(text, msg.surface)
 
         streaming = cast("StreamingLanes | None", self.recall) if _streams(self.recall) else None
         if streaming is None:
@@ -282,13 +289,38 @@ class ChatEngine:
                 yield event
             return
 
-        source = (
-            streaming.stream(self.user_id, text, session_id)
-            if intent is Intent.RECALL or intent is Intent.STATUS
-            else streaming.stream_chat(text, session_id)
-        )
+        if _has_agent(self.recall):
+            source: AsyncIterator[StreamEvent] = cast(
+                "AgentLane", self.recall
+            ).stream_agent(self.user_id, text, session_id)
+        else:
+            source = streaming.stream(self.user_id, text, session_id)
         async for event in source:
             yield event
+
+
+def _log_scope(text: str, surface: str) -> None:
+    """Compute the old gate's verdict and record it. It decides nothing.
+
+    Added 2026-09-03. **Delete this, `scope.py` and its tests after two weeks of
+    comparison** -- around 2026-09-17.
+
+    The gate was a closed allowlist in front of a lane with no vault access, and it
+    declined real questions about the vault because they matched no pattern ("give me the
+    list of my last saved"). Nothing routes through it any more. It is still evaluated for
+    one release so the two systems can be compared on real traffic: `scope_verdict` next
+    to `agent_turn` says what the old system would have refused, and reading those
+    messages is the only way to tell a gate that was too tight from an attack surface that
+    is now open.
+    """
+    verdict = scope.check(text)
+    if not verdict.allowed:
+        log.info("scope_verdict", surface=surface, reason=verdict.reason, blocked=False)
+
+
+def _has_agent(lanes: RecallLanes) -> bool:
+    """Whether these lanes can run the agent. A capability check, not an isinstance."""
+    return hasattr(lanes, "agent") and hasattr(lanes, "stream_agent")
 
 
 def _streams(lanes: RecallLanes) -> bool:
@@ -298,7 +330,7 @@ def _streams(lanes: RecallLanes) -> bool:
     thing being asked is exactly what structural typing means -- does this object have
     the two methods.
     """
-    return hasattr(lanes, "stream") and hasattr(lanes, "stream_chat")
+    return hasattr(lanes, "stream")
 
 
 def _as_events(reply: OutboundReply) -> list[StreamEvent]:
@@ -310,6 +342,18 @@ def _as_events(reply: OutboundReply) -> list[StreamEvent]:
             events.append(Delta(text=block.text))
         elif isinstance(block, ItemListBlock):
             events.append(ItemsEvent(items=block.items, total=block.total))
+        elif isinstance(block, QuestionBlock):
+            events.append(
+                QuestionEvent(question=block.question, choices=block.choices)
+            )
+        elif isinstance(block, ProposalBlock):
+            events.append(
+                ProposalEvent(
+                    preview=block.preview,
+                    accept_token=block.accept_token,
+                    action=block.action,
+                )
+            )
         else:
             error = block.kind
     events.append(StreamEnd(error=error))
@@ -322,4 +366,13 @@ def _to_reply(answer: RecallAnswer) -> OutboundReply:
         return OutboundReply([ErrorBlock(ErrorKind.provider_failure)])
     if answer.items:
         return OutboundReply([ItemListBlock(items=list(answer.items), total=answer.total)])
-    return OutboundReply([TextBlock(text=answer.text or "")])
+    blocks: list[Block] = []
+    if answer.text:
+        blocks.append(TextBlock(text=answer.text))
+    # After the prose, because the card is what the words are about: a surface renders
+    # them in order, and a confirmation sitting above its own explanation reads backwards.
+    if answer.proposal is not None:
+        blocks.append(answer.proposal)
+    elif answer.question is not None:
+        blocks.append(answer.question)
+    return OutboundReply(blocks or [TextBlock(text="")])

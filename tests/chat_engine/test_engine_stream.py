@@ -14,7 +14,6 @@ from typing import Any
 
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine import scope
 from app.services.chat_engine.engine import ChatEngine
 from app.services.chat_engine.types import (
     Delta,
@@ -62,9 +61,7 @@ class BlockingLanes:
         self.answered.append(q)
         return self._reply
 
-    async def chat(self, message: str, s: str) -> RecallAnswer:
-        self.chatted.append(message)
-        return self._reply
+
 
 
 class StreamingLanes(BlockingLanes):
@@ -72,6 +69,8 @@ class StreamingLanes(BlockingLanes):
         super().__init__()
         self.chunks = chunks or ["one ", "two ", "three"]
         self.streamed: list[str] = []
+        #: Permanently empty. There is no second streamed lane any more, and that is what
+        #: the assertions using it are claiming.
         self.stream_chatted: list[str] = []
 
     async def stream(
@@ -82,10 +81,7 @@ class StreamingLanes(BlockingLanes):
             yield Delta(text=chunk)
         yield StreamEnd(memory_ids=("aa11bb22",))
 
-    async def stream_chat(self, message: str, session_id: str) -> AsyncIterator[StreamEvent]:
-        self.stream_chatted.append(message)
-        yield Delta(text="hello back")
-        yield StreamEnd()
+
 
 
 class Saves:
@@ -111,11 +107,13 @@ async def test_a_vault_question_streams_from_the_retrieval_lane() -> None:
     assert isinstance(events[-1], StreamEnd)
 
 
-async def test_small_talk_streams_from_the_conversation_lane() -> None:
+async def test_small_talk_streams_from_the_one_remaining_lane() -> None:
+    """Every message that misses the fast-paths takes the same lane now."""
     lanes = StreamingLanes()
     _events, text = await _drain(ChatEngine(lanes, _USER), _msg("Hii"))
-    assert lanes.stream_chatted == ["Hii"]
-    assert text == "hello back"
+    assert lanes.streamed == ["Hii"]
+    assert lanes.stream_chatted == []
+    assert text == "one two three"
 
 
 async def test_a_status_question_calls_no_model_and_ends_immediately() -> None:
@@ -129,12 +127,19 @@ async def test_a_status_question_calls_no_model_and_ends_immediately() -> None:
     assert isinstance(events[-1], StreamEnd)
 
 
-async def test_an_out_of_scope_message_is_declined_before_any_model() -> None:
+async def test_an_out_of_scope_message_goes_to_retrieval_not_the_chat_lane() -> None:
+    """The scope gate is no longer what stands between this message and an answer.
+
+    It never sees the message at all now: the router sends anything it does not recognise
+    to retrieval, and the gate is only consulted for the CHAT lane, which is reached by
+    greetings and empty messages. Retrieval is the safe destination -- it answers from the
+    vault or says it found nothing, and it cannot answer a Python question in this
+    assistant's own voice because its prompt may only speak from the blocks it was given.
+    """
     lanes = StreamingLanes()
-    _events, text = await _drain(
-        ChatEngine(lanes, _USER), _msg("write me a python function")
-    )
-    assert text == scope.DECLINE
+    await _drain(ChatEngine(lanes, _USER), _msg("write me a python function"))
+
+    assert lanes.streamed == ["write me a python function"]
     assert lanes.stream_chatted == []
 
 

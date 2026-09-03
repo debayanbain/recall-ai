@@ -1,6 +1,7 @@
 .PHONY: install migrate revision dev dev-tunnel tunnel worker flower beat api openapi lint typecheck test check \
 	redis redis-down redis-logs redis-stats autoscale workers workers-down \
-	telegram-webhook telegram-webhook-info telegram-webhook-delete
+	telegram-webhook telegram-webhook-info telegram-webhook-delete \
+	reenrich reenrich-apply
 
 install:            ## sync deps incl. dev extras
 	uv sync --extra dev
@@ -178,6 +179,15 @@ telegram-webhook-info:   ## what Telegram currently thinks, incl. its last error
 
 telegram-webhook-delete: ## stop delivery
 	uv run python scripts/telegram_webhook.py delete
+
+# Changing ENRICHMENT_LANGUAGE does not touch a card that already exists -- `reprocess`
+# refuses a completed item, and rightly. This is the backfill, and it spends a model call
+# per item, so the bare target is a dry run and writing is a second, explicit word.
+reenrich:           ## dry run: which cards are in the wrong language
+	uv run python scripts/reenrich_language.py
+
+reenrich-apply:     ## rewrite them (costs one enrichment + one embedding per item)
+	uv run python scripts/reenrich_language.py --apply
 
 lint:
 	uv run ruff check app tests

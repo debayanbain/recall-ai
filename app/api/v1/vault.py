@@ -5,9 +5,11 @@ import uuid
 from typing import Annotated
 
 from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, status
+from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import CurrentUser, VaultServiceDep
+from app.api.deps import CurrentUser, SessionDep, VaultServiceDep
 from app.core.config import settings
+from app.models.vault import VaultItem
 from app.schemas.vault import (
     CreateNoteRequest,
     FileLinkResponse,
@@ -28,10 +30,30 @@ from app.services.transcription import (
     max_voice_bytes,
     parse_waveform,
 )
-from app.services.vault_service import ItemNotFound, ReprocessError
+from app.services.vault_service import ItemNotFound, ReprocessError, VaultService
 from app.storage import StorageError
 
 router = APIRouter(prefix="/vault", tags=["vault"])
+
+
+async def _commit_then_enqueue(
+    session: AsyncSession, service: VaultService, item: VaultItem
+) -> None:
+    """Make the row visible, then tell the worker about it. In that order.
+
+    Enqueuing first is a real race and it was this API's oldest known rough edge: the
+    worker runs in its own transaction, so a fast one can dequeue before the row is
+    committed, find nothing, log `process_missing_item` and stop -- leaving an item at
+    `pending` that the UI polls forever. The window is small and the failure is silent,
+    which is the combination that keeps it unnoticed.
+
+    The request boundary would commit this anyway; committing here is what puts it
+    *before* the hand-off. The bot has always done it this way (`enqueue=False`, commit,
+    enqueue) precisely because there the symptom is worse -- the completion reply never
+    fires and the user watches an acknowledgement that never resolves.
+    """
+    await session.commit()
+    await service.enqueue(item)
 
 
 @router.post("/save", response_model=VaultItemRead, status_code=status.HTTP_201_CREATED)
@@ -39,6 +61,7 @@ async def save_url(
     body: SaveUrlRequest,
     user: CurrentUser,
     service: VaultServiceDep,
+    session: SessionDep,
     response: Response,
 ) -> VaultItemRead:
     """Save a URL. Returns immediately; AI runs async in the worker.
@@ -46,17 +69,27 @@ async def save_url(
     Answers 200 instead of 201 when the link is already in the vault, so the client can
     say "already saved" rather than implying a second copy was created.
     """
-    item, created = await service.save_url(user.id, str(body.url), body.title)
+    item, created = await service.save_url(
+        user.id, str(body.url), body.title, enqueue=False
+    )
     if not created:
         response.status_code = status.HTTP_200_OK
+        return VaultItemRead.model_validate(item)
+    await _commit_then_enqueue(session, service, item)
     return VaultItemRead.model_validate(item)
 
 
 @router.post("/note", response_model=VaultItemRead, status_code=status.HTTP_201_CREATED)
 async def save_note(
-    body: CreateNoteRequest, user: CurrentUser, service: VaultServiceDep
+    body: CreateNoteRequest,
+    user: CurrentUser,
+    service: VaultServiceDep,
+    session: SessionDep,
 ) -> VaultItemRead:
-    item = await service.create_note(user.id, body.title, body.content)
+    item = await service.create_note(
+        user.id, body.title, body.content, enqueue=False
+    )
+    await _commit_then_enqueue(session, service, item)
     return VaultItemRead.model_validate(item)
 
 
@@ -64,6 +97,7 @@ async def save_note(
 async def upload_document(
     user: CurrentUser,
     service: VaultServiceDep,
+    session: SessionDep,
     file: Annotated[UploadFile, File()],
 ) -> VaultItemRead:
     """Store an uploaded document in the bucket; index its text when it has any.
@@ -81,12 +115,13 @@ async def upload_document(
             f"Files must be under {limit // 1_048_576}MB.",
         )
     try:
-        item = await service.save_document(user.id, data, file.filename)
+        item = await service.save_document(user.id, data, file.filename, enqueue=False)
     except DocumentError as exc:
         # These messages are written for humans and quote nothing from the file itself.
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
     except StorageError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
+    await _commit_then_enqueue(session, service, item)
     return VaultItemRead.model_validate(item)
 
 
@@ -94,6 +129,7 @@ async def upload_document(
 async def save_voice_note(
     user: CurrentUser,
     service: VaultServiceDep,
+    session: SessionDep,
     audio: Annotated[UploadFile, File()],
     title: Annotated[str | None, Form()] = None,
     peaks: Annotated[str | None, Form()] = None,
@@ -146,6 +182,7 @@ async def save_voice_note(
             # Sanity-bounded rather than trusted: this only labels the player's scrubber,
             # and a negative or absurd value would render as a broken control.
             duration=duration if duration and 0 < duration < 86_400 else None,
+            enqueue=False,
         )
     except TranscriptionUnavailable:
         # A deployment fact, not the caller's mistake, and worded so nobody re-records.
@@ -160,6 +197,7 @@ async def save_voice_note(
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
     except StorageError as exc:
         raise HTTPException(status.HTTP_502_BAD_GATEWAY, str(exc)) from None
+    await _commit_then_enqueue(session, service, item)
     return VaultItemRead.model_validate(item)
 
 

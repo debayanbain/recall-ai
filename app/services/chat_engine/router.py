@@ -29,7 +29,9 @@ Order is the whole design, and it is checked top to bottom:
    answered from the database with no model call at all (`status.py`). It is checked
    *before* recall because "did i save it" carries a retrieval phrase and is not a
    retrieval question -- there is no subject to search for, only an outcome to report.
-7. **Retrieval phrasing is recall**, and everything else is chat.
+7. **Everything left is recall.** Retrieval phrasing matches explicitly; anything that
+   matched nothing above falls here too, because the alternative -- a lane with no access
+   to the vault -- can only deflect a question about the vault.
 
 `RECALL` is matched on phrases, never on a trailing `?`. A question mark is the single
 most common character in ordinary conversation with an assistant -- "what is the capital
@@ -46,6 +48,8 @@ from __future__ import annotations
 
 import re
 from enum import StrEnum
+
+from app.services.chat_engine import scope
 
 
 class Intent(StrEnum):
@@ -80,6 +84,14 @@ _RECALL_PATTERNS = (
     r"\bdid i\b",
     r"\bhave i\b",
     r"\bshow me\b",
+    # "list my last saved", "show my notes", "give me the last three". Added as a
+    # courtesy rather than for correctness -- the fallback below is RECALL now, so these
+    # would land there anyway. They keep the router's own tests readable: a phrase that
+    # is obviously retrieval should match a retrieval pattern rather than arrive by
+    # default, or the test says nothing about why it works.
+    r"\blist\b",
+    r"\bgive me\b",
+    r"^show\b",
     r"\bfind\b",
     # "search X" and "look up X" are retrieval verbs. Routed here rather than left to
     # the conversation lane on purpose: retrieval answers an unknown subject with "I
@@ -209,7 +221,23 @@ def route(
     if _RECALL_RE.search(lowered) or _asks_for_a_kind(lowered):
         return Intent.RECALL
 
-    return Intent.CHAT
+    # A greeting is not a search. Everything else unmatched is, but answering "hi" with
+    # "I could not find anything about hi in your vault" is a worse bot than the one this
+    # change exists to fix. `scope.is_social` is an allowlist of a handful of shapes, not
+    # the closed gate that caused the original bug -- what it does not recognise falls
+    # straight through to retrieval below.
+    if scope.is_social(stripped):
+        return Intent.CHAT
+
+    # Unmatched text is a question about the vault, not small talk. This used to be CHAT,
+    # which is the lane with no vault access, sitting behind a closed scope gate -- so a
+    # phrasing nobody had thought of ("give me the list of my last saved") was answered
+    # with a canned deflection about a vault the lane could not see. Retrieval is the
+    # honest default: it answers from the person's own memories, and when it has nothing
+    # it says it found nothing, which is both true and what someone asking about their
+    # vault wanted to hear. General knowledge lands there too and gets the same sentence,
+    # which is the outcome the scope gate existed to produce.
+    return Intent.RECALL
 
 
 def wants_detail(text: str | None) -> bool:

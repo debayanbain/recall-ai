@@ -14,6 +14,7 @@ import pytest
 
 from app.ai.chat.planner import looks_like_question
 from app.core import scripts
+from app.core.config import settings
 from app.services.chat_engine import scope
 
 # Measured, not invented -- see the constant's docstring. Greetings sit at 2-5 letters in
@@ -122,12 +123,15 @@ def test_short_general_knowledge_goes_to_retrieval_not_the_model() -> None:
 def test_both_lanes_are_told_to_answer_in_the_users_language() -> None:
     """Nothing detects the reply language; the only lever is the instruction itself."""
     from app.ai.chat import chain
+    from app.ai.chat.harness.prompts import AGENT_SYSTEM
 
     assert "language the person asked in" in chain._SYSTEM
-    assert "language the person wrote in" in chain._CONVERSE_SYSTEM
+    # The conversation lane it used to check is gone -- there is no lane without vault
+    # access any more -- so the second prompt to hold this rule is the agent's own.
+    assert "language the person wrote in" in AGENT_SYSTEM
     # A declined request must be declined in the language it was asked in, or the refusal
     # is itself unreadable to the person who triggered it.
-    assert "decline in the language it was asked in" in chain._CONVERSE_SYSTEM
+    assert "Decline in that language too" in AGENT_SYSTEM
 
 
 # --- the reply nobody translates ------------------------------------------------------
@@ -177,21 +181,68 @@ def test_an_unlisted_script_falls_back_to_english() -> None:
 # --- the enrichment prompts -----------------------------------------------------------
 
 
-def test_every_provider_asks_for_the_content_language() -> None:
-    """A Bengali note whose summary and tags come back in English is a card its own
-    author reads in translation."""
+def test_every_provider_states_an_output_language(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Whichever way `ENRICHMENT_LANGUAGE` is set, all four prompts must say so.
+
+    The rule is one function now, so the failure this catches is no longer "someone
+    edited one provider" -- it is a provider whose prompt stopped calling it at all, and
+    whose output language then becomes whatever the model felt like.
+    """
     import inspect as _inspect
 
     from app.ai import gemini, openai
-    from app.ai.prompts import label_prompt
 
     for module in (gemini, openai):
-        # Twice: the summary and the tags. Both prompts are written out per provider,
-        # so a rule added to one and not the other is the failure this catches.
+        # Twice: the summary and the tags.
         body = _inspect.getsource(module)
-        assert body.count("SAME LANGUAGE as the content") == 2, module.__name__
+        assert body.count("prompts.language_rule(") == 2, module.__name__
 
+
+def test_content_language_is_still_reachable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The older behaviour is a setting, not a deleted branch: for a person whose notes
+    are not in English, a card in their own words is the right card."""
+    from app.ai import enrichment
+    from app.ai.prompts import label_prompt, language_rule
+
+    monkeypatch.setattr(settings, "ENRICHMENT_LANGUAGE", "content")
+    assert language_rule() == "Write it in the SAME LANGUAGE as the content."
     assert "SAME LANGUAGE as the content" in label_prompt("x")
+    assert enrichment._instructions().count("SAME LANGUAGE as the content") == 3
+
+
+def test_a_pinned_language_names_it_and_never_echoes_the_code(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """What reaches the prompt is the *name* the closed list maps the code to.
+
+    Interpolating the configured string itself would make an environment variable the
+    author of a sentence in a system prompt.
+    """
+    from app.ai.prompts import language_rule
+
+    monkeypatch.setattr(settings, "ENRICHMENT_LANGUAGE", "en")
+    assert language_rule() == (
+        "Write it in English, whatever language the content is in — translate if the "
+        "content is in another language."
+    )
+    monkeypatch.setattr(settings, "ENRICHMENT_LANGUAGE", "bn")
+    assert "Bengali" in language_rule()
+    assert "bn" not in language_rule().split()
+
+
+def test_an_unknown_enrichment_language_is_refused_at_boot() -> None:
+    """Resolving it to a default would be silent: cards in the wrong language, with
+    nothing anywhere saying which setting caused it."""
+    from app.core.config import Settings, validate_deployment_config
+
+    bad = Settings(ENRICHMENT_LANGUAGE="klingon")
+    with pytest.raises(RuntimeError, match="ENRICHMENT_LANGUAGE"):
+        validate_deployment_config(bad)
+
+    validate_deployment_config(Settings(ENRICHMENT_LANGUAGE="content"))
+    validate_deployment_config(Settings(ENRICHMENT_LANGUAGE="bn"))
 
 
 def test_the_category_stays_english() -> None:

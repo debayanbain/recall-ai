@@ -24,6 +24,8 @@ from app.services.chat_engine.types import (
     ErrorKind,
     ItemListBlock,
     OutboundReply,
+    ProposalBlock,
+    QuestionBlock,
     TextBlock,
 )
 from app.services.telegram import formatting
@@ -48,9 +50,33 @@ def render_block(block: Block) -> str:
         return formatting.recent(block.items, block.total)
     if isinstance(block, ErrorBlock):
         return _render_error(block.kind)
+    if isinstance(block, QuestionBlock):
+        return formatting.question(block.question)
+    if isinstance(block, ProposalBlock):
+        return formatting.proposal(block.preview, block.action)
     # Exhaustive: a new Block type fails type-checking here rather than rendering as
     # silence at runtime.
     assert_never(block)
+
+
+def render_markup(reply: OutboundReply) -> dict[str, object] | None:
+    """The buttons for this reply, if it has any. Separate from the text on purpose.
+
+    `render` returns a string because that is what a message body is; a keyboard is a
+    different field of the same API call. Returning them together would mean either a
+    tuple every caller has to unpack or a markup-carrying string, and the second is how
+    markup starts leaking into the engine.
+
+    Only the first block with buttons is honoured: Telegram attaches one keyboard per
+    message, and a reply that wanted two of them is a reply that should have been two
+    messages.
+    """
+    for block in reply.blocks:
+        if isinstance(block, QuestionBlock) and block.choices:
+            return formatting.choice_markup(block.choices)
+        if isinstance(block, ProposalBlock):
+            return formatting.confirm_markup(block.accept_token)
+    return None
 
 
 def _render_error(kind: ErrorKind) -> str:

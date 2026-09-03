@@ -70,13 +70,19 @@ def _has_key(provider: str) -> bool:
     return False
 
 
-def build_chat_model(provider: str) -> BaseChatModel:
-    """One provider's chat model. Raises for a provider this module cannot build."""
+def build_chat_model(provider: str, model: str | None = None) -> BaseChatModel:
+    """One provider's chat model. Raises for a provider this module cannot build.
+
+    `model` overrides the provider's configured model id and nothing else -- same key,
+    same temperature, same timeouts. It exists so the agent loop can run on a different
+    model without a second copy of this construction, which is how one of the two ends up
+    with a timeout nobody meant to change.
+    """
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
         return ChatOpenAI(
-            model=settings.OPENAI_TEXT_MODEL,
+            model=model or settings.OPENAI_TEXT_MODEL,
             api_key=settings.OPENAI_API_KEY,
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
@@ -87,7 +93,7 @@ def build_chat_model(provider: str) -> BaseChatModel:
         from langchain_google_genai import ChatGoogleGenerativeAI
 
         return ChatGoogleGenerativeAI(
-            model=settings.GEMINI_TEXT_MODEL,
+            model=model or settings.GEMINI_TEXT_MODEL,
             google_api_key=settings.GEMINI_API_KEY,
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
@@ -107,6 +113,25 @@ def get_chat_model() -> BaseChatModel:
     *after* the caller has bound what it needs.
     """
     return build_chat_model(settings.AI_PROVIDER)
+
+
+@lru_cache(maxsize=1)
+def get_agent_model() -> BaseChatModel:
+    """The model that drives the agent loop. Its own setting, for its own cost shape.
+
+    The older lanes spend one model call per question; the loop spends one per round, so
+    which model runs it matters more here and is worth setting separately. Empty means
+    "the same one everything else uses", which is the right default -- a second model id
+    nobody set is a second thing to keep in step.
+
+    Bare, like `get_chat_model`, and for the same reason: `with_fallbacks` returns a
+    `RunnableWithFallbacks`, which has neither `bind_tools` nor `with_structured_output`,
+    and this lane is built on both.
+    """
+    configured = settings.AGENT_CHAT_MODEL.strip()
+    if not configured:
+        return get_chat_model()
+    return build_chat_model(settings.AI_PROVIDER, configured)
 
 
 @lru_cache(maxsize=1)

@@ -10,6 +10,8 @@ from typing import Literal
 from pydantic import Field, PostgresDsn, RedisDsn
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.core.languages import LANGUAGES, language_name
+
 # Well-known placeholder. Refused outside dev so a deploy that forgets to set SECRET_KEY
 # cannot silently sign session JWTs with a value anyone reading this file already knows.
 DEFAULT_SECRET_KEY = "change-me-in-production-use-openssl-rand-hex-32"
@@ -245,6 +247,20 @@ class Settings(BaseSettings):
     # it is capped harder than a capture.
     TELEGRAM_CAPTURES_PER_HOUR: int = 60
     TELEGRAM_RECALLS_PER_HOUR: int = 20
+    # How long a processed update_id is remembered, so a redelivery is dropped rather
+    # than answered twice. Telegram redelivers on any non-2xx and Celery redelivers a
+    # task whose worker died after the work but before the ack, so the same turn can
+    # arrive twice through two unrelated paths. A day is far longer than either window.
+    TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS: int = 86400
+    # A capture that is still working after this long gets one message saying so. The
+    # silence between "Saving…" and the finished card is the whole complaint: a crawl
+    # legitimately takes minutes, and a user with no word from the bot reads that as a
+    # failure and sends the thing again. One nudge per item, ever.
+    #
+    # **Must stay below STUCK_PROCESSING_MINUTES.** Above it the sweeper has already
+    # marked the item failed, so the nudge would promise a reply that is never coming.
+    # `validate_deployment_config` refuses to start otherwise.
+    NUDGE_AFTER_MINUTES: int = 10
 
     # --- Recall answering guard rails ---
     # A retrieved memory carries a relevance score: 1 - cosine distance, so 1.0 is
@@ -315,7 +331,22 @@ class Settings(BaseSettings):
     # allowance because they are separate costs. Zero disables it.
     ASK_PER_HOUR: int = 60
     ENRICHMENT_COMBINED: bool = True
+    # What language a card comes back in: an ISO-639-1 code from `core/languages.py`, or
+    # "content" to follow whatever the item itself is written in. Default English,
+    # because the surface reading these is English: a Bengali reel produced a Bengali
+    # summary, Bengali tags and a Bengali label sitting under an English title, and the
+    # tag space split with it ("jobs" and "চাকরি" never match, so one search finds half a
+    # vault). "content" restores the older behaviour, which is the right answer for a
+    # person whose own notes are not in English -- their memory, in their words.
+    # `ai_category` is unaffected either way: it is an enum checked against an English
+    # list, so a translated value silently becomes "Other".
+    ENRICHMENT_LANGUAGE: str = "en"
     CHAT_PROVIDER_FALLBACK: bool = True
+    # How many of the newest memories ride along in every chat prompt. Three is what a
+    # follow-up ever refers to ("it", "that", "my last one"), and it is ~150 tokens; the
+    # alternative is a tool call and a model round to learn what the application already
+    # had in hand. Zero turns the snapshot off, which is a decision rather than a gap.
+    AGENT_SNAPSHOT_ITEMS: int = 3
     RECALL_TOOLS_ENABLED: bool = True
     # Hard ceilings on that loop, because an agent loop with no ceiling is an unbounded
     # bill reachable through a text box. Rounds are model calls; calls are tool
@@ -336,6 +367,40 @@ class Settings(BaseSettings):
     # reply gets clipped mid-essay rather than delivered whole. Deliberately smaller than
     # the recall cap -- an answer here has no evidence behind it to be long about.
     CHAT_REPLY_MAX_CHARS: int = 600
+
+    # --- the agent harness ---
+    # The agent reads the message and picks what to do; the harness bounds what it is
+    # allowed to do. On: it is the answering lane. Turning it off does not turn the
+    # product off -- the single-shot planner path underneath answers the same questions,
+    # a rung further down the degradation ladder, which is where a bad release should
+    # land rather than in a deploy.
+    AGENT_ENABLED: bool = True
+    # Run the agent *after* the old lanes have already answered, log the turn, and send
+    # nothing. It costs a model call per message, which is the price of finding out what
+    # the agent would have said without any user seeing it.
+    AGENT_SHADOW: bool = False
+    # A separate, usually cheaper model for the loop. Empty means "whatever the chat
+    # model is". The loop makes several calls per turn where the old lanes made one, so
+    # the model that drives it is the one worth choosing separately.
+    AGENT_CHAT_MODEL: str = ""
+    # find -> read -> status -> propose is four calls. Six leaves room for a second look
+    # without leaving room for a loop. Past it every tool answers "budget spent" instead
+    # of running, which still returns a ToolMessage -- a tool call left unanswered is a
+    # malformed conversation and providers reject the *next* request outright.
+    AGENT_MAX_TOOL_CALLS: int = 6
+    # Model turns, not tool calls. One more than the old tool lane had.
+    AGENT_MAX_ROUNDS: int = 4
+    # The typing indicator is bounded and a person's patience is bounded; the loop has to
+    # be too. Past it the model gets one tool-free round and the turn ends with words.
+    AGENT_WALL_CLOCK_SECONDS: int = 20
+    # Memory cards from all tools in one turn. Past this, list and search truncate and
+    # say so, rather than filling the context window with a vault.
+    AGENT_MAX_CONTEXT_CARDS: int = 12
+    # How long a proposed write, or an offered answer, stays tappable. Long enough to
+    # read the confirmation and decide, short enough that a card left in a chat overnight
+    # is not a live credential. Single-use regardless, so this is the ceiling and not the
+    # expectation.
+    PROPOSAL_TTL_SECONDS: int = 600
 
     # --- Spaces ---
     # An invite is a bearer link someone pastes into a chat. Long enough to be useful
@@ -363,8 +428,10 @@ class Settings(BaseSettings):
     # selection coherent -- and a bigger bill.
     SPACE_PROPOSAL_MAX_ITEMS: int = 25
     # Per-user hourly cap on the endpoints that call a model (propose, overview, ask).
-    # The in-memory RateLimitMiddleware is per-process and per-IP, which is the wrong key
-    # for a per-account cost; this one is keyed by user id in Redis.
+    # RateLimitMiddleware is keyed by client IP, which is the wrong key for a per-account
+    # cost: it throttles a whole office behind one NAT and nobody behind a botnet. This
+    # one is keyed by user id. Both count in Redis now, so both are correct across
+    # replicas.
     SPACE_AI_CALLS_PER_HOUR: int = 40
     # Regenerating a Space overview re-reads every card in it. Cheap to ask for, not
     # cheap to serve, and nothing about the answer changes second to second.
@@ -609,6 +676,41 @@ def validate_deployment_config(config: Settings) -> None:
     if config.LOG_RETENTION_DAYS < 1:
         raise RuntimeError(
             f"LOG_RETENTION_DAYS must be >= 1 (got {config.LOG_RETENTION_DAYS})."
+        )
+
+    # Also every environment. This value is interpolated into the enrichment prompts, so
+    # an unrecognised one is not a setting that does nothing -- it is a sentence telling
+    # the model to write in a language that does not exist, on every item saved. Refused
+    # at boot rather than resolved to a default, because the failure it would otherwise
+    # produce is silent: cards in the wrong language and nothing anywhere saying why.
+    if config.ENRICHMENT_LANGUAGE != "content" and not language_name(
+        config.ENRICHMENT_LANGUAGE
+    ):
+        raise RuntimeError(
+            "ENRICHMENT_LANGUAGE must be \"content\" or one of: "
+            + ", ".join(sorted(LANGUAGES))
+            + f" (got {config.ENRICHMENT_LANGUAGE!r})."
+        )
+
+    # Every environment. The nudge exists to cover the wait before an item finishes; past
+    # STUCK_PROCESSING_MINUTES the sweeper has already given up on the row and marked it
+    # failed, so a nudge sent after that promises a reply that is never coming. The two
+    # settings are read by different tasks in different files, so nothing else would ever
+    # notice them crossing over.
+    # The agent's wall clock has to stay inside the typing indicator's own ceiling
+    # (`services/telegram/typing.MAX_SECONDS`, 120s). Past that the bot goes quiet while
+    # still working, which is the exact silence the indicator exists to prevent.
+    if not 1 <= config.AGENT_WALL_CLOCK_SECONDS <= 120:
+        raise RuntimeError(
+            "AGENT_WALL_CLOCK_SECONDS must be between 1 and 120 "
+            f"(got {config.AGENT_WALL_CLOCK_SECONDS})."
+        )
+
+    if config.NUDGE_AFTER_MINUTES >= config.STUCK_PROCESSING_MINUTES:
+        raise RuntimeError(
+            f"NUDGE_AFTER_MINUTES ({config.NUDGE_AFTER_MINUTES}) must be below "
+            f"STUCK_PROCESSING_MINUTES ({config.STUCK_PROCESSING_MINUTES}); past that "
+            "the sweeper has already failed the item."
         )
 
     # A refresh window shorter than the access token makes the access cookie outlive the

@@ -381,11 +381,12 @@ catch-all and must stay last, so new extractors get appended *before* it.
   -- was the right call only while there was no explicit way to keep a thought; with
   `/note` it just accumulates greetings the user discovers in bulk much later. The
   failure mode now is retyping something with `/note` in front, which is visible and
-  recoverable. `RecallChatService.respond` then splits chat from retrieval on
-  `planner.looks_like_question`, which costs no tokens -- and `ai/chat/chain.converse` is
-  a **separate chain** from `answer` on purpose: `answer`'s whole rule is "speak only
-  from the MEMORY blocks", which holds precisely because it is never handed an empty
-  context. `first_url` beats phrasing, so "what is this? <link>" saves rather than asks.
+  recoverable. Everything that is not a capture, a command or a status
+  question now takes **one** lane -- the agent -- because the split that used to exist
+  guaranteed one of its two halves could not see the vault. `chain.answer`'s rule is
+  still "speak only from the blocks", and it holds because that lane is never handed an
+  empty context: every prompt carries a capability card and a snapshot of the newest
+  saves. `first_url` beats phrasing, so "what is this? <link>" saves rather than asks.
 - **"Did that save?" is answered by the database, and never by the model.** The
   conversation lane is given no memories by design, so asked whether a capture succeeded
   it answered the only honest thing it could -- *"I can't check what you've saved"* --
@@ -413,8 +414,10 @@ catch-all and must stay last, so new extractors get appended *before* it.
   * **The lane survives a missing chat model.** `ChatEngine` takes `recall: RecallLanes |
     None` and answers `chat_unavailable` itself for the lanes that need a provider, so a
     deployment with no chat model still answers "is it saved?". With no vault reader
-    wired up STATUS degrades to *retrieval*, never to the conversation lane -- retrieval
-    answers from the vault or says it found nothing, which is the safe direction.
+    wired up STATUS degrades to *retrieval* -- which answers from the vault or says it
+    found nothing, and is the safe direction. (The no-vault conversation lane it used to
+    be contrasted with no longer exists; retrieval is the only lane left below the
+    agent.)
   `/status` is the same lane reachable by typing, which matters because the phrase list
   is English-first.
 - **The RECALL lane can run its own searches, and that is the only place a model chooses
@@ -605,9 +608,12 @@ catch-all and must stay last, so new extractors get appended *before* it.
   halves.** `planner.looks_like_question` matches English opening words, so "আমার নোট
   দেখাও" ("show my notes") was not a question; `scope._normalise` strips everything
   outside `[a-z0-9' ]`, so the same sentence became an empty string, which the gate read
-  as an emoji -- a *reaction* -- and allowed into the conversation lane. That lane is
-  given no memories by design. So asking about your own vault in Bengali was answered by
-  a model that had never seen it, and nothing reported a problem. Both halves now go
+  as an emoji -- a *reaction* -- and allowed into the conversation lane, which was given
+  no memories by design. So asking about your own vault in Bengali was answered by a
+  model that had never seen it, and nothing reported a problem. (Both that lane and the
+  gate are gone now; the history is kept because the *shape* of the bug -- a routing rule
+  that could not read the message deciding what the model was allowed to see -- is the
+  one this codebase keeps re-learning.) Both halves now go
   through `app/core/scripts.py`, which counts **letters outside ASCII** -- an observable
   fact, no model, no table, no network. It is not language identification and does not
   claim to be. Three consequences:
@@ -643,46 +649,59 @@ catch-all and must stay last, so new extractors get appended *before* it.
   a language is one entry, written by someone who speaks it. The subject is echoed back
   verbatim -- it is the user's own words, and translating their search term tells them
   they looked for something they did not.
-- **Enrichment follows the content's language, except the category.** Summary, tags and
-  `ai_label` are all asked for in the content's language, or a Bengali note gets an
-  English card its own author reads in translation. Tags too, accepting that the tag
-  space splits ("jobs" and "চাকরি" never match) -- which is the same split their notes
-  already have. **`ai_category` is the exception and must stay English**: the reply is
-  checked with `in _CATEGORIES`, so a model that helpfully translates it drops the item
-  into "Other". The prompt now says so outright. Highlights need no rule -- they are
-  verbatim quotes and `keep_verbatim` enforces it. The summary and tag prompts are still
-  written out inside each provider, so a rule added to one and not the other is a real
-  risk; `tests/chat_engine/test_non_latin_routing.py` counts them in both.
-- **The chat lane is a CLOSED gate, not a filter — it was a blocklist and that was a
-  bug.** `services/chat_engine/scope.py` first enumerated what to refuse (translate,
-  "what is the capital of"), and a live bot asked *"Who is sunny leone?"* matched nothing
-  and replied with a biography. Adding a `who is <person>` pattern would not have fixed
-  it: general knowledge is not a list of phrasings, it is everything. The polarity is now
-  inverted — `scope.check` **allows** only a message that is recognisably (a) *social*
-  (greeting/thanks/goodbye, matched against the whole normalised message, or a ≤6-word
-  message that *opens* with a social word and asks for nothing), (b) *self-referential*
-  ("how does this work"), or (c) *domain* (names saving, notes, links, files, the vault,
-  a content source, connecting an account) — and refuses everything else with no model
-  call. Blocked instruction shapes are checked first so a domain word cannot launder one
-  ("translate this note"). The `Verdict.reason` is logged: a rise in `no_domain_signal`
-  is either an attack surface or a gate that has gone too tight, and only reading the
-  messages tells them apart.
-  Three traps for anyone editing it. **`you`/`your` are not domain signals** — they read
-  as being about the bot until someone writes "can you tell me who X is". **The social
-  word must lead** — matching it anywhere let "recommend a good movie" through on
-  "good". **This package may not name the messaging surface** (`test_boundaries.py`), so
-  content sources are listed and the surface is not. Keep the gate narrow: a false
-  decline costs a rephrase and is visible; a false allow is a confident answer in the
-  assistant's own voice that nobody notices. `search`/`look up` were moved into the
-  router's RECALL patterns for the same reason — retrieval answers an unknown subject
-  with "I couldn't find anything about that in your vault", which is both true and what
-  the person wanted.
-- **The conversation lane's output is bounded too, and harder than recall's.**
-  `RecallChatService.chat` runs its reply through the same `validate_answer` with
-  `allowed_urls=()` and `CHAT_REPLY_MAX_CHARS` (600): this lane has *no evidence at all*
-  behind it, so every URL it emits is unsupported by construction, and a reply that has
-  run to essay length has stopped being about this product. It is the layer that still
-  holds when the prompt is talked past — a prompt is a request, a cap is not.
+- **A card's language is `ENRICHMENT_LANGUAGE`, and it defaults to English.** Summary,
+  tags and `ai_label` used to follow the content unconditionally -- the reasoning being
+  that a Bengali note summarised in English is a memory its author reads in translation.
+  That is still true, and it is still available: `ENRICHMENT_LANGUAGE=content` restores
+  it exactly. It is no longer the default, because the cost lands on the person who
+  *reads* an English vault: a Bengali reel produced a Bengali summary and Bengali tags
+  sitting under an English title, and the tag space split with it ("jobs" and "চাকরি"
+  never match, so one search finds half a vault). Five things go with the setting:
+  * **It is one sentence, written once.** `prompts.language_rule(subject)` is called by
+    the combined enrichment, by both providers' summary and tag prompts, and by
+    `label_prompt`. The four prompts each carried their own copy before, which is a rule
+    that gets corrected in whichever file someone happened to open.
+  * **The prompt never contains the configured string.** The value is a key into
+    `core/languages.py`, and what is interpolated is the *name* that list maps it to --
+    so an environment variable cannot finish a sentence in a system prompt.
+  * **An unrecognised value is refused at boot**, in every environment, rather than
+    resolved to a default. The failure it would otherwise cause is silent: every card in
+    the wrong language, with nothing anywhere naming the setting responsible.
+  * **`ai_category` is untouched by it and must stay English**: the reply is checked with
+    `in CATEGORIES` and written into the schema as an enum, so a model that helpfully
+    translates it drops the item into "Other".
+  * **Nothing re-runs old items.** A card enriched before the setting changed keeps the
+    language it was written in until something reprocesses it, and `reprocess` refuses a
+    `completed` item (voice notes excepted). Changing this setting is not a backfill.
+  Highlights need no rule -- they are verbatim quotes and `keep_verbatim` enforces it.
+  `tests/chat_engine/test_non_latin_routing.py` pins both modes and the boot guard.
+- **The chat lane is gone, and the closed gate that guarded it no longer blocks
+  anything.** Both are worth knowing because the reasoning still applies to whatever
+  replaces them. `scope.py` began as a blocklist (translate, "what is the capital of"),
+  and a live bot asked *"Who is sunny leone?"* matched nothing and replied with a
+  biography; the polarity was inverted to an allowlist, and then the allowlist declined
+  *"give me the list of my last saved"* — a real question about the vault — with the same
+  canned sentence. Both failures have one cause: **a regex decided what the model was
+  allowed to do before the model read the message.** What replaced it is the agent
+  harness (`app/ai/chat/harness/`): the model reads the message and picks its own steps,
+  and the harness bounds what those steps can be. Three things carry the weight the gate
+  used to:
+  * **The prompt states the scope** (`harness/prompts.AGENT_SYSTEM`) and asks for a
+    one-line decline with `declined_out_of_scope` set. That is the model's self-report:
+    it is logged on `agent_turn` and **never branched on**.
+  * **The guard caps a turn that called no tool** at `CHAT_REPLY_MAX_CHARS`
+    (`chat_engine/guard.py`). With no tool call there is no evidence behind a word of the
+    reply, so length is the signal, and `agent_long_reply_no_tools` is the number to
+    watch. A prompt is a request; a cap is not.
+  * **Retrieval is the safe default.** `router.route`'s fallback is RECALL, not CHAT, so
+    an unrecognised phrasing is answered from the person's own vault or told "I couldn't
+    find anything about that", which is true for general knowledge and is what someone
+    asking about their memories wanted. A small social allowlist (`scope.is_social`)
+    keeps "hi" out of a vector search.
+  `scope.check` still runs and still logs its verdict as `scope_verdict` with
+  `blocked=False`, so the two systems can be compared on real traffic for one release.
+  **Delete `scope.py`, `_log_scope` and their tests after that comparison** — it was
+  added 2026-09-03.
 - **The bot types while it works, and the indicator is started in TWO places.**
   `sendChatAction` existed on the client and was never called, so the bot was silent
   from the message to the reply — several seconds for a
@@ -1126,18 +1145,125 @@ extra round trips on the *first* execution of each statement shape per process (
 compiled cache makes every later one 1); and Neon's direct (non-pooled) endpoint would
 allow prepared statements at the cost of a much smaller connection ceiling.
 
+## The agent harness
+
+Everything that is not a capture, a command or a status question is answered by **one**
+lane: a bounded agent loop that reads the message and picks its own steps. The design is
+in `RecallAI — Chat Agent Harness (Design).md` and the build order in
+`Build Instruction: RecallAI Chat Agent Harness.md`; what follows is what a person editing
+it needs to know.
+
+```
+app/ai/chat/harness/{prompts,schemas,tools,graph}.py   the model side
+app/services/chat_engine/{context,budget,guard,trace,proposals}.py   the harness side
+app/services/recall_agent.py                          the lane, a subclass of RecallChatService
+app/services/telegram/confirm.py                      what a tapped button does
+```
+
+- **It is `harness/`, not `agent/`.** `app/ai/chat/agent.py` is the older streamed tool
+  driver and is still the rung below this one; a package cannot share a module's name.
+- **The degradation ladder is literally `super()`.** `RecallAgentService` subclasses
+  `RecallChatService`, so "fall back to the older, better-tested path" needs no wiring
+  and cannot drift. The fall happens **only before a word has been shown** -- after that
+  the turn is final, because repeating sentences a reader has already seen is worse than
+  the shorter answer they have. `GraphRecursionError` and the wall-clock timeout take the
+  same rule; from the reader's side they are the same event.
+- **Every prompt carries a vault snapshot** (`chat_engine/context.py`): the three newest
+  rows, one `cards_only` statement, fenced `<vault_snapshot trust="untrusted">` because
+  titles come from scraped pages. It is what makes "it", "that" and "my last one" resolve
+  to a real row, and it is why "what were my last three?" costs no tool call. `total`
+  rides alongside so three rows are never reported as a whole vault.
+- **`found_nothing` means "searched and found nothing", not "surfaced nothing".** The
+  distinction did not exist before the snapshot and its absence would have been a
+  regression: a question the snapshot answers is answered with **no tool call**, and the
+  old reading would have thrown that answer away and replaced it with "I couldn't find
+  anything in your vault" about memories the person was looking straight at.
+- **Budgets do not refuse calls, they answer them differently** (`chat_engine/budget.py`).
+  Past the ceiling every tool returns the "budget spent" sentence instead of running, so
+  every call still gets its `ToolMessage` -- a call left unanswered is a malformed
+  conversation and providers reject the *next* request outright. Then one tool-free round,
+  and the turn ends with words.
+- **`SurfacedSet` is the answer to two questions and must stay one structure**: which ids
+  a reply may cite, and which ids `GetMemory` may open. Both are the same claim -- the
+  model saw this. The snapshot seeds it, tool results add to it, nothing else may write
+  to it.
+- **A model may propose a write; it may never perform one.** Tool results are scraped
+  captions -- exactly the text an attacker gets to write -- so `propose_note` mints a
+  single-use token (`chat_engine/proposals.py`) and the write happens in
+  `services/telegram/confirm.py` or `POST /chat/proposals/{proposal_token}/accept`, code
+  that imports no model. Four rules hold it:
+  * **`propose_note` is refused at mint unless the text appears in the person's own
+    message this turn** (`from_user_turn`). A model reading an injected caption can be
+    talked into proposing anything; it cannot be talked into having been *asked*.
+    `proposal_text_not_from_user` is the clearest injection signal this system has.
+  * **The token is spent before the write.** A failure between the two leaves nothing to
+    retry with, which is the safe direction.
+  * **Unknown, expired, spent and wrong-owner all answer identically.** Distinguishing
+    them tells whoever found a token in a screenshot what they are holding.
+  * **The card shows the exact text that will be written**, never a summary -- that is
+    where a person reads what a caption talked the model into and taps No.
+  `propose_retry` and `propose_delete` take no text, so their check is the surfaced-id
+  one: an id a *memory* mentioned did not come from the vault. Delete waited for the soft
+  delete to be real -- offering a tap that runs a half-implemented delete is worse than
+  not offering it -- and it says plainly that it is permanent, because it is.
+- **`callback_data` is a prefix and a token, never text**: `p:` accept, `p:no:` decline,
+  `q:` a tapped answer option. Telegram caps it at 64 bytes. A tapped option is replayed
+  through the ordinary inbound path as if typed, so there is no second routing path -- and
+  the text is then genuinely the person's own words, which is what lets it stand as
+  provenance for a later proposal.
+- **`allowed_updates` must list `callback_query`.** Leave it out and taps never arrive at
+  all: the button spins on the person's screen and no handler below it ever runs.
+- **One `agent_turn` log line per turn** (`chat_engine/trace.py`), carrying
+  `prompt_version`, the tool *names* (never their arguments -- those are the model's guess
+  at the subject, derived from the person's message), the guard's removals, and the two
+  self-reported booleans. `surface`, `shadow` and `router_lane` ride as structlog
+  contextvars rather than as fields, the same way `surface` and `intent` already do.
+- **No test may reach a provider, embeddings included.** `_no_provider_calls` patches the
+  chat factory, the agent model, the enrichment client **and**
+  `chat_engine.retrieval.get_ai_provider` -- the last was only ever kept off the network
+  by every test happening to stub `MemoryRetriever.recall` one level above.
+
 ## Known rough edges (real, in the current code)
 
-- `enqueue_process_item` fires inside `VaultService.save_url` *before* the request session commits.
-  A fast worker can dequeue the job before the row is visible, log `process_missing_item`, and leave
-  the item stuck at `pending`. Enqueue after commit if you touch this path. The hand-off itself is
-  now fail-soft (`VaultService._enqueue`): the row is already persisted, so an unreachable Redis
-  logs `vault_enqueue_failed` and leaves the item `pending` rather than 500ing the save. That does
-  not fix the commit race — it only stops a missing queue from breaking capture.
-- `VaultItem.deleted_at` exists and every read filters on it, but `VaultRepository.delete()` does a
-  hard `session.delete()`. Reads assume soft delete; writes do not implement it.
-- Rate limiting (`core/middleware.py`) is per-process in-memory — correct only for a single API
-  replica.
+- ~~`enqueue_process_item` fires before the request session commits.~~ **Fixed.** Every
+  save route in `api/v1/vault.py` now takes `enqueue=False`, commits, and then calls
+  `VaultService.enqueue` (`_commit_then_enqueue`), which is the order the bot has always
+  used. Enqueuing first was a real race: the worker runs in its own transaction, so a
+  fast one could dequeue before the row was visible, log `process_missing_item` and leave
+  the item at `pending` forever. Any new save path must keep that order —
+  `VaultService.enqueue` is public precisely so a caller can. The hand-off is also
+  fail-soft: an unreachable Redis logs `vault_enqueue_failed` and leaves the item
+  `pending` rather than 500ing the save, and `sweep_stranded_items` re-queues it.
+- ~~`VaultItem.deleted_at` exists and every read filters on it, but
+  `VaultRepository.delete()` does a hard `session.delete()`.~~ **Fixed.** `delete` now
+  writes the tombstone the reads were always looking for, and `get` / `get_unscoped`
+  honour it -- neither did, so a soft-deleted row would have stayed fully readable by id
+  and would have kept being processed by the worker. Three properties to keep if you
+  touch it:
+  * **The tombstone is scrubbed.** Title, summary, content, URL, tags, highlights, label,
+    category, metadata and the file fields are all cleared. It keeps the id, the owner,
+    the kind and the timestamps -- enough to explain a gap, not enough to reconstruct
+    anything. Keeping a memory somebody asked to be rid of, so that a hypothetical undo
+    could exist, is the opposite of what they asked for.
+  * **The chunks go with it**, because they carry the same words *and* the vector drawn
+    from them. `search_semantic`'s join also hides them, which is now defence in depth
+    rather than the only thing standing between a deleted memory and the index built to
+    find it.
+  * **The object is deleted for real**, every version of it -- `VaultService.delete`
+    reads `storage_key` before the scrub clears it. See the bucket-versioning note above.
+  `tests/vault/test_soft_delete.py` pins each one.
+- ~~Rate limiting (`core/middleware.py`) is per-process in-memory.~~ **Fixed.** It counts
+  in Redis through `core/rate_limit.consume`, the same function the per-user caps use, so
+  there is one implementation of "count things in a window" and one set of fail-open
+  semantics. It was wrong in two ways and only one was written down: a count per process
+  is a count per replica *and* per uvicorn worker, so the real limit was the configured
+  one times the concurrency -- and the dict was never pruned, so every distinct client
+  address became a permanent entry and the limiter was a slow memory leak reachable from
+  the internet by rotating IPs. Still keyed by client IP, still exempting
+  `/api/v1/webhooks/`, still failing open.
+  **Consequence for tests:** a live developer Redis now makes this count across tests, so
+  `tests/conftest.py`'s autouse `_no_shared_redis_state` stubs it -- without that, the
+  sixty-first request in a suite run starts answering 429 to assertions about 401s.
 - **Spaces are built; the AI half of them is not.** `/api/v1/spaces` does CRUD,
   membership, invites and the public page. Not built yet, and named here so nobody
   assumes otherwise: the AI *proposal* for a Space (`app/ai/chat/curator.py`), the

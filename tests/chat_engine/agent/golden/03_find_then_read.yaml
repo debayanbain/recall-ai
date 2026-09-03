@@ -1,0 +1,23 @@
+name: find the docker talk, then what the speaker claimed
+why: >
+  Find-then-read is the question one planner call cannot express, and the whole reason
+  the model is allowed to choose its own steps. Two tools, in order.
+user_text: "did I save the docker talk, and what did the speaker claim?"
+snapshot: []
+memories:
+  - title: "Docker at scale"
+    summary: "A conference talk on layer caching."
+    content: "The speaker claimed layer caching cut their build time by 80 percent."
+    url: "https://example.com/docker"
+model_turns:
+  - calls:
+      - tool: SearchMemories
+        args: {query: "docker talk"}
+  - calls:
+      - tool: GetMemory
+        args: {memory_id: "{{first_id}}"}
+  - text: "Yes — Docker at scale. The speaker claimed layer caching cut build time by 80 percent."
+expect:
+  tool_calls: [SearchMemories, GetMemory]
+  reply_contains: ["Docker at scale", "80 percent"]
+  failed: false

@@ -1,0 +1,14 @@
+name: save a note, with no propose tool bound
+why: >
+  A deployment whose broker is unreachable binds no propose tools at all, so the honest
+  answer is how to do it themselves. Kept as a case because the failure mode it guards is
+  a model inventing a capability it does not have and reporting the note as saved.
+user_text: "save this: call the landlord about the leak"
+propose: false
+snapshot: []
+model_turns:
+  - text: "I can't save that myself right now — send it as /note call the landlord about the leak and I'll keep it."
+expect:
+  tool_calls: []
+  reply_contains: ["/note"]
+  failed: false

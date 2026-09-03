@@ -278,6 +278,18 @@ def check(text: str | None) -> Verdict:
     return Verdict(False, "no_domain_signal")
 
 
+def is_social(text: str | None) -> bool:
+    """A greeting, a thanks, a goodbye or a bare reaction -- and nothing more than that.
+
+    Split out for the router, which needs exactly this one question and none of the rest
+    of the verdict vocabulary. It is an **allowlist**, not the gate: it recognises the
+    handful of shapes that are plainly not questions about the vault, so a "hi" is not
+    answered with "I could not find anything about hi in your vault". Everything it does
+    not recognise falls through to retrieval, which is the safe direction.
+    """
+    return check(text).reason == "social"
+
+
 def is_out_of_scope(text: str | None) -> bool:
     """`check`, as the boolean the engine branches on."""
     return not check(text).allowed

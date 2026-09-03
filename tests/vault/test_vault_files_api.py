@@ -34,12 +34,20 @@ class _Service:
         self.link = link
         self.saved: list[tuple[uuid.UUID, int, str | None]] = []
         self.raise_on_save: Exception | None = None
+        self.enqueue_deferred = False
+        self.enqueued: list[VaultItem] = []
+
+    async def enqueue(self, item: VaultItem) -> None:
+        self.enqueued.append(item)
 
     async def save_document(
-        self, user_id: uuid.UUID, data: bytes, filename: str | None
+        self, user_id: uuid.UUID, data: bytes, filename: str | None, **kwargs: Any
     ) -> VaultItem:
         if self.raise_on_save:
             raise self.raise_on_save
+        # `enqueue=False` -- the route commits before it hands off, so the worker cannot
+        # dequeue a row it cannot see yet.
+        self.enqueue_deferred = kwargs.get("enqueue") is False
         self.saved.append((user_id, len(data), filename))
         return VaultItem(
             user_id=user_id,
@@ -171,3 +179,22 @@ async def test_limits_endpoint_tells_the_client_what_it_may_send(
     # Refused outright, so they never appear as options.
     assert "svg" not in body["extensions"] and "html" not in body["extensions"]
     assert body["storage_enabled"] == settings.storage_enabled
+
+
+async def test_the_upload_commits_before_it_queues(api: tuple[AsyncClient, Any]) -> None:
+    """The oldest known rough edge in this API, closed.
+
+    Enqueuing first is a real race: the worker runs in its own transaction, so a fast one
+    can dequeue before the row is committed, find nothing, log `process_missing_item` and
+    stop -- leaving an item at `pending` that the UI polls forever. A small window and a
+    silent failure, which is the combination that keeps a bug unnoticed.
+    """
+    client, service = api
+
+    response = await client.post(
+        f"{PREFIX}/vault/upload", files={"file": ("a.png", PNG, "image/png")}
+    )
+
+    assert response.status_code == 201
+    assert service.enqueue_deferred, "the save must not queue the job itself"
+    assert len(service.enqueued) == 1, "the route queues it, after committing"

@@ -95,6 +95,7 @@ def _model_that(monkeypatch: pytest.MonkeyPatch, reply: str, *, search: bool = T
         *,
         max_calls: int = 4,
         max_rounds: int = 3,
+        context: str = "",
     ) -> tools.ToolAnswer:
         if search:
             await executor.search_memories("redis")
@@ -239,3 +240,116 @@ async def test_an_empty_reply_is_a_failure_rather_than_a_blank_message(
     result = await RecallChatService(repo=None).answer(_USER, "redis?", "555")  # type: ignore[arg-type]
 
     assert result.failed
+
+
+# --- the snapshot, and what it changed about "nothing found" --------------------------
+
+
+class _SnapshotRepo:
+    """Just enough repository for the snapshot read the lane now makes."""
+
+    def __init__(self, items: list[VaultItem], total: int = 47) -> None:
+        self.items = items
+        self.total = total
+
+    async def list_for_user(
+        self, user_id: uuid.UUID, limit: int = 20, offset: int = 0
+    ) -> tuple[Sequence[VaultItem], int]:
+        return self.items[:limit], self.total
+
+
+async def test_a_turn_that_called_no_tool_keeps_its_answer(
+    _lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The regression the vault snapshot would otherwise have caused.
+
+    "What were my last three?" is answered from the snapshot with no tool call at all --
+    that is the whole point of putting it in the prompt. The lane used to treat "no
+    memory was surfaced by a tool" as "nothing was found" and replace the reply with the
+    fixed no-match sentence, so the better answer was thrown away and the person was told
+    their vault held nothing about memories they were looking straight at.
+    """
+    _model_that(monkeypatch, "Your last three were the Redis article and two reels.", search=False)
+
+    result = await RecallChatService(  # type: ignore[arg-type]
+        repo=_SnapshotRepo([_item()])
+    ).answer(_USER, "what were my last three?", "555")
+
+    assert result.text == "Your last three were the Redis article and two reels."
+
+
+async def test_a_search_that_found_nothing_still_gets_the_fixed_sentence(
+    _lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other half of the same distinction, which is why it is a counter and not a flag.
+
+    Having gone looking and come back empty is exactly the state in which a model fills
+    the gap from its own knowledge, so that answer is still replaced.
+    """
+    _retrieving(monkeypatch, [])
+    _model_that(monkeypatch, "I think you saved something about Redis clustering.")
+
+    result = await RecallChatService(  # type: ignore[arg-type]
+        repo=_SnapshotRepo([_item()])
+    ).answer(_USER, "redis clustering?", "555")
+
+    assert result.text is not None
+    assert "Redis clustering" not in result.text
+
+
+async def test_the_snapshot_and_the_card_reach_the_tool_prompt(
+    _lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Wiring, which is the half that silently does not happen.
+
+    The block can be perfect and the lane can still never pass it -- that is the shape of
+    every bug this file's sibling `test_telegram_typing.py` was written for.
+    """
+    captured: dict[str, str] = {}
+
+    async def _loop(
+        question: str,
+        past: Sequence[BaseMessage],
+        executor: Any,
+        *,
+        max_calls: int = 4,
+        max_rounds: int = 3,
+        context: str = "",
+    ) -> tools.ToolAnswer:
+        captured["context"] = context
+        return tools.ToolAnswer(text="ok", calls=[], rounds=1)
+
+    monkeypatch.setattr(tools, "answer_with_tools", _loop)
+
+    item = _item()
+    await RecallChatService(repo=_SnapshotRepo([item])).answer(  # type: ignore[arg-type]
+        _USER, "what did I save?", "555"
+    )
+
+    assert "<capability_card>" in captured["context"]
+    assert "<vault_snapshot" in captured["context"]
+    assert short_id(item) in captured["context"]
+    assert 'total="47"' in captured["context"]
+
+
+async def test_an_unreadable_vault_costs_context_and_not_the_answer(
+    _lane: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A snapshot read that fails must not take the turn down with it.
+
+    The lanes underneath do their own reads and fail honestly if those fail; this one is
+    an aid to the prompt, and answering with less context beats answering with an error.
+    """
+
+    class _BrokenRepo:
+        async def list_for_user(self, *args: Any, **kwargs: Any) -> Any:
+            raise ConnectionError("the database is unreachable")
+
+    _model_that(monkeypatch, "Here is what I found.", search=False)
+
+    result = await RecallChatService(repo=_BrokenRepo()).answer(  # type: ignore[arg-type]
+        _USER, "what did I save?", "555"
+    )
+
+    assert result.text == "Here is what I found."
+    assert result.failed is False

@@ -98,8 +98,8 @@ def _build_tools(executor: MemoryTools) -> list[StructuredTool]:
             args_schema=SearchMemories,
         ),
         StructuredTool.from_function(
-            coroutine=lambda days=None, content_types=(), category=None: (
-                executor.list_memories(days, content_types, category)
+            coroutine=lambda days=None, content_types=(), category=None, status=None: (
+                executor.list_memories(days, content_types, category, status)
             ),
             name=ListMemories.__name__,
             description=ListMemories.__doc__ or "",
@@ -120,6 +120,7 @@ async def stream_with_tools(
     executor: MemoryTools,
     *,
     max_rounds: int = 3,
+    context: str = "",
 ) -> AsyncIterator[AgentEvent]:
     """Run the tool lane and yield the answer as it is written.
 
@@ -137,8 +138,12 @@ async def stream_with_tools(
         yield AgentEnd(failed=True)
         return
 
+    # The context is its own system turn, in the same position the template gives it on
+    # the non-streamed path -- ahead of the history, so a memory quoted back from an
+    # earlier turn cannot sit between the rules and the evidence.
     messages: list[BaseMessage] = [
         SystemMessage(content=TOOL_SYSTEM),
+        *([SystemMessage(content=context)] if context else []),
         *history,
         ("human", question),  # type: ignore[list-item]
     ]

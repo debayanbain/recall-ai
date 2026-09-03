@@ -1,0 +1,25 @@
+name: what were my last three, in Bengali
+why: >
+  No script counting anywhere in the path. The model reads the snapshot and answers in the
+  language it was asked in; titles stay in the language they were saved in, because a
+  translated title is one the person cannot search for.
+user_text: "আমার শেষ তিনটা কী ছিল?"
+snapshot:
+  - title: "Redis persistence"
+    type: article
+    status: completed
+    age_minutes: 10
+  - title: "Docker at scale"
+    type: youtube
+    status: completed
+    age_minutes: 60
+  - title: "BellaVita White Oud"
+    type: article
+    status: pending
+    age_minutes: 90
+model_turns:
+  - text: "আপনার শেষ তিনটি: Redis persistence, Docker at scale, আর BellaVita White Oud (এখনও প্রসেস হচ্ছে)।"
+expect:
+  tool_calls: []
+  reply_contains: ["Redis persistence", "Docker at scale", "BellaVita White Oud"]
+  failed: false

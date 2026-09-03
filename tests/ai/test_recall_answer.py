@@ -60,6 +60,7 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "contexts": [],
         "recalls": [],
         "guidance": [],
+        "snapshots": [],
         "stored": [],
     }
 
@@ -71,10 +72,12 @@ def _offline(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         documents: Any,
         past: Any,
         guidance: str = chain.GUIDANCE_SUPPORTED,
+        snapshot: str = "",
     ) -> str:
         seen["answers"].append(question)
         seen["contexts"].append(chain.format_context(documents))
         seen["guidance"].append(guidance)
+        seen["snapshots"].append(snapshot)
         return seen.get("reply", "Two memories cover it.")
 
     async def _load(session_id: str) -> list[Any]:

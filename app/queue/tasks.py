@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 
 from app.core.logging import configure_logging, get_logger
@@ -16,7 +17,11 @@ from app.db.session import task_session
 from app.models.base import ProcessingStatus
 from app.models.extraction_run import RunStatus
 from app.queue.celery_app import celery_app
-from app.queue.client import enqueue_process_item, enqueue_telegram_delivery
+from app.queue.client import (
+    enqueue_process_item,
+    enqueue_shadow_agent_turn,
+    enqueue_telegram_delivery,
+)
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
 from app.services.apify import get_run
@@ -357,12 +362,21 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
         TelegramAccountRepository,
         TelegramLinkTokenRepository,
     )
+    from app.services.chat_engine.proposals import RedisProposalStore
+    from app.services.telegram import dedupe
     from app.services.telegram.client import TelegramClient
     from app.services.telegram.dispatch import TelegramDispatcher
     from app.services.telegram.linking import TelegramLinkService
     from app.services.telegram.typing import chat_id_of, typing_action
     from app.services.vault_service import VaultService
     from app.storage import get_storage
+
+    # Before the session, before the typing indicator, before anything that costs money
+    # or writes a row. A redelivery that gets as far as the dispatcher has already paid
+    # for the turn, and for a capture it has already written a second copy of it.
+    if not await dedupe.claim(update.get("update_id")):
+        log.info("telegram_update_duplicate", update_id=update.get("update_id"))
+        return
 
     # Read before any work starts, and from the raw payload: the indicator is the only
     # sign the message arrived, and a reply can be several seconds away -- an embedding,
@@ -377,7 +391,11 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
         )
         vault = VaultService(VaultRepository(session), get_storage())
         dispatcher = TelegramDispatcher(
-            links, vault, client, recall=_recall_responder(vault.repo)
+            links,
+            vault,
+            client,
+            recall=_recall_responder(vault.repo),
+            proposals=RedisProposalStore(),
         )
 
         async with typing_action(client, typing_chat_id):
@@ -392,10 +410,34 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
             except Exception as exc:  # noqa: BLE001 - the item is saved either way
                 log.warning("telegram_enqueue_failed", error=type(exc).__name__)
 
+        # Acknowledged first: Telegram spins the tapped button until this arrives, and
+        # the reply below may take a database round trip to produce.
+        if result.answer_callback_id:
+            await client.answer_callback_query(result.answer_callback_id)
+        if result.clear_markup_message_id is not None and result.chat_id:
+            # The token is single-use, so a second tap is already refused; this is what
+            # stops the person being offered a choice that no longer exists.
+            await client.edit_message_reply_markup(
+                result.chat_id, result.clear_markup_message_id
+            )
         if result.reply and result.chat_id:
             await client.send_message(
                 result.chat_id, result.reply, reply_markup=result.reply_markup
             )
+
+    # After the reply, and outside the session: a shadow run answers nothing and must
+    # never be between the person and their answer.
+    if result.shadow is not None:
+        try:
+            await enqueue_shadow_agent_turn(
+                str(result.shadow.user_id),
+                result.shadow.question,
+                result.shadow.session_id,
+                "telegram",
+                result.shadow.lane,
+            )
+        except Exception as exc:  # noqa: BLE001 - an experiment is not worth a retry
+            log.warning("agent_shadow_enqueue_failed", error=type(exc).__name__)
 
 
 def _recall_responder(repo: VaultRepository) -> Any:
@@ -410,6 +452,61 @@ def _recall_responder(repo: VaultRepository) -> Any:
         log.warning("recall_chat_unavailable")
         return None
     return build_recall_responder(repo)
+
+
+@celery_app.task(
+    name="app.queue.tasks.shadow_agent_turn",
+    bind=True,
+    max_retries=0,
+    acks_late=False,
+)
+def shadow_agent_turn(
+    self: Any,
+    user_id: str,
+    question: str,
+    session_id: str,
+    surface: str,
+    router_lane: str,
+) -> None:
+    """Run the agent on a turn the old lanes have already answered. Send nothing.
+
+    The whole point is to find out what the new lane *would* have said before anyone
+    depends on it, so this runs after the reply has gone out, on its own queue message,
+    and its answer is thrown away. It writes nothing to the conversation history either:
+    a shadow answer replayed into the next real prompt would make the experiment steer
+    the thing it is measuring.
+
+    `max_retries=0` and `acks_late=False`, unlike every other task here: a shadow turn
+    that fails has cost nobody an answer, and retrying it would spend a second model call
+    to re-learn something already logged as a failure.
+    """
+    try:
+        asyncio.run(
+            _shadow_agent_turn(user_id, question, session_id, surface, router_lane)
+        )
+    except Exception as exc:  # noqa: BLE001 - an experiment must not page anyone
+        log.warning("agent_shadow_failed", error=type(exc).__name__)
+
+
+async def _shadow_agent_turn(
+    user_id: str,
+    question: str,
+    session_id: str,
+    surface: str,
+    router_lane: str,
+) -> None:
+    import structlog
+
+    from app.services.recall_agent import RecallAgentService
+
+    # Bound rather than passed: `agent_turn` and every `model_call` underneath it pick
+    # these up from the context, which is how `surface` and `intent` already travel.
+    structlog.contextvars.bind_contextvars(
+        surface=surface, router_lane=router_lane, shadow=True
+    )
+    async with task_session() as session:
+        service = RecallAgentService(VaultRepository(session))
+        await service.agent(uuid.UUID(user_id), question, session_id, store=False)
 
 
 @celery_app.task(
@@ -454,6 +551,77 @@ async def _deliver_telegram_result(item_id: str) -> None:
 
         async with TelegramClient() as client:
             await client.send_message(account.telegram_chat_id, formatting.result(item))
+
+
+@celery_app.task(name="app.queue.tasks.nudge_slow_captures")
+def nudge_slow_captures() -> int:
+    """Beat task: a capture that is taking a while says so, once.
+
+    Between the acknowledgement and the finished card there is nothing. For an article
+    that gap is a second; for a deferred crawl it is minutes, and for a queue with no
+    worker behind it it is however long the worker stays down. All three look identical
+    from the chat -- a bot that answered once and then stopped -- so the same message
+    gets sent again, which is the one outcome the two-phase pipeline was built to avoid.
+
+    One message per item, ever, recorded in `item_metadata` rather than in a new column:
+    the flag is bookkeeping for a chat surface, not a property of a memory. The reply
+    address is re-derived through the account binding, never read from `item_metadata`,
+    for the same reason `deliver_telegram_result` does it that way.
+    """
+    return asyncio.run(_nudge_slow_captures())
+
+
+async def _nudge_slow_captures() -> int:
+    from app.core.config import settings
+    from app.repositories.telegram import TelegramAccountRepository
+    from app.services.telegram import formatting
+    from app.services.telegram.client import TelegramClient
+
+    sent = 0
+    async with task_session() as session:
+        items = await VaultRepository(session).list_slow_captures(
+            "telegram", settings.NUDGE_AFTER_MINUTES
+        )
+        if not items:
+            return 0
+
+        accounts = TelegramAccountRepository(session)
+        async with TelegramClient() as client:
+            for item in items:
+                account = await accounts.get_for_user(item.user_id)
+                if account is None:
+                    # Disconnected since the capture. Stamped anyway, so a reconnect
+                    # does not deliver a nudge about something long since finished.
+                    item.item_metadata = {
+                        **item.item_metadata,
+                        "nudged_at": datetime.now(UTC).isoformat(),
+                    }
+                    continue
+                try:
+                    await client.send_message(
+                        account.telegram_chat_id, formatting.still_working(item)
+                    )
+                except Exception as exc:  # noqa: BLE001 - one bad chat must not stop the sweep
+                    log.warning(
+                        "telegram_nudge_failed",
+                        item_id=str(item.id),
+                        error=type(exc).__name__,
+                    )
+                    continue
+                # Stamped only after the send succeeded: the flag means "this person has
+                # been told", and setting it for a message that never went out would
+                # silently spend the one nudge this item gets.
+                item.item_metadata = {
+                    **item.item_metadata,
+                    "nudged_at": datetime.now(UTC).isoformat(),
+                }
+                sent += 1
+
+        await session.commit()
+
+    if sent:
+        log.info("telegram_nudged_slow_captures", sent=sent)
+    return sent
 
 
 @celery_app.task(name="app.queue.tasks.purge_expired_telegram_tokens")

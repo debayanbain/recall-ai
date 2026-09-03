@@ -101,9 +101,14 @@ async def telegram_webhook(
     if not isinstance(body, dict):
         raise HTTPException(status.HTTP_400_BAD_REQUEST, "Invalid JSON") from None
 
-    # Only `message` updates are subscribed in setWebhook, but Telegram can still deliver
-    # others after a settings change; acknowledge them rather than retrying forever.
-    if not isinstance(body.get("message"), dict):
+    # `message` and `callback_query` are what setWebhook subscribes to. Telegram can
+    # still deliver others after a settings change; acknowledge those rather than
+    # retrying forever. A tapped button arrives as a callback_query and nothing else --
+    # without this branch it would be dropped here and the button would spin until it
+    # timed out.
+    if not isinstance(body.get("message"), dict) and not isinstance(
+        body.get("callback_query"), dict
+    ):
         log.info("telegram_webhook_ignored", update_id=str(body.get("update_id"))[:20])
         return {"status": "ignored"}
 

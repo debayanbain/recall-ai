@@ -79,7 +79,7 @@ def test_openai_token_counts_are_recorded(events: list[dict[str, Any]]) -> None:
 def test_gemini_reports_its_counts_somewhere_else_and_is_still_read(
     events: list[dict[str, Any]],
 ) -> None:
-    handler = UsageLogger("converse")
+    handler = UsageLogger("agent")
     handler.on_chat_model_start({}, [])
     handler.on_llm_end(_gemini_result())
 

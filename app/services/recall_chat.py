@@ -39,12 +39,14 @@ from app.ai.chat import agent, chain, history, planner, tools
 from app.ai.chat.factory import chat_available
 from app.ai.chat.planner import MemoryQuery, resolved_content_types
 from app.ai.chat.retriever import to_document
+from app.ai.prompts import CAPABILITY_CARD
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.core.scripts import script_of
 from app.models.vault import VaultItem
 from app.repositories.vault import VaultRepository
 from app.services.chat_engine.cards import DETAIL_MAX_ITEMS, build_detail_card
+from app.services.chat_engine.context import load_snapshot, render_snapshot
 from app.services.chat_engine.evidence import Evidence, EvidenceStatus, assess
 from app.services.chat_engine.retrieval import MemoryFilters, MemoryRetriever
 from app.services.chat_engine.router import wants_detail
@@ -53,6 +55,8 @@ from app.services.chat_engine.types import (
     Delta,
     ErrorKind,
     ItemsEvent,
+    ProposalBlock,
+    QuestionBlock,
     StatusEvent,
     StreamEnd,
     StreamEvent,
@@ -89,6 +93,11 @@ class RecallAnswer:
     #: the exact evidence that produced it, and so a later surface can cite sources
     #: without the answer path having to be rebuilt to remember what it read.
     memory_ids: tuple[str, ...] = ()
+    #: A question back to the person, with the answers they may tap. Structure rather
+    #: than text because one surface renders it as buttons and another as chips.
+    question: QuestionBlock | None = None
+    #: Something the assistant is offering to do and will not do unless told.
+    proposal: ProposalBlock | None = None
 
 
 class RecallChatService:
@@ -96,36 +105,27 @@ class RecallChatService:
         self.repo = repo
         self.memories = MemoryRetriever(repo)
 
-    async def chat(self, message: str, session_id: str) -> RecallAnswer:
-        """Small talk. No vault access, so nothing to leak and nothing to inject.
+    async def _prompt_context(self, user_id: uuid.UUID) -> str:
+        """The capability card and the newest rows, as one block for the system turn.
 
-        The reply is bounded on the way out for the same reason the recall answer is,
-        and harder. This lane has **no evidence at all** behind it, so every URL in its
-        output is unsupported by construction -- there is no block a link could have come
-        from -- and a reply that has run to essay length is a reply that stopped being
-        about this product. Neither check can be argued with by a message, which is what
-        makes it worth having behind a prompt that can be.
+        One statement, card columns only. It is loaded for every answered turn because
+        every lane needs it equally: the snapshot is what makes "it" and "my last one"
+        resolvable, and the card is what stops the model guessing at what the product
+        does -- which is the whole reason the no-vault conversation lane could be deleted.
+
+        A failure here costs context, not the answer. The vault being briefly unreadable
+        is a reason to answer with less, never a reason to answer with an error.
         """
-        past = await history.load(session_id)
+        if settings.AGENT_SNAPSHOT_ITEMS <= 0:
+            return CAPABILITY_CARD
         try:
-            reply = await chain.converse(message, past)
-        except Exception as exc:  # noqa: BLE001 - never surface a provider traceback
-            log.warning("recall_converse_failed", error=type(exc).__name__)
-            return RecallAnswer(failed=True)
-
-        checked = validate_answer(
-            reply,
-            allowed_ids=(),
-            allowed_urls=(),
-            max_chars=settings.CHAT_REPLY_MAX_CHARS,
-        )
-        if checked.removed:
-            log.warning("recall_chat_corrected", removed=list(checked.removed[:5]))
-        if checked.rejected:
-            return RecallAnswer(failed=True)
-
-        await history.append(session_id, message, checked.text)
-        return RecallAnswer(text=checked.text)
+            snapshot = await load_snapshot(
+                self.repo, user_id, settings.AGENT_SNAPSHOT_ITEMS
+            )
+        except Exception as exc:  # noqa: BLE001 - context is an aid, not the answer
+            log.warning("recall_snapshot_failed", error=type(exc).__name__)
+            return CAPABILITY_CARD
+        return f"{CAPABILITY_CARD}\n\n{render_snapshot(snapshot)}"
 
     async def answer(
         self, user_id: uuid.UUID, question: str, session_id: str
@@ -142,8 +142,12 @@ class RecallChatService:
         the single-shot path answers the same question rather than the user seeing an
         error.
         """
+        context = await self._prompt_context(user_id)
+
         if settings.RECALL_TOOLS_ENABLED:
-            answered = await self._answer_with_tools(user_id, question, session_id)
+            answered = await self._answer_with_tools(
+                user_id, question, session_id, context
+            )
             if answered is not None:
                 return answered
 
@@ -192,7 +196,9 @@ class RecallChatService:
 
         past = await history.load(session_id)
         try:
-            reply = await chain.answer(question, documents, past, _guidance(evidence))
+            reply = await chain.answer(
+                question, documents, past, _guidance(evidence), snapshot=context
+            )
         except Exception as exc:  # noqa: BLE001 - never surface a provider traceback
             log.warning("recall_answer_failed", error=type(exc).__name__)
             return RecallAnswer(failed=True)
@@ -218,7 +224,7 @@ class RecallChatService:
         return RecallAnswer(text=checked.text, memory_ids=evidence.ids)
 
     async def _answer_with_tools(
-        self, user_id: uuid.UUID, question: str, session_id: str
+        self, user_id: uuid.UUID, question: str, session_id: str, context: str = ""
     ) -> RecallAnswer | None:
         """The lane where the model chooses the searches. `None` means "fall back".
 
@@ -236,6 +242,7 @@ class RecallChatService:
             toolbox,
             max_calls=settings.RECALL_MAX_TOOL_CALLS,
             max_rounds=settings.RECALL_MAX_TOOL_ROUNDS,
+            context=context,
         )
         if result is None:
             return None
@@ -309,9 +316,13 @@ class RecallChatService:
         the same relevance gate and the same output validation; what differs is how many
         looks the model gets.
         """
+        context = await self._prompt_context(user_id)
+
         if settings.RECALL_TOOLS_ENABLED and settings.RECALL_AGENT_ENABLED:
             spoke = False
-            async for event in self._stream_with_tools(user_id, question, session_id):
+            async for event in self._stream_with_tools(
+                user_id, question, session_id, context
+            ):
                 spoke = spoke or isinstance(event, Delta)
                 yield event
             if spoke:
@@ -372,7 +383,9 @@ class RecallChatService:
             max_chars=settings.RECALL_ANSWER_MAX_CHARS,
         )
         async for event in self._pump(
-            chain.answer_stream(question, documents, past, _guidance(evidence)),
+            chain.answer_stream(
+                question, documents, past, _guidance(evidence), snapshot=context
+            ),
             checker,
             session_id=session_id,
             question=question,
@@ -381,7 +394,7 @@ class RecallChatService:
             yield event
 
     async def _stream_with_tools(
-        self, user_id: uuid.UUID, question: str, session_id: str
+        self, user_id: uuid.UUID, question: str, session_id: str, context: str = ""
     ) -> AsyncIterator[StreamEvent]:
         """The tool lane, streamed. Yields nothing at all when the driver is unavailable.
 
@@ -404,7 +417,11 @@ class RecallChatService:
         )
         spoken: list[str] = []
         async for event in agent.stream_with_tools(
-            question, past, toolbox, max_rounds=settings.RECALL_MAX_TOOL_ROUNDS
+            question,
+            past,
+            toolbox,
+            max_rounds=settings.RECALL_MAX_TOOL_ROUNDS,
+            context=context,
         ):
             if isinstance(event, agent.AgentToolCall):
                 yield StatusEvent(stage=_STAGES.get(event.name, "working"))
@@ -441,26 +458,6 @@ class RecallChatService:
             yield StreamEnd(
                 memory_ids=toolbox.allowed_ids, corrected=bool(checker.removed)
             )
-
-    async def stream_chat(self, message: str, session_id: str) -> AsyncIterator[StreamEvent]:
-        """Small talk, as it is written. No vault access, so no evidence and no URLs.
-
-        `allowed_urls=()` is not an oversight: this lane is handed no memories, so every
-        link it could emit is unsupported by construction.
-        """
-        past = await history.load(session_id)
-        checker = StreamValidator(
-            allowed_ids=(),
-            allowed_urls=(),
-            max_chars=settings.CHAT_REPLY_MAX_CHARS,
-        )
-        async for event in self._pump(
-            chain.converse_stream(message, past),
-            checker,
-            session_id=session_id,
-            question=message,
-        ):
-            yield event
 
     async def _pump(
         self,
@@ -601,4 +598,11 @@ def build_recall_responder(repo: VaultRepository) -> RecallChatService | None:
     """
     if not chat_available():
         return None
+    if settings.AGENT_ENABLED:
+        # Imported here rather than at module scope: the agent service subclasses this
+        # one, so a top-level import would be a cycle.
+        from app.services.chat_engine.proposals import RedisProposalStore
+        from app.services.recall_agent import RecallAgentService
+
+        return RecallAgentService(repo, RedisProposalStore())
     return RecallChatService(repo)

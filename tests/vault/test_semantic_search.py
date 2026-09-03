@@ -6,8 +6,10 @@ more than ranking quality:
 
 * **Tenant isolation.** The index spans every user's chunks. A missing predicate here
   does not error -- it quietly returns someone else's memories, ranked helpfully.
-* **Soft-deleted items stay gone.** Deleting an item does not delete its chunk, so the
-  vector outlives the row's visibility and the join is the only thing hiding it.
+* **Soft-deleted items stay gone.** `VaultRepository.delete` now removes an item's chunks
+  along with it, so this join is defence in depth rather than the only thing hiding them
+  -- and it still matters, because a row soft-deleted by any other means (a migration, a
+  fixture, a future bulk operation) leaves its vector behind.
 
 Needs a real PostgreSQL with pgvector; skipped otherwise, like every DB-backed test here.
 """

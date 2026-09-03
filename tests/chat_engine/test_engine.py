@@ -14,7 +14,6 @@ import pytest
 
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine import scope
 from app.services.chat_engine.engine import ChatEngine, classify
 from app.services.chat_engine.router import Intent
 from app.services.chat_engine.types import (
@@ -36,6 +35,8 @@ class FakeRecall:
 
     def __init__(self, answer: RecallAnswer | None = None) -> None:
         self.answered: list[str] = []
+        #: Kept as a permanently-empty list so the assertions below can still say "and
+        #: not the other lane". There is no other lane now, and that is the claim.
         self.chatted: list[str] = []
         self.sessions: list[str] = []
         self._reply = answer or RecallAnswer(text="a reply")
@@ -47,10 +48,7 @@ class FakeRecall:
         self.sessions.append(session_id)
         return self._reply
 
-    async def chat(self, message: str, session_id: str) -> RecallAnswer:
-        self.chatted.append(message)
-        self.sessions.append(session_id)
-        return self._reply
+
 
 
 def _msg(text: str | None, **overrides: Any) -> InboundMessage:
@@ -84,43 +82,59 @@ async def test_a_vault_question_takes_the_retrieval_lane() -> None:
     assert recall.answered == ["what did I save this week?"] and recall.chatted == []
 
 
-async def test_a_greeting_takes_the_chat_lane() -> None:
+async def test_a_greeting_is_answered_by_the_one_remaining_lane() -> None:
+    """There is no lane without vault access any more.
+
+    A greeting used to take the conversation lane precisely because it needed no vault --
+    but that lane was also where every unrecognised phrasing ended up, and it could only
+    deflect. With a capability card and a snapshot in the prompt, the answering lane
+    handles "Hii" and can say what is actually in the vault in the same breath.
+    """
     recall = FakeRecall()
     await ChatEngine(recall, _USER).handle(_msg("Hii"))
 
-    assert recall.chatted == ["Hii"] and recall.answered == []
+    assert recall.answered == ["Hii"] and recall.chatted == []
 
 
 async def test_a_question_about_the_bot_takes_the_chat_lane_not_retrieval() -> None:
-    """META must never reach the answer prompt: it has no memory to answer from."""
+    """META now takes the answering lane, and the reason it could not used to is gone.
+
+    It was kept away from the answer prompt because that prompt had nothing but retrieved
+    memories to speak from, so "who are you?" would have come back "I could not find
+    anything about you in your vault". The prompt now carries a capability card, so the
+    lane can say what the product is *and* show what the person has -- and one lane fewer
+    is one fewer copy of the rules to keep in step.
+    """
     recall = FakeRecall()
     await ChatEngine(recall, _USER).handle(_msg("Who are you?"))
 
-    assert recall.chatted == ["Who are you?"] and recall.answered == []
+    assert recall.answered == ["Who are you?"] and recall.chatted == []
 
 
-async def test_general_knowledge_is_declined_without_a_model_call() -> None:
-    """Not retrieval -- there is nothing to retrieve -- and not conversation either.
+async def test_general_knowledge_goes_to_retrieval_rather_than_a_canned_decline() -> None:
+    """The reversal, and the reasoning behind it.
 
-    This assistant answers about the vault and about itself. Answering world trivia in
-    the same voice teaches the user that fluency is the signal, and the next answer,
-    which *is* about their vault, is believed for the same reason.
+    World trivia must still not be answered in this assistant's own voice -- that part is
+    unchanged, and the answer prompt is what enforces it: it may speak only from the
+    blocks it was given. What changed is where an unrecognised message goes. A closed
+    gate in front of the conversation lane declined general knowledge correctly and
+    declined "give me the list of my last saved" with exactly the same sentence, because
+    neither matched a pattern. Retrieval cannot make that mistake: it answers from the
+    person's own memories, and with nothing to answer from it says it found nothing.
     """
     recall = FakeRecall()
-    reply = await ChatEngine(recall, _USER).handle(
-        _msg("what is the capital of France?")
-    )
+    await ChatEngine(recall, _USER).handle(_msg("what is the capital of France?"))
 
-    assert recall.chatted == [] and recall.answered == []
-    assert reply.blocks == [TextBlock(text=scope.DECLINE)]
+    assert recall.answered == ["what is the capital of France?"]
+    assert recall.chatted == []
 
 
-async def test_ordinary_conversation_still_reaches_the_chat_lane() -> None:
-    """The scope guard is narrow on purpose: a greeting is not an off-topic request."""
+async def test_ordinary_conversation_is_answered_rather_than_declined() -> None:
+    """The scope gate blocks nothing now. A greeting was never an off-topic request."""
     recall = FakeRecall()
     await ChatEngine(recall, _USER).handle(_msg("Hii, thanks for that"))
 
-    assert recall.chatted == ["Hii, thanks for that"]
+    assert recall.answered == ["Hii, thanks for that"]
 
 
 async def test_asking_what_the_bot_can_do_is_never_declined() -> None:
@@ -128,7 +142,7 @@ async def test_asking_what_the_bot_can_do_is_never_declined() -> None:
     recall = FakeRecall()
     await ChatEngine(recall, _USER).handle(_msg("what can you do?"))
 
-    assert recall.chatted == ["what can you do?"]
+    assert recall.answered == ["what can you do?"]
 
 
 async def test_the_conversation_key_is_scoped_to_the_account() -> None:
@@ -164,7 +178,7 @@ async def test_an_attachment_is_answered_rather_than_raising() -> None:
         _msg("look", attachments=[Attachment(kind="document", file_id="abc")])
     )
 
-    assert recall.chatted == ["look"] and recall.answered == []
+    assert recall.answered == ["look"] and recall.chatted == []
     assert reply.blocks
 
 
@@ -172,7 +186,7 @@ async def test_a_command_is_answered_rather_than_raising() -> None:
     recall = FakeRecall()
     reply = await ChatEngine(recall, _USER).handle(_msg("/recent"))
 
-    assert recall.chatted == ["/recent"] and reply.blocks
+    assert recall.answered == ["/recent"] and reply.blocks
 
 
 async def test_a_group_message_is_answered_with_nothing_at_all() -> None:
@@ -189,7 +203,7 @@ async def test_a_message_with_no_text_is_answered_conversationally() -> None:
     recall = FakeRecall()
     reply = await ChatEngine(recall, _USER).handle(_msg(None))
 
-    assert recall.chatted == [""] and recall.answered == []
+    assert recall.answered == [""] and recall.chatted == []
     assert reply.blocks
 
 
@@ -262,9 +276,9 @@ def test_classify_sees_an_attachment_with_no_text() -> None:
     ("text", "intent", "lane"),
     [
         ("what did I save this week?", Intent.RECALL, "answered"),
-        ("Who are you?", Intent.META, "chatted"),
-        ("Hii", Intent.CHAT, "chatted"),
-        ("/froobulate", Intent.COMMAND, "chatted"),
+        ("Who are you?", Intent.META, "answered"),
+        ("Hii", Intent.CHAT, "answered"),
+        ("/froobulate", Intent.COMMAND, "answered"),
     ],
 )
 async def test_handle_takes_the_lane_classify_predicts(

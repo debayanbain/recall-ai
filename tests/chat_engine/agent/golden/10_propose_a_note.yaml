@@ -1,0 +1,18 @@
+name: save this, with the propose tool bound
+why: >
+  The ordinary path once proposals exist. The words are the person's own, so the mint
+  succeeds; the reply describes what is being offered and does not claim it is saved,
+  because nothing has been written until a tap arrives.
+user_text: "save this: call the landlord about the leak"
+propose: true
+snapshot: []
+model_turns:
+  - calls:
+      - tool: ProposeNote
+        args: {text: "call the landlord about the leak"}
+  - text: "Want me to save “call the landlord about the leak”?"
+expect:
+  tool_calls: [ProposeNote]
+  reply_not_contains: ["Saved", "I've saved"]
+  proposal_preview: "call the landlord about the leak"
+  failed: false

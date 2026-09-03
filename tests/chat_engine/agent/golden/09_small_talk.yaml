@@ -1,0 +1,19 @@
+name: small talk
+why: >
+  Replaces the tests that pinned the deleted conversation lane. A greeting used to take a
+  lane with no vault access, which is why it could only ever deflect; the same message now
+  reaches the one remaining lane, which can greet and say what is actually saved in the
+  same breath. No tool call: the snapshot already carries the answer.
+user_text: "hey!"
+snapshot:
+  - title: "Redis persistence"
+    type: article
+    status: completed
+    age_minutes: 10
+model_turns:
+  - text: "Hey! You've got 1 saved so far — the newest is Redis persistence. Want me to find something?"
+expect:
+  tool_calls: []
+  reply_contains: ["Redis persistence"]
+  reply_not_contains: ["couldn't find", "can't check"]
+  failed: false

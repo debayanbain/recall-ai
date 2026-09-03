@@ -13,10 +13,12 @@ from __future__ import annotations
 import re
 from collections.abc import Sequence
 from html import escape as _html_escape
+from typing import Any
 
 from app.core.config import settings
 from app.models.base import ProcessingStatus
 from app.models.vault import VaultItem
+from app.services.chat_engine.cards import short_id
 
 _MAX_TITLE = 120
 _MAX_SUMMARY = 400
@@ -203,8 +205,113 @@ def service_degraded(queued: bool) -> str:
     )
 
 
-def saving() -> str:
-    return "Saving…"
+def id_tag(item: VaultItem) -> str:
+    """The item's short id, rendered so a person can tap it to copy.
+
+    Every acknowledgement carries it, and so does the completion reply, because the two
+    are minutes apart and there is otherwise nothing tying them together. It is the same
+    identifier the assistant cites and the same one that appears in the logs, so "what
+    happened to a3f1c920?" is a question with one answer -- asked by a person in the chat
+    or by a developer with `jq`. `cards.short_id` is the single definition; a second one
+    here would drift the moment either changed.
+    """
+    return f"<code>[{escape(short_id(item))}]</code>"
+
+
+def saving(item: VaultItem) -> str:
+    return f"Saving… {id_tag(item)}"
+
+
+#: Telegram's own ceiling on `callback_data`. A token is 43 characters and the longest
+#: prefix here is 5, so this is headroom rather than a constraint -- but it is the reason
+#: the payload carries a token and never the option text a person tapped.
+CALLBACK_DATA_MAX = 64
+
+
+def question(text: str) -> str:
+    """A question back to the person. The options ride in the keyboard, not the text."""
+    return escape(text)
+
+
+def choice_markup(choices: Sequence[Any]) -> dict[str, object] | None:
+    """Offered answers as one button per row.
+
+    One per row rather than a grid: the labels are model-written and may be long or in a
+    script whose glyphs are wide, and a two-column keyboard truncates them on a phone --
+    which turns "the docker talk" and "the docker article" into the same button.
+    """
+    rows = [
+        [{"text": _clip(escape(choice.label), 60), "callback_data": f"q:{choice.token}"}]
+        for choice in choices
+        if len(f"q:{choice.token}") <= CALLBACK_DATA_MAX
+    ]
+    return {"inline_keyboard": rows} if rows else None
+
+
+def proposal(preview: str, action: str) -> str:
+    """The confirmation card.
+
+    It shows the **exact text that will be saved**, not a summary of it. That is the
+    whole point of the card: if a scraped caption talked the model into proposing
+    something, this is where the person reads the real words and taps No.
+    """
+    if action == "retry":
+        return f"Retry <b>{escape(preview)}</b>?"
+    if action == "delete":
+        return (
+            f"Delete <b>{escape(preview)}</b>?\n"
+            "This removes the memory and its file for good."
+        )
+    return f"Save this as a note?\n\n<code>{escape(preview)}</code>"
+
+
+def confirm_markup(token: str) -> dict[str, object] | None:
+    """Yes / No for a proposal. Both carry the token; only one of them writes anything."""
+    if len(f"p:{token}") > CALLBACK_DATA_MAX:
+        return None
+    return {
+        "inline_keyboard": [
+            [
+                {"text": "Yes", "callback_data": f"p:{token}"},
+                {"text": "No", "callback_data": f"p:no:{token}"},
+            ]
+        ]
+    }
+
+
+def proposal_expired() -> str:
+    """Unknown, expired, already spent, or minted for someone else -- one sentence.
+
+    Distinguishing them would tell whoever found a token in a screenshot which kind they
+    are holding, which is the same reason `link_expired` reads the way it does.
+    """
+    return "That one expired. Ask me again and I'll offer it fresh."
+
+
+def proposal_declined() -> str:
+    return "Okay, nothing done."
+
+
+def deleted() -> str:
+    """Said once the row is a tombstone and the file is gone from the bucket.
+
+    Plain about permanence, because it is: the text is scrubbed and every version of the
+    object is removed. Offering an undo we do not have would be the unkinder message.
+    """
+    return "🗑 Deleted. That one's gone for good."
+
+
+def still_working(item: VaultItem) -> str:
+    """Sent once when a capture has been running longer than a person will wait quietly.
+
+    It promises a later message, so it is only ever sent for an item that is genuinely
+    still in flight -- the boot guard keeps the threshold below the sweeper's, which is
+    the point at which that promise would stop being true.
+    """
+    return (
+        f"Still working on {id_tag(item)} — this one is taking a little longer.\n"
+        "I'll message you here when it's done. No need to send it again."
+    )
 
 
 def duplicate(item: VaultItem) -> str:
@@ -212,7 +319,10 @@ def duplicate(item: VaultItem) -> str:
 
 
 def note_saved(item: VaultItem) -> str:
-    return f"📝 Noted — <b>{escape(_title_of(item))}</b>\nI'll tag it in a moment."
+    return (
+        f"📝 Noted — <b>{escape(_title_of(item))}</b> {id_tag(item)}\n"
+        "I'll tag it in a moment."
+    )
 
 
 def stored_without_text(item: VaultItem) -> str:
@@ -222,7 +332,7 @@ def stored_without_text(item: VaultItem) -> str:
     a promise that never arrives reads as a bug.
     """
     return (
-        f"📎 Saved — <b>{escape(_title_of(item))}</b>\n"
+        f"📎 Saved — <b>{escape(_title_of(item))}</b> {id_tag(item)}\n"
         "It's in your vault and you can download it, but I can't read this file type "
         "yet, so there's no summary or tags."
     )
@@ -250,11 +360,11 @@ def result(item: VaultItem) -> str:
     """The message sent once the pipeline finishes."""
     if item.processing_status == ProcessingStatus.failed:
         return (
-            f"⚠️ Couldn't process <b>{escape(_title_of(item))}</b>.\n"
+            f"⚠️ Couldn't process <b>{escape(_title_of(item))}</b> {id_tag(item)}.\n"
             "It's saved, so nothing is lost — you can retry it from the web app."
         )
 
-    lines = [f"✅ <b>{escape(_title_of(item))}</b>"]
+    lines = [f"✅ <b>{escape(_title_of(item))}</b> {id_tag(item)}"]
     if item.summary:
         lines.append(escape(_clip(item.summary, _MAX_SUMMARY)))
     meta = _tag_line(item)

@@ -1,0 +1,24 @@
+name: list my last saved
+why: >
+  The message from the screenshot. It used to match no pattern, fall to the lane with no
+  vault access, and come back "just ask me what you want to know about". A list is the
+  answer, and any phrasing of it has to reach the vault.
+user_text: "give me the list of my last saved"
+snapshot:
+  - title: "5 games every Cloud Engineer should play"
+    type: instagram
+    status: completed
+    age_minutes: 53
+  - title: "Redis persistence"
+    type: article
+    status: completed
+    age_minutes: 120
+model_turns:
+  - calls:
+      - tool: ListMemories
+        args: {}
+  - text: "Your last two: 1. 5 games every Cloud Engineer should play (instagram) 2. Redis persistence (article)"
+expect:
+  tool_calls: [ListMemories]
+  reply_contains: ["Cloud Engineer", "Redis persistence"]
+  failed: false

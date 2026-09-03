@@ -70,6 +70,14 @@ celery_app.conf.update(
             "task": "app.queue.tasks.sweep_stranded_items",
             "schedule": crontab(minute="*/5"),
         },
+        # The other half of "nothing captured sits in limbo": the sweep above fixes the
+        # row, this one tells the person waiting on it. Same 5 minutes, because the
+        # threshold that matters is NUDGE_AFTER_MINUTES and a tick finer than that only
+        # adds queries.
+        "nudge-slow-captures": {
+            "task": "app.queue.tasks.nudge_slow_captures",
+            "schedule": crontab(minute="*/5"),
+        },
         # Expired sessions are dead weight, not evidence: once a row is past its
         # expiry it can neither be redeemed nor prove a replay. Daily is plenty --
         # nothing depends on the cleanup being timely.

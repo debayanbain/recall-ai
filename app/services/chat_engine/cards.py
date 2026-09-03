@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from collections.abc import Sequence
 
+from app.core.config import settings
 from app.models.vault import VaultItem
 
 #: Roughly a sentence and a half. Long enough to recognise the item, short enough that
@@ -184,6 +185,27 @@ def short_id(item: VaultItem) -> str:
     reaching nothing on its own.
     """
     return item.id.hex[:ID_CHARS] if item.id is not None else "unsaved"
+
+
+def memory_link(item: VaultItem) -> str | None:
+    """The memory's own page in the vault, for a person to open.
+
+    A memory has **two** links and they answer different questions: `source_url` is where
+    it came from, and this is where it lives now. Asked for "the link", a person usually
+    wants both -- and only this one works for a note, a voice recording or an upload,
+    which have no source at all.
+
+    Handing it over discloses nothing. The route takes the full UUID and fetches the row
+    client-side with the session cookie, so the API re-scopes it to the signed-in user:
+    the link is useless to anyone else, exactly like the presigned-download route being
+    minted per request rather than guessed.
+
+    `None` for an unsaved row, matching `short_id`'s "unsaved" -- there is no page for
+    something that has not been written yet.
+    """
+    if item.id is None:
+        return None
+    return f"{settings.FRONTEND_URL.rstrip('/')}/memory/{item.id}"
 
 
 def _saved_on(item: VaultItem) -> str | None:

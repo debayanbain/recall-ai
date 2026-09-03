@@ -111,6 +111,41 @@ class TelegramClient:
         except TelegramApiError:
             log.debug("telegram_chat_action_failed", chat_id_present=bool(chat_id))
 
+    async def answer_callback_query(
+        self, callback_query_id: str, text: str | None = None
+    ) -> None:
+        """Acknowledge a tapped button.
+
+        Telegram shows a spinner on the button until this arrives or ~30s pass, so it is
+        not optional feedback -- it is the difference between "that worked" and a control
+        that appears to have hung. Best-effort like the typing indicator: a failure here
+        must never turn a completed write into a Celery retry that writes again.
+        """
+        payload: dict[str, Any] = {"callback_query_id": callback_query_id}
+        if text:
+            payload["text"] = text
+        try:
+            await self._call("answerCallbackQuery", payload)
+        except TelegramApiError:
+            log.debug("telegram_callback_answer_failed")
+
+    async def edit_message_reply_markup(
+        self, chat_id: str, message_id: int, reply_markup: dict[str, Any] | None = None
+    ) -> None:
+        """Take the buttons off a card that has been acted on.
+
+        The token is single-use, so a second tap is already refused; this is what stops
+        the person being offered a choice that no longer exists. Failures are swallowed
+        for the same reason as above -- the write has happened by now, and a cosmetic
+        edit must not be able to undo the reply.
+        """
+        payload: dict[str, Any] = {"chat_id": chat_id, "message_id": message_id}
+        payload["reply_markup"] = reply_markup or {"inline_keyboard": []}
+        try:
+            await self._call("editMessageReplyMarkup", payload)
+        except TelegramApiError:
+            log.debug("telegram_markup_edit_failed")
+
     async def get_file(self, file_id: str) -> dict[str, Any]:
         return await self._call("getFile", {"file_id": file_id})
 
@@ -151,7 +186,10 @@ class TelegramClient:
                 "url": url,
                 "secret_token": secret_token,
                 "drop_pending_updates": True,
-                "allowed_updates": ["message"],
+                # Both, and the list is exhaustive at Telegram's end: an update type
+                # left out here never arrives, so a tapped button would spin on the
+                # person's screen until it timed out with nothing having happened.
+                "allowed_updates": ["message", "callback_query"],
             },
         )
 

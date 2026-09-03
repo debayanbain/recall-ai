@@ -135,8 +135,21 @@ def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
 
     monkeypatch.setattr("app.ai.chat.factory.get_chat_model", _refuse)
     monkeypatch.setattr("app.ai.chat.factory.build_chat_model", _refuse)
+    monkeypatch.setattr("app.ai.chat.factory.get_agent_model", _refuse)
     monkeypatch.setattr("app.ai.chat.factory.fallback_models", tuple)
     monkeypatch.setattr("app.ai.chat.tools.get_chat_model", _refuse)
+    # The agent loop holds its own reference, imported by name. Patching the factory's
+    # copy alone would leave this one pointing at the real thing -- the same trap the
+    # comment above describes, and the reason both are always done rather than reasoned
+    # about.
+    monkeypatch.setattr("app.ai.chat.harness.graph.get_agent_model", _refuse)
+
+    # Embeddings are an outbound provider call too, and until now the only thing keeping
+    # them off the network was that every test happened to stub `MemoryRetriever.recall`
+    # one level above. A test that reaches retrieval without doing so does not fail --
+    # it works, over the network, and bills per run. Closed here for the same reason as
+    # the rest: the failure is invisible except as a slower suite.
+    monkeypatch.setattr("app.services.chat_engine.retrieval.get_ai_provider", _refuse)
 
     # Combined enrichment is its own client and its own switch, so it is its own way out
     # to the network. Turned off *and* stubbed: off is what the pipeline's own tests
@@ -144,6 +157,39 @@ def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     # is what catches a future caller that reaches past the switch.
     monkeypatch.setattr(settings, "ENRICHMENT_COMBINED", False)
     monkeypatch.setattr("app.ai.enrichment._call_provider", _refuse)
+
+
+@pytest.fixture(autouse=True)
+def _no_shared_redis_state(monkeypatch: pytest.MonkeyPatch) -> None:
+    """No test may depend on what a *previous* run left in Redis.
+
+    A developer machine has a live broker, so anything the code stores there outlives the
+    process. Update dedupe is the first such thing: it is a `SET NX` keyed on Telegram's
+    `update_id`, and two tests that both dispatch `update_id: 1` are fine on a clean Redis
+    and order-dependent on a used one -- the second run of the suite fails a test that the
+    first one passed, which reads as flakiness rather than as state.
+
+    Neutralised here rather than per test, for the same reason `_no_provider_calls` is:
+    the failure it prevents is one nobody would think to guard against until they had
+    spent an afternoon on it. A test of the dedupe itself stubs the Redis client instead.
+    """
+    async def _always_first(update_id: object) -> bool:
+        return True
+
+    monkeypatch.setattr("app.services.telegram.dedupe.claim", _always_first)
+
+    # The per-IP request cap counts in Redis now, which is the point of it -- a count per
+    # process was a count per replica. It also means the count survives the test that
+    # made it: every request in the suite comes from the same client address, so after
+    # sixty of them the limiter starts answering 429 to assertions about 401s. Allowed
+    # here for the same reason the dedupe is stubbed, and a test *of* the limiter puts
+    # the real function back over the top.
+    async def _allow(
+        namespace: str, identity: str, limit: int, window: int = 3600
+    ) -> bool:
+        return True
+
+    monkeypatch.setattr("app.core.rate_limit.consume", _allow)
 
 
 @pytest_asyncio.fixture(scope="session", loop_scope="session")

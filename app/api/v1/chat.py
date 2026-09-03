@@ -33,6 +33,7 @@ declined here for the same reason it is there.
 from __future__ import annotations
 
 import json
+import uuid
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -44,18 +45,29 @@ from app.api.deps import CurrentUser, SessionDep, assert_same_site
 from app.core import rate_limit
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.queue.client import enqueue_shadow_agent_turn
 from app.repositories.vault import VaultRepository
 from app.schemas.vault import VaultItemRead
-from app.services.chat_engine.engine import ChatEngine
+from app.services.chat_engine.engine import ChatEngine, classify, session_id_for
+from app.services.chat_engine.proposals import Action, RedisProposalStore
 from app.services.chat_engine.types import (
     Delta,
     InboundMessage,
     ItemsEvent,
+    ProposalEvent,
+    QuestionEvent,
     StatusEvent,
     StreamEvent,
 )
 from app.services.recall_chat import build_recall_responder
-from app.services.vault_service import VaultService
+from app.services.vault_service import (
+    NOTE_CONTENT_MAX,
+    ItemNotFound,
+    ReprocessError,
+    VaultService,
+    note_title,
+)
+from app.storage import get_storage
 
 log = get_logger("api.chat")
 
@@ -64,6 +76,10 @@ router = APIRouter(prefix="/chat", tags=["chat"], dependencies=[Depends(assert_s
 #: The surface name stamped on every log line and model call from this endpoint, so a
 #: question asked from the web is distinguishable from the same question asked in the bot.
 _SURFACE = "web"
+
+#: One sentence for unknown, expired, spent and wrong-owner alike. Distinguishing them
+#: tells the holder of a leaked token which kind they are holding.
+_EXPIRED = "That one expired. Ask again and I'll offer it fresh."
 
 
 class AskRequest(BaseModel):
@@ -113,6 +129,32 @@ def _frame(event: StreamEvent) -> str:
                 "total": event.total,
             },
         )
+    if isinstance(event, QuestionEvent):
+        # The client renders the choices as chips. A tapped chip posts its own label as
+        # the next question, so an answered question is an ordinary turn from there on --
+        # no second routing path, and the text is genuinely the person's own words.
+        return _event(
+            "question",
+            {
+                "question": event.question,
+                "options": [
+                    {"label": choice.label, "token": choice.token}
+                    for choice in event.choices
+                ],
+            },
+        )
+    if isinstance(event, ProposalEvent):
+        # `preview` is the exact text that will be written, never a summary of it: if a
+        # scraped caption talked the model into proposing something, this is where the
+        # person reads the real words and declines.
+        return _event(
+            "proposal",
+            {
+                "token": event.accept_token,
+                "action": event.action,
+                "preview": event.preview,
+            },
+        )
     return _event(
         "end",
         {
@@ -121,6 +163,116 @@ def _frame(event: StreamEvent) -> str:
             "error": event.error.value if event.error else None,
         },
     )
+
+
+class ProposalResult(BaseModel):
+    """What a tapped confirmation did. Deliberately thin.
+
+    It reports an outcome and, when one was created, the card for it -- the same
+    `VaultItemRead` every other listing returns, so nothing reaches the browser here that
+    a listing would not already show.
+    """
+
+    status: str
+    message: str
+    item: VaultItemRead | None = None
+
+
+@router.post("/proposals/{proposal_token}/accept", response_model=ProposalResult)
+async def accept_proposal(
+    proposal_token: str, user: CurrentUser, session: SessionDep
+) -> ProposalResult:
+    """Do the thing the assistant offered to do. No model runs in this path.
+
+    The whole point of a proposal is that the write happens here rather than in a tool a
+    model can call: tool results are scraped page text, and a write tool bound to a model
+    reading them is one caption away from filing something the person never asked for.
+
+    The path parameter is `proposal_token` and not `token` on purpose. FastAPI resolves
+    path-parameter names across the entire dependency tree, and `get_current_user` already
+    takes a `token` -- from a cookie, with a default, which a path parameter may not have.
+    Same trap as `/spaces/invites/{invite_token}/accept`.
+    """
+    store = RedisProposalStore()
+    # Spent before anything is written. A failure between the two leaves nothing to retry
+    # with, which is the safe direction: the person is told it expired rather than a
+    # half-failed write staying repeatable by anyone holding the token.
+    proposal = await store.spend(proposal_token, user.id)
+    if proposal is None:
+        # Unknown, expired, already spent, or minted for another account: one answer for
+        # all four, so a token found in a screenshot tells its finder nothing.
+        raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED)
+
+    service = VaultService(VaultRepository(session), get_storage())
+
+    if proposal.action is Action.note:
+        text = proposal.args.get("text", "")[:NOTE_CONTENT_MAX]
+        item = await service.create_note(
+            user.id, note_title(text), text, enqueue=False
+        )
+        # Committed before the job is queued, not after: a worker that dequeues before
+        # the row is visible logs `process_missing_item` and leaves the item stuck at
+        # `pending`. The request boundary would commit this anyway -- doing it here is
+        # what puts it *before* the enqueue.
+        await session.commit()
+        await service.enqueue(item)
+        return ProposalResult(
+            status="saved",
+            message="Saved. I'll tag it in a moment.",
+            item=VaultItemRead.model_validate(item),
+        )
+
+    if proposal.action is Action.retry:
+        try:
+            item = await service.reprocess(uuid.UUID(proposal.args["memory_id"]), user.id)
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED) from exc
+        except ItemNotFound as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED) from exc
+        except ReprocessError as exc:
+            # The service's own wording and the same codes the manual retry route gives.
+            code = (
+                status.HTTP_429_TOO_MANY_REQUESTS
+                if "seconds" in str(exc)
+                else status.HTTP_409_CONFLICT
+            )
+            raise HTTPException(code, str(exc)) from exc
+        return ProposalResult(
+            status="retrying",
+            message="Retrying that one now.",
+            item=VaultItemRead.model_validate(item),
+        )
+
+    if proposal.action is Action.delete:
+        try:
+            removed = await service.delete(
+                uuid.UUID(proposal.args["memory_id"]), user.id
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED) from exc
+        if not removed:
+            # Already gone, or never theirs. The same answer either way, for the same
+            # reason `repo.get` returns None for both.
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED)
+        await session.commit()
+        return ProposalResult(status="deleted", message="Deleted. That one's gone.")
+
+    # `answer` proposals are a messaging-surface affordance: on the web a tapped chip
+    # posts its own text as the next question, so there is nothing to redeem here.
+    raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED)
+
+
+@router.post("/proposals/{proposal_token}/decline", response_model=ProposalResult)
+async def decline_proposal(
+    proposal_token: str, user: CurrentUser
+) -> ProposalResult:
+    """Burn the token without doing anything with it.
+
+    Spending it on a decline is the point: it stops a card left open in a tab from being
+    tappable later by anyone who reaches that tab.
+    """
+    await RedisProposalStore().spend(proposal_token, user.id)
+    return ProposalResult(status="declined", message="Okay, nothing saved.")
 
 
 @router.post("/ask")
@@ -160,6 +312,20 @@ async def ask(
     async def _body() -> AsyncIterator[str]:
         async for event in engine.stream(message):
             yield _frame(event)
+        # After the last frame: the shadow run answers nobody, so it must not be in front
+        # of anyone's answer. Its failure is logged and never reaches this response --
+        # the reader has already had theirs.
+        if settings.AGENT_SHADOW and payload.question.strip():
+            try:
+                await enqueue_shadow_agent_turn(
+                    str(user.id),
+                    payload.question,
+                    session_id_for(user.id, message),
+                    _SURFACE,
+                    classify(message).value,
+                )
+            except Exception as exc:  # noqa: BLE001 - an experiment is not worth a 500
+                log.warning("agent_shadow_enqueue_failed", error=type(exc).__name__)
 
     return StreamingResponse(
         _body(),

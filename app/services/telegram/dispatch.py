@@ -35,12 +35,18 @@ from typing import Any
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.chat_engine import status
-from app.services.chat_engine.engine import ChatEngine, RecallLanes, classify
+from app.services.chat_engine.engine import (
+    ChatEngine,
+    RecallLanes,
+    classify,
+    session_id_for,
+)
+from app.services.chat_engine.proposals import ProposalStore
 from app.services.chat_engine.router import Intent
 from app.services.chat_engine.types import InboundMessage
 from app.services.surfaces.telegram.parse import parse_message
-from app.services.surfaces.telegram.render import render
-from app.services.telegram import formatting, limits
+from app.services.surfaces.telegram.render import render, render_markup
+from app.services.telegram import confirm, formatting, limits
 from app.services.telegram.capture import (
     CaptureKind,
     CaptureOutcome,
@@ -74,6 +80,24 @@ class DispatchResult:
     # Only ever a connect button, and only for a sender we could not identify. Built
     # from configuration in `formatting`, never from anything in the update.
     reply_markup: dict[str, Any] | None = None
+    #: A turn to re-run through the agent after the reply has gone out, while the two
+    #: systems are being compared. `None` in normal operation.
+    shadow: ShadowTurn | None = None
+    #: Set when this reply answers a tapped button. Telegram spins the button until the
+    #: acknowledgement arrives, so it is feedback rather than bookkeeping.
+    answer_callback_id: str | None = None
+    #: The card whose buttons should come off, now that one of them has been acted on.
+    clear_markup_message_id: int | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class ShadowTurn:
+    """What the agent needs to answer the question the old lanes have just answered."""
+
+    user_id: uuid.UUID
+    question: str
+    session_id: str
+    lane: str
 
 
 class TelegramDispatcher:
@@ -83,17 +107,30 @@ class TelegramDispatcher:
         vault: VaultService,
         client: TelegramClient,
         recall: RecallLanes | None = None,
+        proposals: ProposalStore | None = None,
     ) -> None:
         self.links = links
         self.vault = vault
         self.client = client
         self.capture = TelegramCaptureService(vault, client)
+        #: Where a tapped button's token is redeemed. `None` means this deployment has
+        #: no store wired up, and a tap is then answered as expired rather than acted on
+        #: -- the same answer an unknown token gets, which is the point.
+        self.proposals = proposals
         # None when no chat model is configured. Plain text is then answered with
         # `chat_unavailable` rather than saved: links and files still capture, so nothing
         # a user meant to keep is lost, and nothing they meant as talk is kept.
         self.recall = recall
 
     async def handle(self, update: dict[str, Any]) -> DispatchResult:
+        # A tapped button first: it is a different update shape entirely, and everything
+        # below reads `message`. It goes through the same account lookup, the same
+        # private-chat rule and the same rate limit -- a tap is a request like any other,
+        # and the only thing that makes it privileged is a token it has to redeem.
+        callback = update.get("callback_query")
+        if isinstance(callback, dict):
+            return await self._handle_callback(callback)
+
         message = update.get("message")
         if not isinstance(message, dict):
             return DispatchResult()
@@ -212,9 +249,118 @@ class TelegramDispatcher:
         # second-guessing which lanes need a provider: the status lane needs none, and a
         # check here would have taken it away.
         engine = ChatEngine(self.recall, user_id, saves=self.vault)
+        answer = await engine.handle(inbound)
         return DispatchResult(
-            render(await engine.handle(inbound)), chat_id=identity.chat_id
+            render(answer),
+            chat_id=identity.chat_id,
+            # A question's options and a proposal's Yes/No travel as a keyboard, which is
+            # a different field of the same API call than the text. Rendering them into
+            # the message body instead would offer buttons a person cannot press.
+            reply_markup=render_markup(answer),
+            shadow=_shadow_for(user_id, inbound, intent),
         )
+
+    async def _handle_callback(self, callback: dict[str, Any]) -> DispatchResult:
+        """One tapped button. Authorised exactly like a message, then redeemed.
+
+        The order is the whole of it: private chat, then the account lookup that *is*
+        this surface's access control, then the rate limit, and only then the token. A
+        token is not an identity -- it says what may be done, never by whom -- so it is
+        checked last and against the account this sender resolved to.
+        """
+        query_id = str(callback.get("id") or "")
+        message = callback.get("message")
+        if not isinstance(message, dict):
+            return DispatchResult(answer_callback_id=query_id or None)
+
+        chat = message.get("chat")
+        if not isinstance(chat, dict) or chat.get("type") != "private":
+            # The bot does not act in a room, and a tap in one is the same disclosure a
+            # reply in one would be.
+            log.info("telegram_non_private_ignored")
+            return DispatchResult(answer_callback_id=query_id or None)
+
+        chat_id = str(chat.get("id"))
+        message_id = message.get("message_id")
+        sender = callback.get("from")
+        sender_id = str(sender.get("id")) if isinstance(sender, dict) else ""
+        if not sender_id:
+            return DispatchResult(answer_callback_id=query_id or None)
+
+        account = await self.links.resolve(sender_id)
+        if account is None:
+            # An unlinked sender learns nothing -- not that the token was real, not who
+            # it belonged to. They are told how to connect, as everywhere else here.
+            return DispatchResult(
+                formatting.not_linked(),
+                chat_id=chat_id,
+                reply_markup=formatting.connect_markup(),
+                answer_callback_id=query_id or None,
+            )
+
+        tap = confirm.parse(callback.get("data"))
+        if tap is None or self.proposals is None:
+            return DispatchResult(
+                formatting.proposal_expired(),
+                chat_id=chat_id,
+                answer_callback_id=query_id or None,
+            )
+
+        if not await limits.allow(sender_id, limits.Action.capture):
+            log.info("telegram_rate_limited", action=limits.Action.capture.value)
+            return DispatchResult(
+                formatting.rate_limited(),
+                chat_id=chat_id,
+                answer_callback_id=query_id or None,
+            )
+
+        outcome = await confirm.execute(
+            tap,
+            store=self.proposals,
+            vault=self.vault,
+            capture=self.capture,
+            user_id=account.user_id,
+            chat_id=chat_id,
+            message=message,
+        )
+
+        if outcome.reroute_text is not None:
+            # An offered answer. Fed back through the ordinary inbound path as if typed,
+            # so there is no second routing path to keep in step -- and the text is the
+            # person's own words from here on, which is what later lets it stand as the
+            # provenance for a proposal.
+            return await self._reroute(
+                outcome.reroute_text, callback, chat_id, query_id, message_id
+            )
+
+        return DispatchResult(
+            outcome.reply,
+            enqueue_item_ids=outcome.enqueue_item_ids,
+            chat_id=chat_id,
+            answer_callback_id=query_id or None,
+            clear_markup_message_id=message_id if isinstance(message_id, int) else None,
+        )
+
+    async def _reroute(
+        self,
+        text: str,
+        callback: dict[str, Any],
+        chat_id: str,
+        query_id: str,
+        message_id: object,
+    ) -> DispatchResult:
+        """A tapped option, replayed as an ordinary message."""
+        replayed = {
+            "chat": {"id": chat_id, "type": "private"},
+            "from": callback.get("from"),
+            "text": text,
+        }
+        result = await self.handle({"message": replayed})
+        result.answer_callback_id = query_id or None
+        result.clear_markup_message_id = (
+            message_id if isinstance(message_id, int) else None
+        )
+        return result
 
     async def _handle_note(
         self,
@@ -240,6 +386,24 @@ class TelegramDispatcher:
         return _capture_reply(outcome, identity.chat_id)
 
 
+def _shadow_for(
+    user_id: uuid.UUID, inbound: InboundMessage, intent: Intent
+) -> ShadowTurn | None:
+    """The same turn, for the agent to answer out of sight -- when that is switched on.
+
+    Only for messages the agent would have handled. A capture and a command never reach
+    it, so re-running them would compare two systems on a question neither was asked.
+    """
+    if not settings.AGENT_SHADOW or not (inbound.text or "").strip():
+        return None
+    return ShadowTurn(
+        user_id=user_id,
+        question=inbound.text or "",
+        session_id=session_id_for(user_id, inbound),
+        lane=intent.value,
+    )
+
+
 def _capture_reply(outcome: CaptureOutcome, chat_id: str) -> DispatchResult:
     kind, item = outcome.kind, outcome.item
     if kind is CaptureKind.voice_unsupported:
@@ -260,7 +424,7 @@ def _capture_reply(outcome: CaptureOutcome, chat_id: str) -> DispatchResult:
 
     # The acknowledgement is deliberately terse: the real reply -- summary, category,
     # tags -- is sent by `deliver_telegram_result` once the pipeline finishes.
-    ack = formatting.note_saved(item) if kind is CaptureKind.note else formatting.saving()
+    ack = formatting.note_saved(item) if kind is CaptureKind.note else formatting.saving(item)
     return DispatchResult(ack, enqueue_item_ids=[item.id], chat_id=chat_id)
 
 
