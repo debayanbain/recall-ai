@@ -446,7 +446,7 @@ class MemoryToolbox:
             items = _with_tags(evidence.items, tags)[:rows]
             if not items:
                 return _NO_MATCH
-            blocks = self._render(items, wanted)
+            blocks = self._render(items, wanted, cap=rows)
             if evidence.status is EvidenceStatus.insufficient:
                 return (
                     "These are only a WEAK match. Do not stretch them to fit -- say you "
@@ -474,7 +474,7 @@ class MemoryToolbox:
         if not found:
             return _NO_MATCH
         header = f"{total} saved in total; {len(found)} shown below.\n\n"
-        return header + self._render(found, wanted)
+        return header + self._render(found, wanted, cap=rows)
 
     async def get_capture_status(self, memory_id: str | None = None) -> str:
         """Whether a capture finished, is still being read, or failed.
@@ -693,7 +693,10 @@ class MemoryToolbox:
     # --- rendering ----------------------------------------------------------------------
 
     def _render(
-        self, items: Sequence[VaultItem], fields: tuple[str, ...] | None = None
+        self,
+        items: Sequence[VaultItem],
+        fields: tuple[str, ...] | None = None,
+        cap: int | None = None,
     ) -> str:
         """Cards as fenced blocks, registering each one as citable evidence.
 
@@ -703,7 +706,15 @@ class MemoryToolbox:
         model but missing from that set would have its own citation stripped as a
         fabrication.
         """
-        allowed = items[: DETAIL_MAX_ITEMS * 4]
+        # `cap` is the caller's own ceiling. The fixed one below it is for the older
+        # lane, whose tools take no limit and pass no budget -- without something, a
+        # listing there could pour a whole vault into the context window.
+        #
+        # It used to apply to *every* caller, which silently contradicted a query that
+        # asked for more: asked to list 13 memories the repository returned 13, this cut
+        # them to 8, and the model reported eight as the whole vault. A limit the caller
+        # chose and a limit nothing tells them about are different things.
+        allowed = items[: cap if cap is not None else DETAIL_MAX_ITEMS * 4]
         if self.budget is not None:
             keep = self.budget.take_cards(len(allowed))
             dropped = len(allowed) - keep

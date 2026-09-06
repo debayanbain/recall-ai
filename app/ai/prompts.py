@@ -34,7 +34,11 @@ BOT_IDENTITY = (
 #: search/list pair on the agent lane, and the prompt gained "never say you cannot give
 #: them something without looking first" -- after a live turn answered "I can't provide
 #: links directly" about memories that had two apiece.
-PROMPT_VERSION = "agent-v2"
+#:
+#: v3: bare URLs, list everything you were given, and say when a result was truncated --
+#: after a live turn wrote `[Link](url)` into a chat that renders plain text, and reported
+#: eight of thirteen memories as the whole vault.
+PROMPT_VERSION = "agent-v3"
 
 #: What the product can and cannot do, in the model's own context so it stops guessing.
 #: Ten lines, no surface named: the same card is read by the bot and by the web page, and

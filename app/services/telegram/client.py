@@ -31,6 +31,38 @@ _TIMEOUT = 20.0
 _FILE_PATH_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_./-]*$")
 
 
+#: Telegram's own ceiling on one message. Over it, `sendMessage` answers 400 and the
+#: person gets nothing at all.
+_MAX_MESSAGE_CHARS = 4096
+
+
+def _split(text: str, limit: int) -> list[str]:
+    """One message, or several that read as one.
+
+    Breaks at a paragraph, then at a line, and only falls back to a hard cut when a
+    single line is itself longer than the limit. The order matters: a URL is never split
+    across two messages unless it alone exceeds 4096 characters, and half a URL in a chat
+    is not a shorter link, it is a broken one somebody will tap.
+    """
+    if len(text) <= limit:
+        return [text]
+
+    parts: list[str] = []
+    rest = text
+    while len(rest) > limit:
+        window = rest[:limit]
+        cut = window.rfind("\n\n")
+        if cut <= 0:
+            cut = window.rfind("\n")
+        if cut <= 0:
+            cut = limit
+        parts.append(rest[:cut].rstrip())
+        rest = rest[cut:].lstrip("\n")
+    if rest:
+        parts.append(rest)
+    return parts
+
+
 class TelegramApiError(RuntimeError):
     """A Bot API call failed. Safe to log; never rendered to a user verbatim."""
 
@@ -85,24 +117,36 @@ class TelegramClient:
         disable_preview: bool = True,
         reply_markup: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
-        """Send HTML-formatted text.
+        """Send HTML-formatted text, split across messages if it is too long.
 
         HTML rather than MarkdownV2 on purpose: MarkdownV2 requires escaping 18
         characters including `.` and `-`, so a single unescaped title turns into a 400
         and the user gets nothing at all. HTML needs only `& < >`, which
         `formatting.escape` handles.
+
+        **Telegram rejects a message over 4096 characters outright.** That used not to be
+        reachable, because the answer guard clipped at 1500 -- so raising the guard to let
+        a list of memories carry its links made a 400 possible for the first time, and a
+        400 here means the person gets *nothing*, which is worse than the wall of text it
+        was protecting them from. `_split` breaks on paragraph and line boundaries so a
+        URL is never cut across two messages; only the last part carries the keyboard,
+        because a keyboard belongs to the end of a reply rather than the middle of one.
         """
-        payload: dict[str, Any] = {
-            "chat_id": chat_id,
-            "text": text,
-            "parse_mode": "HTML",
-            "link_preview_options": {"is_disabled": disable_preview},
-        }
-        # Omitted rather than sent as null: Telegram treats a present-but-empty
-        # `reply_markup` as a keyboard to render, and an empty one is a 400.
-        if reply_markup is not None:
-            payload["reply_markup"] = reply_markup
-        return await self._call("sendMessage", payload)
+        parts = _split(text, _MAX_MESSAGE_CHARS)
+        result: dict[str, Any] = {}
+        for index, part in enumerate(parts):
+            payload: dict[str, Any] = {
+                "chat_id": chat_id,
+                "text": part,
+                "parse_mode": "HTML",
+                "link_preview_options": {"is_disabled": disable_preview},
+            }
+            # Omitted rather than sent as null: Telegram treats a present-but-empty
+            # `reply_markup` as a keyboard to render, and an empty one is a 400.
+            if reply_markup is not None and index == len(parts) - 1:
+                payload["reply_markup"] = reply_markup
+            result = await self._call("sendMessage", payload)
+        return result
 
     async def send_chat_action(self, chat_id: str, action: str = "typing") -> None:
         """Best-effort typing indicator. A failure here must never fail the capture."""

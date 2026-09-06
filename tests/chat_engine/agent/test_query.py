@@ -216,3 +216,67 @@ def test_the_query_schema_has_no_tenant_field() -> None:
 
     fields = set(QueryMemories.model_fields)
     assert not fields & {"user_id", "user", "owner", "account", "account_id"}
+
+
+# --- the caps that were silently cutting the list ------------------------------------
+
+
+async def test_a_listing_returns_every_row_the_query_asked_for() -> None:
+    """The bug behind "give me the full list" answering with eight of thirteen.
+
+    `_render` had a fixed ceiling of `DETAIL_MAX_ITEMS * 4`, applied to every caller. The
+    repository returned all 13, this cut them to 8, and the model reported eight as the
+    whole vault -- confidently, because nothing in the result said it had been cut. A
+    limit the caller chose and a limit nothing tells them about are different things.
+    """
+    from app.services.chat_engine.budget import Budget
+
+    items = [_item(f"memory {n}") for n in range(13)]
+    box = MemoryToolbox(  # type: ignore[arg-type]
+        _USER,
+        FakeRepo(items),
+        budget=Budget(max_calls=6, max_rounds=4, wall_clock_seconds=20, max_cards=25),
+    )
+
+    rendered = await box.query_memories(limit=13)
+
+    assert rendered.count("<memory ") == 13
+    assert len(box.surfaced) == 13
+
+
+async def test_a_truncated_listing_says_so() -> None:
+    """Silence is the part that made the old cap dangerous, not the number."""
+    from app.services.chat_engine.budget import Budget
+
+    items = [_item(f"memory {n}") for n in range(13)]
+    box = MemoryToolbox(  # type: ignore[arg-type]
+        _USER,
+        FakeRepo(items),
+        budget=Budget(max_calls=6, max_rounds=4, wall_clock_seconds=20, max_cards=5),
+    )
+
+    rendered = await box.query_memories(limit=13)
+
+    assert rendered.count("<memory ") == 5
+    assert "8 more" in rendered
+
+
+def test_the_answer_cap_leaves_room_for_a_list_with_links() -> None:
+    """Two URLs per memory is ~150 characters before the title.
+
+    At 1500 the guard clipped that list mid-URL, which is worse than a long answer twice
+    over: a cut link is not a shorter link, and the truncated one fails its own allowlist
+    check on the next turn. It still has to stay under Telegram's 4096 message ceiling.
+    """
+    from app.core.config import settings
+
+    assert settings.RECALL_ANSWER_MAX_CHARS >= 3000
+    assert settings.RECALL_ANSWER_MAX_CHARS < 4096
+
+
+def test_the_agent_can_write_the_length_the_guard_permits() -> None:
+    """The other half of the same clip: the model stopped generating before the guard ran."""
+    import app.ai.chat.factory as factory
+    from app.core.config import settings
+
+    assert factory._AGENT_MAX_OUTPUT_TOKENS > settings.RECALL_ANSWER_MAX_CHARS / 4

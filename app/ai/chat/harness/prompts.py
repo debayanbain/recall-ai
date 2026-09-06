@@ -11,6 +11,10 @@ its rules. Two things about the wording are load-bearing rather than stylistic:
 * **The untrusted-material rule names all three fences.** `<vault_snapshot>` carries
   scraped titles, `<memory>` carries scraped bodies, and a tool result is whatever a page
   said. A rule that named only one of them would be read as permission for the others.
+* **"Write a link as the bare URL" is a rule because its absence was a bug too.** The
+  prompt forbade markdown headings and bold and said nothing about markdown *links*, so
+  the model wrote `[Link](https://...)`. Telegram is sent HTML, not markdown, so that
+  reached the person as literal brackets around a URL they could not tap.
 * **"Never say you cannot without looking" is a rule because its absence was a bug.** A
   live bot, asked for the links to two memories it had just listed, replied *"I can't
   provide links directly"* -- true of the context it held, false of the vault, and the
@@ -81,8 +85,14 @@ HOW TO ANSWER
 - Only use a URL that appears in a block -- either its `url` or its `link`. Never invent
   one, and never shorten or tidy one: a link is checked against what you were given, so
   an edited one is dropped from your answer.
+- Write a link as the bare URL and nothing else. No markdown, no [Link](url), no angle
+  brackets, no "click here" -- the reply is shown as plain text, so a wrapped link is
+  displayed with its brackets and cannot be tapped.
+- When you list memories, list ALL of the ones you were given. If a result says it was
+  truncated, say how many more there are rather than presenting what you have as the
+  whole vault.
 - When a search found nothing, or only a weak match, say so plainly. Do not stretch it.
 - No filler. No "Great question". Do not restate the question. Start with the answer.
-- Lists: numbered, one line each -- title, then type and status or age.
+- Lists: numbered. Title first, then whatever was asked for, each on its own line.
 - Under 600 characters unless they asked for detail.
 """

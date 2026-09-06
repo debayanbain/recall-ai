@@ -304,7 +304,13 @@ class Settings(BaseSettings):
     # A grounded answer about a handful of cards has no honest reason to be long, and an
     # answer that runs away from its evidence is the shape a fabrication takes. Clipped
     # rather than rejected -- the first sentences are the answer.
-    RECALL_ANSWER_MAX_CHARS: int = 1500
+    # Raised from 1500, which was sized for prose. A grounded answer still has no reason
+    # to ramble -- but "list what I saved, with links" is a legitimately long reply, and
+    # two URLs per memory is ~150 characters each before the title. At 1500 the guard was
+    # clipping that list **mid-URL**, which is worse than a long answer twice over: a cut
+    # link is not a shorter link, and the truncated one then fails its own allowlist check
+    # on the next turn. Kept under Telegram's 4096-character message ceiling.
+    RECALL_ANSWER_MAX_CHARS: int = 3500
     # --- the tool lane ---
     # When true, a RECALL question is answered by a model that runs the searches itself
     # (`ai/chat/tools.py`) instead of by one planner call and one fixed search. It buys
@@ -395,7 +401,14 @@ class Settings(BaseSettings):
     AGENT_WALL_CLOCK_SECONDS: int = 20
     # Memory cards from all tools in one turn. Past this, list and search truncate and
     # say so, rather than filling the context window with a vault.
-    AGENT_MAX_CONTEXT_CARDS: int = 12
+    #
+    # 12 was too tight for the request people actually make. "Give me the full list with
+    # links" on a 13-item vault hit this *and* the fixed cap in `_render`, and the model
+    # reported eight items as the whole vault -- confidently, because nothing tells it
+    # that a listing was cut. A card is a title and a couple of fields; twenty-five of
+    # them is a few thousand tokens, which is affordable for the one question this
+    # product exists to answer.
+    AGENT_MAX_CONTEXT_CARDS: int = 25
     # How long a proposed write, or an offered answer, stays tappable. Long enough to
     # read the confirmation and decide, short enough that a card left in a chat overnight
     # is not a live credential. Single-use regardless, so this is the ceiling and not the

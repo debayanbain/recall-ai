@@ -64,6 +64,14 @@ _MAX_RETRIES = 2
 #: ample there as well.
 _MAX_OUTPUT_TOKENS = 512
 
+#: The agent's own ceiling, and it has to clear `RECALL_ANSWER_MAX_CHARS` (3500, roughly
+#: 875 tokens) or the model stops writing before the guard has anything to check. That is
+#: the failure mode this number exists to prevent: asked to list a vault with links, the
+#: generation ran out mid-URL, and a cut URL is not a shorter link -- it is a broken one
+#: that then fails its own allowlist check. Only this lane needs the room; the planner's
+#: structured call still wants about sixty tokens.
+_AGENT_MAX_OUTPUT_TOKENS = 1200
+
 
 def chat_available() -> bool:
     """True when the configured provider has a key. Checked before any chat feature."""
@@ -82,14 +90,18 @@ def _has_key(provider: str) -> bool:
     return False
 
 
-def build_chat_model(provider: str, model: str | None = None) -> BaseChatModel:
+def build_chat_model(
+    provider: str, model: str | None = None, max_tokens: int | None = None
+) -> BaseChatModel:
     """One provider's chat model. Raises for a provider this module cannot build.
 
-    `model` overrides the provider's configured model id and nothing else -- same key,
-    same temperature, same timeouts. It exists so the agent loop can run on a different
-    model without a second copy of this construction, which is how one of the two ends up
-    with a timeout nobody meant to change.
+    `model` and `max_tokens` override the provider's configured model id and output
+    ceiling and nothing else -- same key, same temperature, same timeouts. They exist so
+    the agent loop can run on a different model, with the room a list-with-links answer
+    needs, without a second copy of this construction -- which is how one of the two ends
+    up with a timeout nobody meant to change.
     """
+    cap = max_tokens or _MAX_OUTPUT_TOKENS
     if provider == "openai":
         from langchain_openai import ChatOpenAI
 
@@ -99,7 +111,7 @@ def build_chat_model(provider: str, model: str | None = None) -> BaseChatModel:
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
             max_retries=_MAX_RETRIES,
-            max_tokens=_MAX_OUTPUT_TOKENS,
+            max_tokens=cap,
         )
     if provider == "gemini":
         from langchain_google_genai import ChatGoogleGenerativeAI
@@ -110,7 +122,7 @@ def build_chat_model(provider: str, model: str | None = None) -> BaseChatModel:
             temperature=_TEMPERATURE,
             timeout=_TIMEOUT,
             max_retries=_MAX_RETRIES,
-            max_output_tokens=_MAX_OUTPUT_TOKENS,
+            max_output_tokens=cap,
         )
     raise ValueError(f"No chat model for AI_PROVIDER={provider!r}")
 
@@ -141,9 +153,11 @@ def get_agent_model() -> BaseChatModel:
     and this lane is built on both.
     """
     configured = settings.AGENT_CHAT_MODEL.strip()
-    if not configured:
-        return get_chat_model()
-    return build_chat_model(settings.AI_PROVIDER, configured)
+    return build_chat_model(
+        settings.AI_PROVIDER,
+        configured or None,
+        max_tokens=_AGENT_MAX_OUTPUT_TOKENS,
+    )
 
 
 @lru_cache(maxsize=1)

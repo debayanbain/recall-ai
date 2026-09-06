@@ -357,3 +357,60 @@ async def test_the_claim_is_a_set_nx_with_a_ttl(monkeypatch: pytest.MonkeyPatch)
     assert calls[0]["key"] == "tg:update:77"
     assert calls[0]["nx"] is True
     assert calls[0]["ex"] == settings.TELEGRAM_UPDATE_DEDUPE_TTL_SECONDS
+
+
+# --- a reply too long for one message -------------------------------------------------
+
+
+def test_a_long_reply_is_split_on_a_line_boundary() -> None:
+    """Telegram rejects a message over 4096 characters, and a 400 means nothing arrives.
+
+    Unreachable while the answer guard clipped at 1500 -- so raising that cap to let a
+    list carry its links made this possible for the first time. Splitting on a line break
+    is what keeps a URL whole: half a link in a chat is not a shorter link, it is a broken
+    one somebody will tap.
+    """
+    from app.services.telegram.client import _MAX_MESSAGE_CHARS, _split
+
+    line = "1. A memory — https://example.com/" + "a" * 60
+    text = "\n".join(line for _ in range(200))
+
+    parts = _split(text, _MAX_MESSAGE_CHARS)
+
+    assert len(parts) > 1
+    assert all(len(p) <= _MAX_MESSAGE_CHARS for p in parts)
+    # Every line survives intact in some part -- no URL cut across the boundary.
+    assert sum(p.count("https://") for p in parts) == 200
+    for part in parts:
+        for rendered in part.splitlines():
+            assert rendered == line
+
+
+def test_a_short_reply_is_still_one_message() -> None:
+    from app.services.telegram.client import _MAX_MESSAGE_CHARS, _split
+
+    assert _split("just this", _MAX_MESSAGE_CHARS) == ["just this"]
+
+
+async def test_only_the_last_part_carries_the_keyboard() -> None:
+    """A keyboard belongs to the end of a reply, not the middle of one."""
+    from app.services.telegram.client import TelegramClient
+
+    sent: list[dict[str, Any]] = []
+
+    class Recorder(TelegramClient):
+        def __init__(self) -> None:
+            super().__init__(token="x")
+
+        async def _call(self, method: str, payload: dict[str, Any]) -> dict[str, Any]:
+            sent.append(payload)
+            return {}
+
+    await Recorder().send_message(
+        "4242", "\n".join(f"line {n} " + "x" * 80 for n in range(200)),
+        reply_markup={"inline_keyboard": [[{"text": "Yes", "callback_data": "p:t"}]]},
+    )
+
+    assert len(sent) > 1
+    assert "reply_markup" not in sent[0]
+    assert "reply_markup" in sent[-1]
