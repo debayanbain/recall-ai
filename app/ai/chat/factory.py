@@ -46,11 +46,23 @@ _MAX_RETRIES = 2
 #: the token. Set generously above four sentences (~100 tokens) so a normal reply is
 #: never cut off mid-word -- a truncated answer is worse than a long one.
 #:
+#: **It has to sit above `RECALL_ANSWER_MAX_CHARS`, and at 256 it did not.** That guard
+#: allows 1500 characters, roughly 375 tokens, so the model could not reach the length it
+#: was permitted: measured on a real "give me those links" turn, gpt-4o spent all 256 and
+#: was cut off mid-URL. A truncated URL is worse than a long answer twice over -- the
+#: guard then fails to match it against the allowlist and replaces it with
+#: `[link omitted]`.
+#:
+#: It is also the budget a *reasoning* model spends before it writes anything. gpt-5-mini
+#: fails outright at 256 with "max_tokens or model output limit was reached", having spent
+#: the lot on reasoning tokens. Anything in that family needs room to think and then
+#: answer, which is the other reason this is not tight.
+#:
 #: The kwarg is named differently by each provider, which is why this lives here: the
 #: factory is the only place that knows which provider is configured. It applies to the
 #: planner's structured call too, which needs roughly sixty tokens, so the headroom is
 #: ample there as well.
-_MAX_OUTPUT_TOKENS = 256
+_MAX_OUTPUT_TOKENS = 512
 
 
 def chat_available() -> bool:
