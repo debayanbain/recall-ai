@@ -207,11 +207,19 @@ def describe(items: Sequence[VaultItem], message: str = "", *, now: datetime | N
 
 
 def _title_of(item: VaultItem) -> str:
-    """What to call this memory. Never `content` -- it is not loaded on a card query."""
-    raw = (item.title or item.source_url or "").strip()
-    if not raw:
-        return "your last save"
-    return raw if len(raw) <= _MAX_TITLE else raw[: _MAX_TITLE - 1].rstrip() + "…"
+    """What to call this memory. Never `content` -- it is not loaded on a card query.
+
+    A title is clipped; a **URL is not**. When there is no title yet -- which is every
+    capture until the pipeline finishes, and exactly the item a status question is about
+    -- the URL is standing in for one, and half of a URL is not a shorter link, it is a
+    broken one. It also reaches the model through `get_capture_status`, where a clipped
+    one fails the answer validator's allowlist check and is replaced with
+    `[link omitted]`: the model quotes what it was given and the guard deletes it.
+    """
+    title = (item.title or "").strip()
+    if title:
+        return title if len(title) <= _MAX_TITLE else title[: _MAX_TITLE - 1].rstrip() + "…"
+    return (item.source_url or "").strip() or "your last save"
 
 
 def _relative(moment: datetime | None, phrasing: _Phrasing, *, now: datetime | None = None) -> str:

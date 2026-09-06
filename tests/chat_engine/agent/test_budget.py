@@ -189,7 +189,7 @@ async def test_a_turn_that_runs_out_still_ends_with_words(
     toolbox = MemoryToolbox(_USER, repo, budget=_budget(max_calls=6))  # type: ignore[arg-type]
     recorded = RecordedModel(
         [
-            Turn(calls=[("ListMemories", {}) for _ in range(7)]),
+            Turn(calls=[("QueryMemories", {}) for _ in range(7)]),
             Turn(text="Here are the ones I could get to."),
         ]
     )

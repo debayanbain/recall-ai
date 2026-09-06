@@ -1,0 +1,23 @@
+name: an untitled capture is described by its link
+why: >
+  A fresh link save has no title until the pipeline finishes, and it is the newest row --
+  the one the next message is about. The snapshot used to render it as an empty tag,
+  `<item id=".." status="pending"></item>`, describing nothing, which is why the bot in
+  the screenshot could say the newest item was processing but not what it was. Every other
+  renderer already fell back to the source URL; this one now does too.
+user_text: "what was the last thing I sent?"
+snapshot:
+  - title: null
+    type: facebook
+    status: processing
+    age_minutes: 1
+    url: "https://www.facebook.com/share/r/19a2dy2tPp/"
+model_turns:
+  - text: "The newest one is https://www.facebook.com/share/r/19a2dy2tPp/ — still processing, sent 1m ago."
+expect:
+  tool_calls: []
+  reply_contains: ["https://www.facebook.com/share/r/19a2dy2tPp/", "processing"]
+  context_contains:
+    - "url=\"https://www.facebook.com/share/r/19a2dy2tPp/\""
+    - ">https://www.facebook.com/share/r/19a2dy2tPp/</item>"
+  failed: false

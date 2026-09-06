@@ -138,6 +138,18 @@ async def test_golden_case(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
 
     from app.ai.chat import harness
 
+    # What the model was actually shown. A recorded case replays a scripted reply, so
+    # asserting on the reply alone cannot tell "the model had the data" from "the script
+    # happened to contain it" -- removing the URLs from the snapshot left every case
+    # green. This is the half that catches that.
+    shown: list[str] = []
+    real_run = harness.graph.run_agent
+
+    def _capture(question, history, executor, *, context="", budget):  # type: ignore[no-untyped-def]
+        shown.append(context)
+        return real_run(question, history, executor, context=context, budget=budget)
+
+    monkeypatch.setattr(harness.graph, "run_agent", _capture)
     monkeypatch.setattr(langgraph.prebuilt, "create_react_agent", recorded)
     monkeypatch.setattr(harness.graph, "get_agent_model", lambda: object())
     monkeypatch.setattr(settings, "AGENT_ENABLED", True)
@@ -194,6 +206,11 @@ async def test_golden_case(path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
         assert needle not in reply, f"{path.name}: {needle!r} leaked into the reply"
     if "max_chars" in expect:
         assert len(reply) <= int(expect["max_chars"])
+    for needle in expect.get("context_contains") or []:
+        assert shown, f"{path.name}: the agent lane never ran"
+        assert needle in shown[0], (
+            f"{path.name}: {needle!r} was never put in front of the model"
+        )
     if "proposal_preview" in expect:
         assert offered is not None, f"{path.name}: nothing was offered"
         assert offered.preview == expect["proposal_preview"]

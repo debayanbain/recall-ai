@@ -16,7 +16,7 @@ import pytest
 
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine.cards import short_id
+from app.services.chat_engine.cards import memory_link, short_id
 from app.services.chat_engine.context import load_snapshot, render_snapshot
 
 _USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
@@ -25,6 +25,7 @@ _USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 def _item(
     *,
     title: str | None = "BellaVita White Oud",
+    source_url: str | None = "https://example.com/perfume",
     state: ProcessingStatus = ProcessingStatus.completed,
     age: timedelta = timedelta(minutes=53),
     kind: ContentType = ContentType.article,
@@ -34,6 +35,7 @@ def _item(
         user_id=_USER,
         type=kind,
         title=title,
+        source_url=source_url,
         processing_status=state,
         created_at=datetime.now(UTC) - age,
     )
@@ -213,3 +215,66 @@ async def test_a_naive_timestamp_is_read_as_utc_rather_than_crashing() -> None:
     block = render_snapshot(await load_snapshot(reader, _USER, 3))
 
     assert 'age="2h"' in block
+
+
+# --- the links, which are the reason this block exists at all --------------------------
+
+
+async def test_every_row_carries_both_of_its_links() -> None:
+    """The failure this was written for.
+
+    Asked for the links to two memories it had just listed, a live bot replied "I can't
+    provide links directly". That was true of the context it held and false of the vault:
+    the snapshot carried id, type, status, age and a title, and no URL at all. A model
+    cannot hand over what it was never shown.
+    """
+    item = _item()
+    block = render_snapshot(await load_snapshot(FakeReader([item]), _USER, 3))
+
+    assert f'url="{item.source_url}"' in block
+    assert f'link="{memory_link(item)}"' in block
+
+
+async def test_a_memory_with_no_source_still_has_a_vault_link() -> None:
+    """A note, a recording and an upload have no `url` -- and are still openable.
+
+    This is why `link` is a separate attribute rather than a fallback for `url`: one of
+    them is where it came from, the other is where it lives, and only the second exists
+    for everything.
+    """
+    item = _item(title="A voice note")
+    item.source_url = None
+    block = render_snapshot(await load_snapshot(FakeReader([item]), _USER, 3))
+
+    assert "url=" not in block
+    assert f'link="{memory_link(item)}"' in block
+
+
+async def test_a_titleless_capture_is_described_by_its_url() -> None:
+    """A fresh link save has no title until the pipeline finishes.
+
+    It used to render as `<item id=".." status="pending"></item>` -- an empty tag
+    describing nothing, and the *newest* row, which is the one the next message is about.
+    Every other renderer in the system already falls back to the source URL; this one did
+    not.
+    """
+    item = _item(title=None, state=ProcessingStatus.pending)
+    block = render_snapshot(await load_snapshot(FakeReader([item]), _USER, 3))
+
+    assert item.source_url is not None
+    assert f">{item.source_url}</item>" in block
+    assert "></item>" not in block
+
+
+async def test_a_url_cannot_break_out_of_its_attribute() -> None:
+    """`source_url` is whatever someone pasted, and it sits inside a quoted attribute.
+
+    A quote in it would close the attribute early and let the rest of the string read as
+    more attributes -- the same class of problem the title escaping already covers.
+    """
+    item = _item()
+    item.source_url = 'https://example.com/a" injected="yes'
+    block = render_snapshot(await load_snapshot(FakeReader([item]), _USER, 3))
+
+    assert 'injected="yes"' not in block
+    assert "&quot;" in block

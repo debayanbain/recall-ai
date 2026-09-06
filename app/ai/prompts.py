@@ -29,7 +29,12 @@ BOT_IDENTITY = (
 #: bumped on any edit to any of them -- the point is not to version each string but to be
 #: able to date a regression, and a per-prompt version is a set of numbers nobody keeps
 #: straight. Logged on every turn.
-PROMPT_VERSION = "agent-v1"
+#:
+#: v2: the snapshot gained both links per memory, `QueryMemories` replaced the fixed
+#: search/list pair on the agent lane, and the prompt gained "never say you cannot give
+#: them something without looking first" -- after a live turn answered "I can't provide
+#: links directly" about memories that had two apiece.
+PROMPT_VERSION = "agent-v2"
 
 #: What the product can and cannot do, in the model's own context so it stops guessing.
 #: Ten lines, no surface named: the same card is read by the bot and by the web page, and

@@ -16,7 +16,7 @@ import pytest
 from app.ai.chat import tools
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine.cards import short_id
+from app.services.chat_engine.cards import memory_link, short_id
 from app.services.chat_engine.evidence import RetrievedMemory
 from app.services.chat_engine.retrieval import MemoryRetriever
 from app.services.chat_engine.toolbox import MemoryToolbox
@@ -149,7 +149,11 @@ async def test_a_surfaced_memory_becomes_citable(monkeypatch: pytest.MonkeyPatch
 
     await box.search_memories("redis")
     assert box.allowed_ids == (short_id(item),)
-    assert box.allowed_urls == (item.source_url,)
+    # Both of the memory's links. `validate_answer` replaces any URL outside this set
+    # with `[link omitted]`, so the vault page missing from here would be a correct
+    # answer the guard silently deletes -- invisible from the model's side, and reading
+    # as a model problem rather than as a guard one.
+    assert box.allowed_urls == (item.source_url, memory_link(item))
 
 
 # --- the relevance gate is not the model's to skip -----------------------------------------
@@ -246,3 +250,55 @@ async def test_an_empty_vault_lists_nothing_rather_than_inventing_a_row() -> Non
     repo = FakeRepo([])
     result = await MemoryToolbox(_USER, repo).list_memories(days=7)  # type: ignore[arg-type]
     assert "No memories matched" in result
+
+
+async def test_both_links_survive_the_answer_validator(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The regression that would otherwise be invisible.
+
+    `validate_answer` replaces any URL outside the surfaced set with `[link omitted]`.
+    Add the vault page to the prompt without adding it to that set and the model does
+    everything right while the guard deletes the link on the way out -- a hole in the
+    reply, no error anywhere, and it reads as a model problem rather than a guard one.
+    """
+    from app.services.chat_engine.validation import validate_answer
+
+    item = _item()
+    _searching(monkeypatch, [item])
+    box = MemoryToolbox(_USER, FakeRepo())  # type: ignore[arg-type]
+    await box.search_memories("redis")
+
+    checked = validate_answer(
+        f"Source: {item.source_url} — in your vault: {memory_link(item)}",
+        allowed_ids=box.allowed_ids,
+        allowed_urls=box.allowed_urls,
+        max_chars=1500,
+    )
+
+    assert item.source_url in checked.text
+    assert memory_link(item) in checked.text
+    assert checked.removed == ()
+
+
+async def test_a_link_to_someone_elses_memory_is_still_stripped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Adding a second URL per memory widened the allowlist; it must not have opened it."""
+    from app.services.chat_engine.validation import validate_answer
+
+    item = _item()
+    _searching(monkeypatch, [item])
+    box = MemoryToolbox(_USER, FakeRepo())  # type: ignore[arg-type]
+    await box.search_memories("redis")
+
+    stranger = memory_link(item).replace(str(item.id), str(uuid.uuid4()))
+    checked = validate_answer(
+        f"Try {stranger}",
+        allowed_ids=box.allowed_ids,
+        allowed_urls=box.allowed_urls,
+        max_chars=1500,
+    )
+
+    assert stranger not in checked.text
+    assert any(entry.startswith("unknown-url:") for entry in checked.removed)

@@ -164,9 +164,11 @@ def test_any_new_tool_is_reachable_from_the_real_toolbox() -> None:
 
     names = {tool.name for tool in build_tools(MemoryToolbox(_USER, None))}  # type: ignore[arg-type]
 
+    # `QueryMemories` replaces the fixed SearchMemories/ListMemories pair here. They
+    # still exist and the older lane still binds them; offering all three would give the
+    # model two narrower ways to answer a question the composable one covers.
     assert names == {
-        "SearchMemories",
-        "ListMemories",
+        "QueryMemories",
         "GetMemory",
         "GetCaptureStatus",
         "AskUser",

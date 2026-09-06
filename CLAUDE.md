@@ -1173,6 +1173,21 @@ app/services/telegram/confirm.py                      what a tapped button does
   titles come from scraped pages. It is what makes "it", "that" and "my last one" resolve
   to a real row, and it is why "what were my last three?" costs no tool call. `total`
   rides alongside so three rows are never reported as a whole vault.
+  **Each row carries both of its links and falls back to the URL for a title**, and both
+  were bugs found on a live bot rather than design. Asked for the links to two memories it
+  had just listed, it replied *"I can't provide links directly"* -- true of its context,
+  false of the vault, and the data was one tool call away. And a fresh capture has no
+  title until the pipeline finishes, so the newest row -- the one the next message is
+  about -- rendered as an empty `<item></item>` describing nothing. Every other renderer
+  already fell back to `source_url`; this one did not.
+- **A memory has TWO links and they answer different questions.** `url` is where it came
+  from; `link` (`cards.memory_link`) is its page in the vault, and it is the only one a
+  note, a recording or an upload has. Handing the second over discloses nothing -- the
+  route takes the full UUID and the API re-scopes the row to the session.
+  **Both must be in `SurfacedSet.urls`.** `validate_answer` replaces any URL outside that
+  set with `[link omitted]`, so a link in the prompt but not in the allowlist is a correct
+  answer the guard silently deletes: no error, a hole in the reply, and it reads as a
+  model problem rather than a guard one. `tests/chat_engine/test_toolbox.py` pins it.
 - **`found_nothing` means "searched and found nothing", not "surfaced nothing".** The
   distinction did not exist before the snapshot and its absence would have been a
   regression: a question the snapshot answers is answered with **no tool call**, and the
@@ -1187,6 +1202,14 @@ app/services/telegram/confirm.py                      what a tapped button does
   a reply may cite, and which ids `GetMemory` may open. Both are the same claim -- the
   model saw this. The snapshot seeds it, tool results add to it, nothing else may write
   to it.
+- **The agent reads through one composable tool, not a menu of fixed ones.**
+  `QueryMemories` lets the model choose the filters *and* the projection (`fields`), which
+  is the answerable version of "let it build its own tool" -- it composes a query, and
+  nothing anywhere executes text a model wrote. `SearchMemories` / `ListMemories` still
+  exist and the older `recall_chat` lane still binds them; the agent lane does not, because
+  two narrower tools overlapping this one are two more ways to pick the worse answer.
+  Two things are deliberately not the model's to choose: **the links are always returned**
+  (a projection that could omit them can reproduce the bug above), and the tenant.
 - **A model may propose a write; it may never perform one.** Tool results are scraped
   captions -- exactly the text an attacker gets to write -- so `propose_note` mints a
   single-use token (`chat_engine/proposals.py`) and the write happens in

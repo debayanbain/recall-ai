@@ -1,0 +1,44 @@
+name: give me those links
+why: >
+  Straight from a live Telegram session. Asked for the links to two memories it had just
+  listed, the bot replied "I can't provide links directly, but here are the titles… You
+  can search for these titles in your vault". That was true of its context and false of
+  the vault: the snapshot carried id, type, status, age and a title, and no URL at all.
+  Now every row carries both links, so this is answerable with no tool call -- and the
+  reply must contain them rather than an apology.
+user_text: "Give me those links"
+snapshot:
+  - title: null
+    type: facebook
+    status: processing
+    age_minutes: 1
+    url: "https://www.facebook.com/share/r/19a2dy2tPp/"
+  - title: "Stop paying agency fees! You can apply directly for high-paying jobs in Switzerland"
+    type: facebook
+    status: completed
+    age_minutes: 27
+    url: "https://www.facebook.com/share/r/aaa111/"
+  - title: "AI ENGINEERING INTERVIEWS ARE CHANGING."
+    type: facebook
+    status: completed
+    age_minutes: 32
+    url: "https://www.facebook.com/share/r/bbb222/"
+model_turns:
+  - text: |
+      Here they are:
+      1. Stop paying agency fees! — https://www.facebook.com/share/r/aaa111/
+      2. AI ENGINEERING INTERVIEWS ARE CHANGING. — https://www.facebook.com/share/r/bbb222/
+expect:
+  tool_calls: []
+  reply_contains:
+    - "https://www.facebook.com/share/r/aaa111/"
+    - "https://www.facebook.com/share/r/bbb222/"
+  reply_not_contains:
+    - "can't provide"
+    - "cannot provide"
+    - "search for these titles"
+  context_contains:
+    - "url=\"https://www.facebook.com/share/r/aaa111/\""
+    - "url=\"https://www.facebook.com/share/r/bbb222/\""
+    - "link="
+  failed: false
