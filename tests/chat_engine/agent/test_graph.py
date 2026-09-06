@@ -406,3 +406,103 @@ async def test_rounds_are_counted_from_the_graphs_own_steps(
     end = events[-1]
     assert isinstance(end, graph.AgentEnd)
     assert end.rounds >= 2, "a search and an answer are two steps, not one"
+
+
+# --- FinalAnswer across rounds, which is where it used to be lost ---------------------
+
+
+async def test_final_answer_survives_a_tool_call_before_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The shape that silently lost every self-report on a live bot.
+
+    A provider numbers tool calls within one model turn, so the numbering restarts at
+    zero on the next. Keyed by index alone, the search in round one and the answer in
+    round two shared an accumulator and their two JSON documents were concatenated into
+    one unparseable string -- so the reply still arrived as prose while
+    `declined_out_of_scope` and `asked_question` stayed false for reasons nobody could
+    see. A turn that answered *immediately* was the only shape that worked, which is
+    exactly the shape that hides it.
+    """
+    _retrieving(monkeypatch, [_item()])
+    recorded = RecordedModel(
+        [
+            Turn(calls=[("SearchMemories", {"query": "redis"})]),
+            Turn(
+                calls=[
+                    (
+                        "FinalAnswer",
+                        {
+                            "text": "You saved the Redis article.",
+                            "cited_ids": ["a3f1c920"],
+                            "declined_out_of_scope": False,
+                            "asked_question": False,
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+
+    events, _text = await _drain(recorded, monkeypatch)
+
+    end = events[-1]
+    assert isinstance(end, graph.AgentEnd)
+    assert end.final is not None, "the answer was lost between rounds"
+    assert end.final.text == "You saved the Redis article."
+    assert end.final.cited_ids == ["a3f1c920"]
+
+
+async def test_the_self_reported_flags_survive_a_tool_call_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """These are the whole reason FinalAnswer exists; losing them loses the signal."""
+    _retrieving(monkeypatch, [_item()])
+    recorded = RecordedModel(
+        [
+            Turn(calls=[("SearchMemories", {"query": "sunny leone"})]),
+            Turn(
+                calls=[
+                    (
+                        "FinalAnswer",
+                        {
+                            "text": "I can only help with what you've saved here.",
+                            "declined_out_of_scope": True,
+                        },
+                    )
+                ]
+            ),
+        ]
+    )
+
+    events, _text = await _drain(recorded, monkeypatch)
+
+    end = events[-1]
+    assert isinstance(end, graph.AgentEnd)
+    assert end.final is not None
+    assert end.final.declined_out_of_scope is True
+
+
+async def test_the_turn_stops_once_the_answer_is_complete(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`FinalAnswer` is how a turn ends, but the graph treats it as a tool like any other.
+
+    Left alone it runs, hands its result back, and the model gets another turn -- a round
+    spent saying nothing, and a chance to write the answer twice. Both were seen live on
+    a turn that ran to the step ceiling with FinalAnswer in it twice.
+    """
+    _retrieving(monkeypatch, [_item()])
+    recorded = RecordedModel(
+        [
+            Turn(calls=[("FinalAnswer", {"text": "Here it is."})]),
+            Turn(text="and now I am talking past the end of the turn"),
+        ]
+    )
+
+    events, text = await _drain(recorded, monkeypatch)
+
+    assert "past the end" not in text, "the graph kept going after the answer"
+    end = events[-1]
+    assert isinstance(end, graph.AgentEnd)
+    assert end.final is not None and end.final.text == "Here it is."

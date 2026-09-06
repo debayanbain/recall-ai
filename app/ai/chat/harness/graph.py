@@ -108,7 +108,8 @@ async def run_agent(
 
     spoke = False
     rounds = 0
-    args_by_index: dict[int, _PartialCall] = {}
+    return_final: FinalAnswer | None = None
+    args_by_call: dict[tuple[int, int], _PartialCall] = {}
     try:
         async with asyncio.timeout(budget.wall_clock_seconds):
             async for chunk, meta in graph.astream(
@@ -124,13 +125,26 @@ async def run_agent(
                 # one model turn or one tool batch. Counting chunks would count fragments
                 # of a sentence, and counting tool calls would miss a turn that made two.
                 rounds = max(rounds, _step_of(meta))
-                for name in _collect(chunk, args_by_index):
+                for name in _collect(chunk, args_by_call, rounds):
                     calls.append(name)
                     yield AgentToolCall(name=name)
                 text = _text_of(chunk)
                 if text:
                     spoke = True
                     yield AgentDelta(text=text)
+                # `FinalAnswer` is how a turn ends, but to `create_react_agent` it is a
+                # tool like any other: it runs, its result goes back to the model, and the
+                # model gets another turn. Left alone that spends a round to say nothing
+                # and lets the answer be written twice -- both seen live, on a turn that
+                # ran to the step ceiling with FinalAnswer in it twice.
+                #
+                # Parsing is the completeness test. Arguments arrive in fragments, so
+                # valid JSON means the call is whole and there is nothing further to wait
+                # for. Stopping here leaves that call without its `ToolMessage`, which is
+                # fine precisely because there is no next request to malform.
+                if (done := _final_of(args_by_call)) is not None:
+                    return_final = done
+                    break
     except (TimeoutError, Exception) as exc:  # noqa: BLE001 - see the module docstring
         # GraphRecursionError arrives here too. All three -- a provider fault, the step
         # ceiling, the wall clock -- are the same event from the reader's side, and the
@@ -146,12 +160,12 @@ async def run_agent(
             failed=not spoke,
             calls=calls,
             rounds=rounds,
-            final=_final_of(args_by_index),
+            final=_final_of(args_by_call),
             exhausted=True,
         )
         return
 
-    final = _final_of(args_by_index)
+    final = return_final or _final_of(args_by_call)
     if final is None and spoke:
         # The instruction says to end with FinalAnswer and the model ended with prose.
         # Taken as the answer rather than discarded -- the words are already on their way
@@ -185,13 +199,27 @@ class _PartialCall:
     args: str = ""
 
 
-def _collect(chunk: Any, into: dict[int, _PartialCall]) -> list[str]:
+def _collect(
+    chunk: Any, into: dict[tuple[int, int], _PartialCall], step: int
+) -> list[str]:
     """Tool calls announced by this chunk, accumulating their arguments as they arrive.
 
     Read from `tool_call_chunks` rather than `tool_calls`: while streaming, a call's
     arguments arrive in fragments and only the first fragment carries the name. The
     fragments are kept because `FinalAnswer`'s payload *is* its arguments -- there is no
-    other copy of it in the stream.
+    other copy of it anywhere in the stream.
+
+    **Keyed by `(step, index)`, not by `index`.** A provider numbers the tool calls
+    within one model turn, so the numbering restarts at zero on the next one: keyed by
+    index alone, a search in round one and the answer in round two shared an accumulator
+    and their two JSON documents were concatenated into one unparseable string. The
+    effect was quietly bad -- every turn that called any tool before answering lost its
+    `FinalAnswer`, so the reply still arrived as prose while the self-reported flags on
+    `agent_turn` silently stayed false. A turn where the model answered *immediately* was
+    the only shape that worked, which is exactly the shape that hides the bug.
+
+    A name arriving at a key that already holds a different one starts that accumulator
+    again, which covers the same collision if a driver ever stops reporting steps.
     """
     if not isinstance(chunk, AIMessage):
         return []
@@ -199,9 +227,12 @@ def _collect(chunk: Any, into: dict[int, _PartialCall]) -> list[str]:
     for piece in getattr(chunk, "tool_call_chunks", None) or []:
         if not isinstance(piece, dict):
             continue
-        index = int(piece.get("index") or 0)
-        partial = into.setdefault(index, _PartialCall())
+        key = (step, int(piece.get("index") or 0))
         name = piece.get("name")
+        partial = into.setdefault(key, _PartialCall())
+        if name and partial.name and partial.name != str(name):
+            partial = _PartialCall()
+            into[key] = partial
         if name:
             partial.name = str(name)
             announced.append(str(name))
@@ -209,7 +240,7 @@ def _collect(chunk: Any, into: dict[int, _PartialCall]) -> list[str]:
     return announced
 
 
-def _final_of(calls: dict[int, _PartialCall]) -> FinalAnswer | None:
+def _final_of(calls: dict[tuple[int, int], _PartialCall]) -> FinalAnswer | None:
     """The `FinalAnswer` the turn ended with, if it ended with one.
 
     Validated through the schema rather than trusted as a dict: the arguments were
