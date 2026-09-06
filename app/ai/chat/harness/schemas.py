@@ -20,8 +20,8 @@ ASK_USER_MAX_OPTION_CHARS = 40
 
 
 class FinalAnswer(BaseModel):
-    """End the turn. Call this with the reply for the person, exactly as they should read
-    it. Call it once, last, after any searching is done."""
+    """End the turn with the reply for the person, exactly as they should read it. Call
+    it once, last, after any searching is done."""
 
     text: str = Field(
         description="The reply, in the language the person wrote in.",
@@ -29,21 +29,14 @@ class FinalAnswer(BaseModel):
     )
     cited_ids: list[str] = Field(
         default_factory=list,
-        description=(
-            "The ids of the memories this answer is built from, as they appeared in the "
-            "blocks you were shown. Empty when the answer is not about a saved memory."
-        ),
+        description="Ids of the memories this answer is built from. Empty if none.",
     )
     declined_out_of_scope: bool = Field(
         default=False,
-        description=(
-            "True when you declined because the request is not about this person's "
-            "vault -- general knowledge, writing tasks, translation, the news."
-        ),
+        description="True when you declined because it is not about their vault.",
     )
     asked_question: bool = Field(
-        default=False,
-        description="True when the reply is a question back to the person.",
+        default=False, description="True when the reply is a question back to them."
     )
 
 
@@ -63,64 +56,55 @@ class AskUser(BaseModel):
 
 
 class QueryMemories(BaseModel):
-    """Look through the person's saved memories. This is your main tool -- use it for any
-    question about what they saved, what something said, when they saved it, or for a
-    link to it. You choose both what to look for and what to get back, so if you are
-    missing a detail, ask for that field rather than telling them you cannot provide it.
-    Every result always comes with its title and both of its links."""
+    """Search or list the person's saved memories. Your main tool: use it for anything
+    about what they saved, what one said, when, or a link to it. You pick the filters and
+    the fields, so if you are missing a detail, ask for that field rather than saying you
+    cannot provide it. Every result carries its title and both links."""
 
     text: str | None = Field(
         default=None,
         description=(
-            "What to search for, by meaning, with time words stripped out: "
-            "'any cooking videos from last week?' -> 'cooking'. Leave empty to just list "
-            "by the filters below, newest first, which is right for a question purely "
-            "about time or kind."
+            "Subject to search for by meaning, time words removed: 'any cooking videos "
+            "from last week' -> 'cooking'. Empty lists by the filters below, newest "
+            "first, which is right for a question purely about time or kind."
         ),
     )
     days: int | None = Field(
-        default=None,
-        description="Only memories from the last N days. 'this week' -> 7. Null for all.",
+        default=None, description="Only the last N days. 'this week' -> 7."
     )
     content_types: list[str] = Field(
         default_factory=list,
         description=(
-            "Restrict to these kinds: youtube, article, pdf, document, note, instagram, "
-            "facebook, tiktok, linkedin, voice, image. 'videos' means youtube, instagram "
-            "and facebook."
+            "youtube, article, pdf, document, note, instagram, facebook, tiktok, "
+            "linkedin, voice, image. 'videos' means youtube, instagram and facebook."
         ),
     )
     category: str | None = Field(
         default=None,
         description=(
-            "One of Technology, Business, Science, Health, Education, Entertainment, "
-            "News, Productivity, Finance, Lifestyle."
+            "Technology, Business, Science, Health, Education, Entertainment, News, "
+            "Productivity, Finance, Lifestyle."
         ),
     )
     status: str | None = Field(
         default=None,
         description=(
-            "Restrict to one processing state: 'pending' or 'processing' for a capture "
-            "still being read, 'completed' for a finished one, 'failed' for one that "
-            "could not be read, 'skipped' for one stored but not readable. Null for all "
-            "of them, which is usually right -- a capture from a minute ago is still "
-            "processing and is often the one being asked about."
+            "pending, processing, completed, failed or skipped. Null for all, which is "
+            "usually right -- a capture from a minute ago is still processing and is "
+            "often the one being asked about."
         ),
     )
     tags: list[str] = Field(
-        default_factory=list,
-        description="Only memories carrying all of these tags.",
+        default_factory=list, description="Must carry all of these tags."
     )
-    limit: int | None = Field(
-        default=None, description="How many to return, at most 20. Default 10."
-    )
+    limit: int | None = Field(default=None, description="At most 20. Default 10.")
     fields: list[str] = Field(
         default_factory=list,
         description=(
-            "Which details to include for each memory: summary, tags, category, saved, "
-            "status, age, excerpt. Ask for 'excerpt' only when the question is about what "
-            "a memory actually said -- it is the full text and it is long. The id, the "
-            "title and both links are always included and do not need to be requested."
+            "Details to include: summary, tags, category, saved, status, age, excerpt. "
+            "Ask for 'excerpt' -- the full text, and long -- only when the question is "
+            "about what a memory actually said. Id, title and both links are always "
+            "included."
         ),
     )
 

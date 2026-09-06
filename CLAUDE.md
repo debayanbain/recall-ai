@@ -1241,6 +1241,17 @@ app/services/telegram/confirm.py                      what a tapped button does
   at the subject, derived from the person's message), the guard's removals, and the two
   self-reported booleans. `surface`, `shadow` and `router_lane` ride as structlog
   contextvars rather than as fields, the same way `surface` and `intent` already do.
+- **Which model drives the loop is a measured choice, not a reputation.**
+  `AGENT_CHAT_MODEL` is `gpt-4.1-mini`, and `scripts/bench_agent_model.py` is why: it
+  scores a candidate on the four shapes of turn that matter -- the snapshot holds the
+  answer, the snapshot does not, out of scope, small talk -- and fails it for markdown, a
+  needless tool call, a refusal to hand over a link it was shown. Three trials each, 4/4
+  every time, at the lowest output of anything that passed. Re-run it before changing the
+  setting; the failures are not marginal. `gpt-4o-mini`, which the loop inherited by
+  default for its first release, returns markdown the prompt forbids, and the gpt-5-mini
+  family spends the entire output budget on reasoning tokens and returns nothing.
+  The script spends real money and lives in `scripts/` for that reason -- `_no_provider_calls`
+  would refuse it, and rightly.
 - **No test may reach a provider, embeddings included.** `_no_provider_calls` patches the
   chat factory, the agent model, the enrichment client **and**
   `chat_engine.retrieval.get_ai_provider` -- the last was only ever kept off the network
