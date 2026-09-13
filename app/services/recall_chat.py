@@ -602,7 +602,7 @@ def build_recall_responder(repo: VaultRepository) -> RecallChatService | None:
         # Imported here rather than at module scope: the agent service subclasses this
         # one, so a top-level import would be a cycle.
         from app.services.chat_engine.proposals import RedisProposalStore
-        from app.services.recall_agent import RecallAgentService
+        from app.services.recall_agent import RecallAgentService, _connections
 
-        return RecallAgentService(repo, RedisProposalStore())
+        return RecallAgentService(repo, RedisProposalStore(), _connections(repo))
     return RecallChatService(repo)

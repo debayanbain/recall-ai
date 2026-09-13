@@ -93,7 +93,7 @@ async def test_the_shadow_run_writes_nothing_to_the_conversation(
         yield FakeSession()
 
     class FakeAgent:
-        def __init__(self, repo: Any) -> None:
+        def __init__(self, repo: Any, *_: Any, **__: Any) -> None:
             pass
 
         async def agent(

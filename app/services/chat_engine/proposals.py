@@ -63,6 +63,11 @@ class Action(StrEnum):
     #: a hard `session.delete()` with every read written for a soft one -- offering a tap
     #: that runs a half-implemented delete is worse than not offering it.
     delete = "delete"
+    #: Draw an edge between two memories. The only proposal whose check is doubled: BOTH
+    #: ids have to have been surfaced this turn, because an id a *memory* mentioned did
+    #: not come from the vault -- and a connection is precisely a route from one page's
+    #: text to another's in a later prompt.
+    connect = "connect"
     #: The person picked one of the options from a question. Its text re-enters the
     #: ordinary inbound path, so it is genuinely their own words from that point on --
     #: which is what makes it usable as the provenance for a later `propose_note`.

@@ -95,9 +95,30 @@ def test_no_tool_takes_a_user() -> None:
     add a tool -- and a new schema that lands in the other file is exactly the one that
     would slip past.
     """
-    from app.ai.chat.harness.schemas import AskUser, FinalAnswer, GetCaptureStatus
+    from app.ai.chat.harness.schemas import (
+        AskUser,
+        FinalAnswer,
+        GetCaptureStatus,
+        GetConnections,
+        ProposeConnect,
+        ProposeDelete,
+        ProposeNote,
+        ProposeRetry,
+        QueryMemories,
+    )
 
-    every = [*tools._TOOLS, GetCaptureStatus, AskUser, FinalAnswer]
+    every = [
+        *tools._TOOLS,
+        QueryMemories,
+        GetCaptureStatus,
+        GetConnections,
+        AskUser,
+        FinalAnswer,
+        ProposeNote,
+        ProposeRetry,
+        ProposeDelete,
+        ProposeConnect,
+    ]
     for tool in every:
         fields = set(tool.model_fields)
         assert not {"user_id", "user", "owner", "account", "account_id"} & fields

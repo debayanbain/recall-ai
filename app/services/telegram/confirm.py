@@ -20,8 +20,10 @@ from __future__ import annotations
 import uuid
 from dataclasses import dataclass, field
 from enum import StrEnum
+from typing import Protocol
 
 from app.core.logging import get_logger
+from app.models.base import Relation
 from app.services.chat_engine.proposals import Action, Proposal, ProposalStore
 from app.services.telegram import formatting
 from app.services.telegram.capture import TelegramCaptureService
@@ -34,6 +36,27 @@ log = get_logger("telegram")
 _ACCEPT = "p:"
 _DECLINE = "p:no:"
 _ANSWER = "q:"
+
+
+class ConnectionWriter(Protocol):
+    """The one write a tapped `connect` needs, named structurally on purpose.
+
+    Importing `ConnectionService` directly would pull `app.ai.connections` into this
+    module's import graph -- the relation-typing capability, which this path never uses.
+    The boundary test checks this file's **direct** imports only (a transitive walk was
+    tried and flags `VaultService -> app.ai.spans`, which is legitimate), so keeping the
+    import out is the whole of what keeps that test meaningful rather than decorative.
+    """
+
+    async def connect(
+        self,
+        user_id: uuid.UUID,
+        source_id: uuid.UUID,
+        target_id: uuid.UUID,
+        *,
+        relation: Relation,
+        note: str | None,
+    ) -> object: ...
 
 
 class Tap(StrEnum):
@@ -81,6 +104,7 @@ async def execute(
     store: ProposalStore,
     vault: VaultService,
     capture: TelegramCaptureService,
+    connections: ConnectionWriter | None,
     user_id: uuid.UUID,
     chat_id: str,
     message: dict[str, object],
@@ -107,6 +131,9 @@ async def execute(
     if proposal.action is Action.delete:
         return await _delete(proposal, vault, user_id)
 
+    if proposal.action is Action.connect:
+        return await _connect(proposal, connections, user_id)
+
     return Outcome(reply=formatting.proposal_expired())
 
 
@@ -132,6 +159,45 @@ async def _save_note(
         reply=formatting.note_saved(outcome.item),
         enqueue_item_ids=[outcome.item.id],
     )
+
+
+async def _connect(
+    proposal: Proposal, connections: ConnectionWriter | None, user_id: uuid.UUID
+) -> Outcome:
+    """`ConnectionService.connect`, scoped to the tapping account.
+
+    The service re-checks that **both** ends belong to this user, per item, so a token
+    cannot link a row it did not name or a row belonging to somebody else -- the ids in
+    the payload are not trusted just because a proposal carried them.
+
+    The relation is re-derived from the enum rather than taken as text: it arrives through
+    Redis as a string, and a value that is not a relation must not reach a column that
+    everything downstream reads as one.
+    """
+    if connections is None:
+        # No service wired up, so the tool was never bound and no token of this action
+        # should exist. Answered like any unredeemable one rather than raising.
+        return Outcome(reply=formatting.proposal_expired())
+    try:
+        source_id = uuid.UUID(proposal.args.get("source_id", ""))
+        target_id = uuid.UUID(proposal.args.get("target_id", ""))
+    except ValueError:
+        return Outcome(reply=formatting.proposal_expired())
+    try:
+        relation = Relation(proposal.args.get("relation", Relation.related_to.value))
+    except ValueError:
+        relation = Relation.related_to
+    try:
+        await connections.connect(
+            user_id, source_id, target_id, relation=relation, note=None
+        )
+    except LookupError:
+        # `ConnectionNotFound`, caught by its base class so this module needs no import
+        # from the service package. One end is gone, or was never theirs -- the same
+        # sentence as any spent token, because from the person's side it is the same
+        # thing: nothing left to do.
+        return Outcome(reply=formatting.proposal_expired())
+    return Outcome(reply=formatting.connected())
 
 
 async def _delete(

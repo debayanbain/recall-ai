@@ -174,3 +174,28 @@ def test_any_new_tool_is_reachable_from_the_real_toolbox() -> None:
         "AskUser",
         "FinalAnswer",
     }
+
+
+def test_the_connection_tool_is_offered_only_with_something_to_read() -> None:
+    """`GetConnections` is gated on the reader, not on the method.
+
+    The method is on every toolbox, so gating on `hasattr` would offer the tool to a turn
+    whose only possible answer is an apology -- a wasted round and a reply that promises
+    something impossible. It is the same gate the proposal tools take on the store.
+
+    It is not an overlap of `QueryMemories`, which is why it is bound here at all: the
+    reasoning that keeps `SearchMemories` and `ListMemories` off this lane was about two
+    narrower versions of the *same* read. Following an edge is a different read, and it is
+    the only one that can answer "how do these two relate".
+    """
+    from app.ai.chat.harness.tools import build_tools
+    from app.services.chat_engine.toolbox import MemoryToolbox
+
+    class _Reader:
+        async def list_for_item(self, *_: object, **__: object) -> object:
+            return [], 0
+
+    with_reader = MemoryToolbox(_USER, None, connections=_Reader())  # type: ignore[arg-type]
+    names = {tool.name for tool in build_tools(with_reader)}
+
+    assert "GetConnections" in names

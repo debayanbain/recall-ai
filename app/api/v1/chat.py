@@ -45,7 +45,9 @@ from app.api.deps import CurrentUser, SessionDep, assert_same_site
 from app.core import rate_limit
 from app.core.config import settings
 from app.core.logging import get_logger
+from app.models.base import Relation
 from app.queue.client import enqueue_shadow_agent_turn
+from app.repositories.connection import ConnectionRepository
 from app.repositories.vault import VaultRepository
 from app.schemas.vault import VaultItemRead
 from app.services.chat_engine.engine import ChatEngine, classify, session_id_for
@@ -59,6 +61,7 @@ from app.services.chat_engine.types import (
     StatusEvent,
     StreamEvent,
 )
+from app.services.connection_service import ConnectionNotFound, ConnectionService
 from app.services.recall_chat import build_recall_responder
 from app.services.vault_service import (
     NOTE_CONTENT_MAX,
@@ -256,6 +259,37 @@ async def accept_proposal(
             raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED)
         await session.commit()
         return ProposalResult(status="deleted", message="Deleted. That one's gone.")
+
+    if proposal.action is Action.connect:
+        # Both ends re-checked against the tapping account, per item, inside the service:
+        # the ids in a proposal are not trusted just because a proposal carried them.
+        connections = ConnectionService(
+            ConnectionRepository(session), VaultRepository(session)
+        )
+        try:
+            relation = Relation(proposal.args.get("relation", Relation.related_to.value))
+        except ValueError:
+            # A value that is not a relation must never reach a column everything
+            # downstream reads as one. `related_to` is the weakest claim and the
+            # fail-closed direction.
+            relation = Relation.related_to
+        try:
+            await connections.connect(
+                user.id,
+                uuid.UUID(proposal.args["source_id"]),
+                uuid.UUID(proposal.args["target_id"]),
+                relation=relation,
+                note=None,
+            )
+        except (KeyError, ValueError) as exc:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED) from exc
+        except ConnectionNotFound as exc:
+            # One end is gone, or was never theirs. Same answer as a spent token.
+            raise HTTPException(status.HTTP_404_NOT_FOUND, _EXPIRED) from exc
+        await session.commit()
+        return ProposalResult(
+            status="connected", message="Connected. It shows on both memories."
+        )
 
     # `answer` proposals are a messaging-surface affordance: on the web a tapped chip
     # posts its own text as the next question, so there is nothing to redeem here.

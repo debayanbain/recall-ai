@@ -375,3 +375,99 @@ async def test_for_item_lists_only_spaces_you_can_see(
     body = (await client.get(f"/api/v1/spaces/for-item/{item.id}")).json()
 
     assert body == [str(mine.id)]
+
+
+# --------------------------------------------------------------------------------------
+# Connections inside a Space: the boundary that was decided rather than inherited
+# --------------------------------------------------------------------------------------
+
+
+async def test_a_member_sees_only_their_own_connections_in_a_space(
+    bob_client: AsyncClient, session: AsyncSession, alice: User, bob: User
+) -> None:
+    """The whole point of this panel's design.
+
+    A connection is a judgement its author made about their own memories -- "A contradicts
+    B" is an opinion, not a fact about the Space. Two members looking at the same Space
+    therefore see different graphs, and that is deliberate: widening this later is a
+    decision somebody can take; un-showing people each other's judgements is not.
+    """
+    from app.models.connection import MemoryConnection
+
+    space = await make_space(session, alice, "Shared")
+    await make_member(session, space, bob, SpaceRole.editor)
+
+    hers_a = await make_item(session, alice, "alice a")
+    hers_b = await make_item(session, alice, "alice b")
+    his_a = await make_item(session, bob, "bob a")
+    his_b = await make_item(session, bob, "bob b")
+    for item in (hers_a, hers_b, his_a, his_b):
+        session.add(SpaceItem(space_id=space.id, vault_item_id=item.id))
+    session.add(
+        MemoryConnection(
+            user_id=alice.id,
+            source_item_id=hers_a.id,
+            target_item_id=hers_b.id,
+            relation="contradicts",
+            origin="user",
+            status="confirmed",
+        )
+    )
+    session.add(
+        MemoryConnection(
+            user_id=bob.id,
+            source_item_id=his_a.id,
+            target_item_id=his_b.id,
+            relation="expands",
+            origin="user",
+            status="confirmed",
+        )
+    )
+    await session.commit()
+
+    body = (await bob_client.get(f"/api/v1/spaces/{space.id}/connections")).json()
+
+    assert body["total"] == 1
+    assert body["connections"][0]["relation"] == "expands"
+    # Alice's judgement about her own memories is not his to read.
+    assert "contradicts" not in str(body)
+
+
+async def test_an_edge_reaching_outside_the_space_is_not_shown(
+    alice_client: AsyncClient, session: AsyncSession, alice: User
+) -> None:
+    """Both ends have to be in the Space, or the panel renders a card from outside it --
+    which is a memory the viewer may have no entitlement to see at all."""
+    from app.models.connection import MemoryConnection
+
+    space = await make_space(session, alice, "Mine")
+    inside = await make_item(session, alice, "inside")
+    outside = await make_item(session, alice, "outside")
+    session.add(SpaceItem(space_id=space.id, vault_item_id=inside.id))
+    session.add(
+        MemoryConnection(
+            user_id=alice.id,
+            source_item_id=inside.id,
+            target_item_id=outside.id,
+            relation="related_to",
+            origin="user",
+            status="confirmed",
+        )
+    )
+    await session.commit()
+
+    body = (await alice_client.get(f"/api/v1/spaces/{space.id}/connections")).json()
+
+    assert body["connections"] == []
+
+
+async def test_a_non_member_cannot_read_a_space_connection_panel(
+    bob_client: AsyncClient, session: AsyncSession, alice: User
+) -> None:
+    """The membership gate runs first. Inferring "not a member" from an empty edge list
+    would save a statement and stop being an access check."""
+    space = await make_space(session, alice, "Alice only")
+
+    response = await bob_client.get(f"/api/v1/spaces/{space.id}/connections")
+
+    assert response.status_code == 404

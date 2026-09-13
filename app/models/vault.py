@@ -44,6 +44,9 @@ class VaultItem(SQLModel, table=True):
     title: Optional[str] = Field(default=None, max_length=512)
     summary: Optional[str] = None
     content: Optional[str] = None
+    #: Where the card's picture is read from. For a link this starts life as the
+    #: scraped `og:image` and is replaced by our own mirror once `thumbnail_key` is set
+    #: -- see `services/thumbnails.py` for why a scraped still cannot be kept.
     thumbnail_url: Optional[str] = None
     language: Optional[str] = None
 
@@ -52,6 +55,9 @@ class VaultItem(SQLModel, table=True):
     # a presigned URL minted per request, so the key itself grants nothing and exposing
     # it only advertises the bucket's layout.
     storage_key: Optional[str] = Field(default=None, max_length=512)
+    #: The mirrored card image, in the same private bucket and under the same rules: the
+    #: key never reaches the browser, and `thumbnail_url` is minted per response.
+    thumbnail_key: str | None = Field(default=None, max_length=512)
     #: Sanitized original name, for display and the download's Content-Disposition.
     file_name: Optional[str] = Field(default=None, max_length=255)
     file_size: Optional[int] = Field(default=None, sa_column=Column(BigInteger, nullable=True))

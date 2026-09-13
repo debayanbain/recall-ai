@@ -34,7 +34,16 @@ from app.core.config import settings
 from app.core.security import create_access_token
 from app.db.session import get_session
 from app.main import create_app
-from app.models.base import ContentType, ProcessingStatus, SpaceRole, Visibility
+from app.models.base import (
+    ConnectionOrigin,
+    ConnectionStatus,
+    ContentType,
+    ProcessingStatus,
+    Relation,
+    SpaceRole,
+    Visibility,
+)
+from app.models.connection import MemoryConnection
 from app.models.space import Space, SpaceMember
 from app.models.user import User
 from app.models.vault import VaultItem
@@ -158,6 +167,13 @@ def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "ENRICHMENT_COMBINED", False)
     monkeypatch.setattr("app.ai.enrichment._call_provider", _refuse)
 
+    # Relation typing, the same way and for the same two reasons. Off is what the
+    # connection tests want -- they assert that an edge keeps the honest `related_to` a
+    # distance can actually support -- and the stub is what catches a future caller that
+    # reaches past the switch.
+    monkeypatch.setattr(settings, "CONNECTION_TYPING_ENABLED", False)
+    monkeypatch.setattr("app.ai.connections._call_provider", _refuse)
+
 
 @pytest.fixture(autouse=True)
 def _no_shared_redis_state(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -264,6 +280,41 @@ async def make_item(session: AsyncSession, owner: User, title: str) -> VaultItem
     await session.commit()
     await session.refresh(item)
     return item
+
+
+async def make_connection(
+    session: AsyncSession,
+    owner: User,
+    source: VaultItem,
+    target: VaultItem,
+    *,
+    relation: Relation = Relation.related_to,
+    status: ConnectionStatus = ConnectionStatus.confirmed,
+    origin: ConnectionOrigin = ConnectionOrigin.user,
+    score: float | None = None,
+) -> MemoryConnection:
+    """Seed an edge directly.
+
+    Suggested edges have no API that creates them -- the worker does, and the worker needs
+    Redis and an embedding -- so every test about confirming, dismissing or reading one
+    would otherwise have to stand up the whole derivation first.
+
+    `pair_low` / `pair_high` are GENERATED columns and are deliberately not passed:
+    SQLAlchemy omits them from the INSERT, and Postgres fills them.
+    """
+    connection = MemoryConnection(
+        user_id=owner.id,
+        source_item_id=source.id,
+        target_item_id=target.id,
+        relation=relation.value,
+        status=status.value,
+        origin=origin.value,
+        score=score,
+    )
+    session.add(connection)
+    await session.commit()
+    await session.refresh(connection)
+    return connection
 
 
 async def make_space(

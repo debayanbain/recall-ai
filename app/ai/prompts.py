@@ -38,7 +38,11 @@ BOT_IDENTITY = (
 #: v3: bare URLs, list everything you were given, and say when a result was truncated --
 #: after a live turn wrote `[Link](url)` into a chat that renders plain text, and reported
 #: eight of thirteen memories as the whole vault.
-PROMPT_VERSION = "agent-v3"
+#: v4: GetConnections, and a `connections` count in the QueryMemories projection -- the
+#: agent can follow the edges between memories rather than only rank them by similarity.
+#: v5: ProposeConnect -- the agent can offer to link two memories it has been shown, and
+#: the person taps to confirm. Still no write tool.
+PROMPT_VERSION = "agent-v5"
 
 #: What the product can and cannot do, in the model's own context so it stops guessing.
 #: Ten lines, no surface named: the same card is read by the bot and by the web page, and

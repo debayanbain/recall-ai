@@ -17,8 +17,9 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Response, status
 
+from app.api import cards
 from app.api.deps import CurrentUser, SpaceServiceDep, assert_same_site
 from app.models.base import SpaceRole
 from app.models.user import User
@@ -28,12 +29,13 @@ from app.schemas.space import (
     CreateInviteRequest,
     CreateSpaceRequest,
     InviteResponse,
+    SpaceConnectionRead,
+    SpaceConnectionsResponse,
     SpaceDetail,
     SpaceMemberRead,
     SpaceRead,
     UpdateSpaceRequest,
 )
-from app.schemas.vault import VaultItemRead
 from app.services.space_service import SpaceSummary
 
 router = APIRouter(prefix="/spaces", tags=["spaces"])
@@ -139,8 +141,16 @@ async def accept_invite(
 
 @router.get("/{space_id}", response_model=SpaceDetail)
 async def get_space(
-    space_id: uuid.UUID, user: CurrentUser, service: SpaceServiceDep
+    space_id: uuid.UUID,
+    user: CurrentUser,
+    service: SpaceServiceDep,
+    response: Response,
 ) -> SpaceDetail:
+    # A presigned thumbnail is a bearer credential for its whole TTL, so a response
+    # carrying one must not sit in a shared cache. That matters more on this route than
+    # any other: it is the only one that serves *other members'* memories, so a cached
+    # copy would hand one member's cards to whoever the cache answers next.
+    cards.no_store(response)
     summary, items, owner, members = await service.detail(space_id, user.id)
     detail = SpaceDetail(
         **summary.space.model_dump(include=_PUBLIC_FIELDS),
@@ -152,7 +162,7 @@ async def get_space(
     # member's memory -- title, summary, tags, thumbnail -- and never its body, its
     # highlights, its metadata or its stored file. Being in a shared Space is not a grant
     # on the memory itself, and this line is where that stops being true if it is widened.
-    detail.items = [VaultItemRead.model_validate(i) for i in items]
+    detail.items = await cards.read_cards(items)
     detail.members = _members(owner, members)
     return detail
 
@@ -209,6 +219,42 @@ async def remove_item(
 ) -> None:
     if not await service.remove_item(space_id, user.id, item_id):
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Memory is not in this Space")
+
+
+@router.get("/{space_id}/connections", response_model=SpaceConnectionsResponse)
+async def space_connections(
+    space_id: uuid.UUID,
+    user: CurrentUser,
+    service: SpaceServiceDep,
+    response: Response,
+) -> SpaceConnectionsResponse:
+    """The caller's own connections between memories in this Space.
+
+    **Only their own.** A Space is where one person reads another's rows, and this does
+    not widen that: a connection is a judgement its author made about their own memories,
+    so two members see the same Space with different graphs. Widening later is a decision
+    somebody can take deliberately; un-showing people each other's judgements is not.
+
+    Two statements: the membership gate, then the edges. Both ends must be in the Space
+    and both must still exist, so nothing here can render a card from outside it.
+    """
+    cards.no_store(response)
+    found, total = await service.connections(space_id, user.id)
+    items = [item for _edge, source, target in found for item in (source, target)]
+    by_id = {card.id: card for card in await cards.read_cards(items)}
+    return SpaceConnectionsResponse(
+        connections=[
+            SpaceConnectionRead(
+                **edge.model_dump(
+                    include={"id", "relation", "note", "ai_reason", "created_at"}
+                ),
+                source=by_id[source.id],
+                target=by_id[target.id],
+            )
+            for edge, source, target in found
+        ],
+        total=total,
+    )
 
 
 @router.get("/{space_id}/members", response_model=list[SpaceMemberRead])

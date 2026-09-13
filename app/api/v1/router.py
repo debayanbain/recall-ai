@@ -6,6 +6,7 @@ from fastapi import APIRouter
 from app.api.v1 import (
     auth,
     chat,
+    connections,
     integrations,
     public,
     search,
@@ -20,6 +21,7 @@ api_router.include_router(vault.router)
 api_router.include_router(search.router)
 api_router.include_router(chat.router)
 api_router.include_router(spaces.router)
+api_router.include_router(connections.router)
 api_router.include_router(integrations.router)
 api_router.include_router(public.router)
 api_router.include_router(webhooks.router)

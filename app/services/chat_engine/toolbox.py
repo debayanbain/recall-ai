@@ -34,12 +34,13 @@ from __future__ import annotations
 import uuid
 from collections.abc import Sequence
 from datetime import UTC, datetime, timedelta
+from typing import Any, Protocol, runtime_checkable
 
 from sqlalchemy import inspect as sa_inspect
 
 from app.ai.chat import chain
 from app.core.logging import get_logger
-from app.models.base import ContentType, ProcessingStatus
+from app.models.base import ContentType, ProcessingStatus, Relation
 from app.models.vault import VaultItem
 from app.repositories.vault import VaultRepository
 from app.services.chat_engine import status
@@ -111,6 +112,27 @@ ASKED = (
 )
 
 
+#: What `get_connections` says when a memory has no edges. Plain English addressed to the
+#: model, in the `_NO_MATCH` idiom, and it closes the door on the one failure this feature
+#: could have: a model that answers the question anyway, from similarity it inferred
+#: itself, about links nobody drew.
+_NO_CONNECTIONS = (
+    "That memory has no connections yet. Tell them so plainly -- do not describe a link "
+    "you worked out yourself."
+)
+
+#: Returned if the tool is somehow reached with no reader behind it. The binder gates on
+#: the reader, so this should be unreachable; it is here because a tool that raises costs
+#: the turn, and one that answers costs a sentence.
+_NO_CONNECTIONS_READER = (
+    "You cannot look up connections right now. Answer from what you already have."
+)
+
+#: How many neighbours one call returns, and the ceiling on what the model may ask for.
+_CONNECTION_LIMIT = 6
+_MAX_CONNECTIONS = 10
+
+
 #: A note offered by tap is bounded like a typed one. The capture path clips again.
 _MAX_NOTE = 4000
 
@@ -126,6 +148,27 @@ _NO_STORE = (
 #: The only two states a retry can improve. Re-running a completed item spends the whole
 #: pipeline to replace a result with itself; re-running a queued one races the worker.
 _RETRYABLE = (ProcessingStatus.failed, ProcessingStatus.skipped)
+
+
+@runtime_checkable
+class ConnectionReader(Protocol):
+    """The one read `get_connections` needs, named structurally so it never sees a session.
+
+    Satisfied by `ConnectionRepository.list_for_item`. A Protocol rather than the concrete
+    class for the reason the rest of this package uses them: the toolbox is constructed in
+    three places and faked in a dozen tests, and a hard dependency here would drag a
+    repository into every one of them.
+    """
+
+    async def list_for_item(
+        self,
+        user_id: uuid.UUID,
+        item_id: uuid.UUID,
+        *,
+        statuses: Sequence[Any] | None = ...,
+        relation: Any | None = ...,
+        limit: int = ...,
+    ) -> tuple[list[Any], int]: ...
 
 
 class SurfacedSet:
@@ -206,9 +249,15 @@ class MemoryToolbox:
         budget: Budget | None = None,
         store: ProposalStore | None = None,
         turn: str = "",
+        connections: ConnectionReader | None = None,
     ) -> None:
         self.user_id = user_id
         self.repo = repo
+        #: Reads the edges between this person's memories. `None` means this turn simply
+        #: is not told the tool exists -- `build_tools` gates on it, the same way it gates
+        #: the proposal tools on the store. An offered tool that cannot work is a wasted
+        #: round and an answer that promises something impossible.
+        self.connections = connections
         self.memories = MemoryRetriever(repo)
         self.top_k = top_k or DEFAULT_LIMIT
         #: What this turn has shown the model, and therefore what it may cite and open.
@@ -379,6 +428,77 @@ class MemoryToolbox:
             link=memory_link(item),
         )
 
+    async def get_connections(
+        self,
+        memory_id: str,
+        relation: str | None = None,
+        limit: int | None = None,
+    ) -> str:
+        """The memories connected to one the model has already been shown.
+
+        Three of the four rules here are the same ones `get_memory` follows, and for the
+        same reasons; the fourth is specific and is the point of the whole feature.
+
+        * **Only an id surfaced this turn.** Not secrecy -- a short id is a prefix of a
+          UUID its owner has -- but a model told by a *memory* to expand something did not
+          get that id from the vault.
+        * **Charged against the budget**, unlike `ask_user`. This is a read that costs a
+          statement and fills the window with cards; asking is how a turn ends.
+        * **Counted as a lookup**, so `found_nothing` can tell "followed the links and
+          found none" from "never went looking" -- two different answers that used to be
+          one.
+        * **The relation travels inside each fenced block**, so the model can say *how*
+          two memories relate rather than only that they do. It is written through the
+          same one-line-and-cap treatment every other interpolated value gets, because a
+          neighbour's own text must not be able to open a line that looks like the start
+          of another memory.
+        """
+        if (spent := self._spend()) is not None:
+            return spent
+        if self.connections is None:
+            return _NO_CONNECTIONS_READER
+
+        wanted = (memory_id or "").strip().lower()
+        item = self.surfaced.get(wanted)
+        if item is None or item.id is None:
+            log.info("recall_tool_unknown_id", requested=wanted[:16])
+            return (
+                "No memory with that id has been shown to you. Use an id from the "
+                "snapshot or from a search, or search first."
+            )
+
+        self.lookups += 1
+        found, total = await self.connections.list_for_item(
+            self.user_id,
+            item.id,
+            relation=_relation(relation),
+            limit=_connection_limit(limit),
+        )
+        log.info("recall_tool_connections", returned=len(found), total=total)
+        if not found:
+            return _NO_CONNECTIONS
+
+        labels = {
+            neighbour.item.id: _edge_line(neighbour, item)
+            for neighbour in found
+            if neighbour.item.id is not None
+        }
+        header = (
+            f"{total} memories are connected to [{short_id(item)}]; "
+            f"{len(found)} are below.\n\n"
+        )
+        # An explicit projection, not the default `build_card`. Neighbours arrive from a
+        # `load_only(..., raiseload=True)` read, and `build_card` reads `ai_highlights`,
+        # which `_CARD_COLUMNS` deliberately excludes -- so rendering them as full cards
+        # raises against a real database while passing every test whose rows are built in
+        # memory. `_project` reads only the fields it is handed, and all four are loaded.
+        return header + self._render(
+            [neighbour.item for neighbour in found],
+            _DEFAULT_FIELDS,
+            cap=len(found),
+            extra=labels,
+        )
+
     async def query_memories(
         self,
         text: str | None = None,
@@ -446,7 +566,9 @@ class MemoryToolbox:
             items = _with_tags(evidence.items, tags)[:rows]
             if not items:
                 return _NO_MATCH
-            blocks = self._render(items, wanted, cap=rows)
+            blocks = self._render(
+                items, wanted, cap=rows, counts=await self._counts(wanted, items)
+            )
             if evidence.status is EvidenceStatus.insufficient:
                 return (
                     "These are only a WEAK match. Do not stretch them to fit -- say you "
@@ -474,7 +596,9 @@ class MemoryToolbox:
         if not found:
             return _NO_MATCH
         header = f"{total} saved in total; {len(found)} shown below.\n\n"
-        return header + self._render(found, wanted, cap=rows)
+        return header + self._render(
+            found, wanted, cap=rows, counts=await self._counts(wanted, found)
+        )
 
     async def get_capture_status(self, memory_id: str | None = None) -> str:
         """Whether a capture finished, is still being read, or failed.
@@ -642,6 +766,71 @@ class MemoryToolbox:
             "retry and stop -- do not claim it has been retried."
         )
 
+    async def propose_connect(
+        self, memory_id: str, other_id: str, relation: str = "related_to"
+    ) -> str:
+        """Offer to connect two memories. Writes nothing.
+
+        **The surfaced-id check, doubled.** `propose_delete` requires one id this turn
+        actually showed the model; this requires two, and the reason is sharper than
+        symmetry. A connection is a route from one memory's text to another's in a *later*
+        prompt -- it is the mechanism by which a scraped page ends up adjacent to a memory
+        the question was never about. An id the model got from inside a memory rather than
+        from the vault is exactly the id an attacker would want on one end of that edge.
+
+        There is no text to check against the person's own turn, the way `propose_note`
+        does, so the card carries **both titles and the relation** instead: what somebody
+        needs to see before tapping Yes is which two memories, and how they are about to
+        be labelled.
+
+        The relation is a closed enum and an unrecognised one becomes `related_to` -- the
+        weakest claim in the vocabulary, which is the fail-closed direction. A model
+        talked into proposing `contradicts` by a caption would still be proposing the
+        connection a person has to approve; the label is the smaller half of that.
+        """
+        left = self.surfaced.get(memory_id or "")
+        right = self.surfaced.get(other_id or "")
+        if left is None or right is None:
+            log.info(
+                "recall_tool_unknown_id",
+                requested=(memory_id if left is None else other_id or "")[:16],
+            )
+            return (
+                "You have not been shown both of those memories. Offer to connect only "
+                "two whose ids you have actually seen -- search for them first."
+            )
+        if left.id == right.id or left.id is None or right.id is None:
+            return "Those are the same memory. A memory cannot be connected to itself."
+        if self.store is None:
+            return _NO_STORE
+
+        wanted = _relation(relation) or Relation.related_to
+        token = await self.store.mint(
+            Proposal(
+                self.user_id,
+                Action.connect,
+                {
+                    "source_id": str(left.id),
+                    "target_id": str(right.id),
+                    "relation": wanted.value,
+                },
+            )
+        )
+        if token is None:
+            return _NO_STORE
+        preview = (
+            f"{_one_line(left.title or left.source_url, 60) or short_id(left)}"
+            f"  →  {_one_line(right.title or right.source_url, 60) or short_id(right)}"
+        )
+        self.proposal = ProposalBlock(
+            preview=preview, accept_token=token, action="connect"
+        )
+        log.info("proposal_minted", action="connect", relation=wanted.value)
+        return (
+            "Offered. The person will see both memories with a Yes/No button. Say which "
+            "two you are offering to connect and stop -- do not claim it is connected."
+        )
+
     def register_snapshot(self, items: Sequence[VaultItem]) -> None:
         """Seed the surfaced set from the rows already in the prompt.
 
@@ -673,6 +862,25 @@ class MemoryToolbox:
         )
         return SPENT
 
+    async def _counts(
+        self, fields: tuple[str, ...], items: Sequence[VaultItem]
+    ) -> dict[uuid.UUID, int] | None:
+        """Connection counts for a page of results -- one grouped statement, or none.
+
+        Issued **only when the projection asked for `connections`**, which is why that
+        field is opt-in. `_field` is pure and reads what is on the row, and a count is not
+        on the row: caching one there would be wrong the moment anything is dismissed or
+        deleted, and the caller reads this number and then follows it inside the same turn.
+        """
+        if "connections" not in fields or self.connections is None:
+            return None
+        counter = getattr(self.connections, "counts_for_items", None)
+        if counter is None:
+            return None
+        ids = [item.id for item in items if item.id is not None]
+        counts: dict[uuid.UUID, int] = await counter(self.user_id, ids)
+        return counts
+
     async def _with_body(self, item: VaultItem) -> VaultItem:
         """The same row, guaranteed to have its body loaded.
 
@@ -697,6 +905,8 @@ class MemoryToolbox:
         items: Sequence[VaultItem],
         fields: tuple[str, ...] | None = None,
         cap: int | None = None,
+        extra: dict[uuid.UUID, str] | None = None,
+        counts: dict[uuid.UUID, int] | None = None,
     ) -> str:
         """Cards as fenced blocks, registering each one as citable evidence.
 
@@ -725,10 +935,18 @@ class MemoryToolbox:
         blocks = []
         for item in allowed:
             identifier = self.surfaced.add(item)
+            body = build_card(item) if fields is None else _project(item, fields, counts)
+            # One extra fact about *this* item, supplied by the caller -- today only the
+            # relation an edge carries. Flattened and capped like every other interpolated
+            # value, so a neighbour's own text cannot open a line that reads as the start
+            # of another memory.
+            line = (extra or {}).get(item.id) if item.id is not None else None
+            if line:
+                body = f"{body}\n  connection: {_one_line(line, 120)}"
             blocks.append(
                 chain.fence_block(
                     identifier,
-                    build_card(item) if fields is None else _project(item, fields),
+                    body,
                     title=item.title or item.source_url or "Untitled",
                     category=item.ai_category,
                     saved=item.created_at.date().isoformat() if item.created_at else None,
@@ -772,6 +990,12 @@ QUERY_FIELDS = (
     "status",
     "age",
     "excerpt",
+    # How many memories this one is connected to. The only field that costs an extra
+    # statement, which is why it is opt-in like `excerpt` -- and why it is worth having:
+    # without it the model cannot see that a result *has* neighbours, so it has no reason
+    # to ever follow them. That is the same shape as the missing-`link` bug, where "never
+    # say you cannot without looking" only works if there is something visible to look at.
+    "connections",
 )
 
 #: What a caller gets for asking for nothing: enough to tell memories apart, cheaply.
@@ -819,7 +1043,11 @@ def _with_tags(items: Sequence[VaultItem], tags: Sequence[str]) -> list[VaultIte
     ]
 
 
-def _project(item: VaultItem, fields: tuple[str, ...]) -> str:
+def _project(
+    item: VaultItem,
+    fields: tuple[str, ...],
+    counts: dict[uuid.UUID, int] | None = None,
+) -> str:
     """A card body carrying only what was asked for.
 
     Every value is flattened to one line and length-capped, for the same reason
@@ -828,13 +1056,15 @@ def _project(item: VaultItem, fields: tuple[str, ...]) -> str:
     """
     lines: list[str] = []
     for name in fields:
-        rendered = _field(item, name)
+        rendered = _field(item, name, counts)
         if rendered:
             lines.append(f"  {name}: {rendered}")
     return "\n".join(lines) or "  (no details requested)"
 
 
-def _field(item: VaultItem, name: str) -> str | None:
+def _field(
+    item: VaultItem, name: str, counts: dict[uuid.UUID, int] | None = None
+) -> str | None:
     if name == "summary":
         return _one_line(item.summary, SUMMARY_LIMIT)
     if name == "tags":
@@ -850,6 +1080,12 @@ def _field(item: VaultItem, name: str) -> str | None:
         return _age_of(item)
     if name == "excerpt":
         return _one_line(item.content, DETAIL_CONTENT_LIMIT)
+    if name == "connections":
+        # Zero is a real answer here and is rendered, unlike a null score: "nothing is
+        # connected to this" is exactly what stops the model calling GetConnections on it.
+        if counts is None or item.id is None:
+            return None
+        return str(counts.get(item.id, 0))
     return None
 
 
@@ -898,3 +1134,65 @@ def _statuses(value: str | None) -> list[ProcessingStatus] | None:
 def _category(value: str | None) -> str | None:
     cleaned = (value or "").strip()
     return cleaned[:64] or None
+
+
+def _relation(value: str | None) -> Relation | None:
+    """One relation, checked against the enum. Anything else means "all of them".
+
+    Dropped rather than refused, like `_content_types` and `_statuses` above: the value is
+    a model's guess at a word, and every connection is a better answer than an error it
+    has to interpret and retry.
+    """
+    if not value:
+        return None
+    try:
+        return Relation(value.strip().lower())
+    except ValueError:
+        log.info("recall_tool_unknown_relation", value=value[:32])
+        return None
+
+
+def _connection_limit(value: int | None) -> int:
+    if not value or value < 1:
+        return _CONNECTION_LIMIT
+    return min(int(value), _MAX_CONNECTIONS)
+
+
+def _edge_line(neighbour: Any, focus: VaultItem) -> str:
+    """How the memory that was expanded relates to this neighbour, in words.
+
+    **The focus is the subject.** `direction` is computed relative to the focus, so the
+    label in `_RELATION_WORDS` reads correctly only with the focus in front of it: a
+    stored "chapter part_of book", read from the book, is `("part_of", "incoming")` ->
+    "has a part in", and the true sentence is *the book* has a part in the chapter. Making
+    the neighbour the subject inverts every directional relation -- which is the exact
+    quiet inversion this line exists to prevent, and it shipped that way until a review
+    caught it.
+    """
+    relation = str(getattr(neighbour, "connection", None) and neighbour.connection.relation)
+    direction = str(getattr(neighbour, "direction", "outgoing"))
+    label = _RELATION_WORDS.get((relation, direction), relation.replace("_", " "))
+    return f"[{short_id(focus)}] {label} this memory"
+
+
+#: Both readings of every relation, as a table rather than as logic. Kept here because the
+#: model reads these words: the frontend has its own copy in `lib/connection-style.ts` and
+#: the two are allowed to differ in tone, but not in meaning.
+_RELATION_WORDS = {
+    ("related_to", "outgoing"): "is related to",
+    ("related_to", "incoming"): "is related to",
+    ("expands", "outgoing"): "expands",
+    ("expands", "incoming"): "is expanded by",
+    ("supports", "outgoing"): "supports",
+    ("supports", "incoming"): "is supported by",
+    ("contradicts", "outgoing"): "contradicts",
+    ("contradicts", "incoming"): "contradicts",
+    ("inspired_by", "outgoing"): "was inspired by",
+    ("inspired_by", "incoming"): "inspired",
+    ("depends_on", "outgoing"): "depends on",
+    ("depends_on", "incoming"): "is depended on by",
+    ("example_of", "outgoing"): "is an example of",
+    ("example_of", "incoming"): "has an example in",
+    ("part_of", "outgoing"): "is part of",
+    ("part_of", "incoming"): "has a part in",
+}

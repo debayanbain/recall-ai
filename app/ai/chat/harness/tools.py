@@ -22,6 +22,8 @@ from app.ai.chat.harness.schemas import (
     AskUser,
     FinalAnswer,
     GetCaptureStatus,
+    GetConnections,
+    ProposeConnect,
     ProposeDelete,
     ProposeNote,
     ProposeRetry,
@@ -37,8 +39,10 @@ __all__ = [
     "AskUser",
     "FinalAnswer",
     "GetCaptureStatus",
+    "GetConnections",
     "GetMemory",
     "ListMemories",
+    "ProposeConnect",
     "ProposeDelete",
     "ProposeNote",
     "ProposeRetry",
@@ -71,6 +75,10 @@ class AgentTools(Protocol):
 
     async def get_memory(self, memory_id: str) -> str: ...
 
+    async def get_connections(
+        self, memory_id: str, relation: str | None = None, limit: int | None = None
+    ) -> str: ...
+
     async def get_capture_status(self, memory_id: str | None = None) -> str: ...
 
     async def ask_user(self, question: str, options: Sequence[str] = ()) -> str: ...
@@ -80,6 +88,10 @@ class AgentTools(Protocol):
     async def propose_retry(self, memory_id: str) -> str: ...
 
     async def propose_delete(self, memory_id: str) -> str: ...
+
+    async def propose_connect(
+        self, memory_id: str, other_id: str, relation: str = "related_to"
+    ) -> str: ...
 
 
 def build_tools(executor: Any) -> list[StructuredTool]:
@@ -109,6 +121,20 @@ def build_tools(executor: Any) -> list[StructuredTool]:
     if hasattr(executor, "get_memory"):
         tools.append(
             _tool(GetMemory, coroutine=lambda memory_id: executor.get_memory(memory_id))
+        )
+    # Gated on the reader rather than on the method, like the proposal tools are gated on
+    # the store. The method exists on every toolbox; a turn with nowhere to read edges from
+    # must not be told about a tool whose only possible answer is an apology.
+    if getattr(executor, "connections", None) is not None and hasattr(
+        executor, "get_connections"
+    ):
+        tools.append(
+            _tool(
+                GetConnections,
+                coroutine=lambda memory_id, relation=None, limit=None: (
+                    executor.get_connections(memory_id, relation, limit)
+                ),
+            )
         )
     if hasattr(executor, "get_capture_status"):
         tools.append(
@@ -150,6 +176,20 @@ def build_tools(executor: Any) -> list[StructuredTool]:
                 _tool(
                     ProposeDelete,
                     coroutine=lambda memory_id: executor.propose_delete(memory_id),
+                )
+            )
+        # Gated on the connection reader as well as the store: without one there is no
+        # way to show the edge afterwards, and offering a write whose result is invisible
+        # is worse than not offering it.
+        if getattr(executor, "connections", None) is not None and hasattr(
+            executor, "propose_connect"
+        ):
+            tools.append(
+                _tool(
+                    ProposeConnect,
+                    coroutine=lambda memory_id, other_id, relation="related_to": (
+                        executor.propose_connect(memory_id, other_id, relation)
+                    ),
                 )
             )
 

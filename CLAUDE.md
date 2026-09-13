@@ -782,6 +782,32 @@ catch-all and must stay last, so new extractors get appended *before* it.
   signed URL is the only way in and it is minted per request. `storage_key` is never
   serialized to the browser. `get_storage()` returns None when the bucket is unconfigured
   and uploads degrade to text-only rather than the API failing to boot.
+- **A card's picture is copied into our bucket; the scraped URL is not kept as the
+  answer.** An `og:image` from Instagram or Facebook is a *signed* fbcdn/cdninstagram
+  URL with an expiry measured in days -- measured 2026-09-13, eleven of twelve stored
+  stills already answered **403**. Storing it is storing a credential on someone else's
+  clock, and the failure is silent in the worst way: the capture is fine, the row is
+  fine, and the picture just stops arriving about a week later. It also cost requests --
+  a failed `<img>` made the card re-mint a download link for a memory with no stored
+  file, so every link card spent a round trip on a guaranteed 404 (`GET /vault/{id}/file`
+  404 storms in the log are this). `services/thumbnails.py` mirrors the image once, at
+  processing time, into the same private bucket. Five rules:
+  * **The fetch goes through `assert_safe_url`, per redirect hop.** The URL was written
+    by a scraped page, so this is the same SSRF surface as an extractor.
+  * **The type comes from the bytes**, never the header or the extension, and **SVG is
+    refused** -- this is the one object in the bucket a page is meant to render.
+  * **Failure is silent and total.** Decoration must never fail a capture, retry a task,
+    or strand an item; the row keeps the scraped URL, which at least works for a week.
+  * **`thumbnail_key` never reaches the browser.** `VaultItemRead.thumbnail_url` is
+    swapped for a presigned URL in `api/cards.py`, minted per response with
+    `THUMBNAIL_LINK_TTL_SECONDS` (6h -- it has to outlive the *page*, not a click), and
+    those responses carry `Cache-Control: private, no-store` because they now embed a
+    credential. It is signed in the listing rather than served by a
+    `GET /vault/{id}/thumbnail` route because a route per card puts the round trips
+    straight back (see "Latency").
+  * **Nothing is backfilled by the migration.** `0015_thumbnail_key` adds the column and
+    stops; `scripts/backfill_thumbnails.py --apply` is the one-off, and it rescued
+    exactly 1 of 12 because the other eleven were already dead.
 - **The upload allowlist is closed, and SVG/HTML are refused on purpose.** They are
   executable in a browser context, so storing them makes any future render path a stored
   XSS. Defence in depth on top of that: every presigned URL forces
@@ -1003,6 +1029,233 @@ catch-all and must stay last, so new extractors get appended *before* it.
   kept rather than deleted because a database created before the rename still has to pass
   through them. **Any future table rename has to sweep the earlier migrations the same
   way.**
+- **A connection is ONE row, directional, read from both ends.** `memory_connections`
+  (`app/models/connection.py`) stores `source_item_id -> target_item_id` once, and
+  `ConnectionRepository.list_for_item` returns each edge with a `direction` computed
+  relative to the memory that was asked about. Storing two rows per edge would be two
+  sources of truth that can disagree after a retype, with nothing to arbitrate -- the
+  reason ownership lives only in `spaces.user_id`. Storing one *undirected* row would make
+  `part_of` and `depends_on` unrenderable, because those say different things each way.
+  "Bidirectional navigation" is a read concern and it is solved by reading. Five things go
+  with it:
+  * **The unique key is the unordered pair and excludes the relation.**
+    `(user_id, pair_low, pair_high)` over two `GENERATED ALWAYS AS (least/greatest(...))
+    STORED` columns, so a pair has at most one edge however it is labelled and whichever
+    end it was drawn from. Re-typing is an `UPDATE`. That is also why `POST /connections`
+    answers **200 with `created: false`** rather than 409 -- somebody connects A to B from
+    A's page and later from B's, and re-adding is a normal outcome, not an error (the
+    `SpaceRepository.add_items` lesson). The generated columns are an index, never data:
+    they are not in `_PUBLIC_FIELDS` and must not be.
+  * **A dismissal is a `status`, not a second table.** The constraint that stops a
+    duplicate edge is the same one that has to stop a re-suggestion, so the derivation's
+    `ON CONFLICT DO NOTHING` already refuses to re-propose a pair somebody declined -- the
+    dismissal *is* the conflicting row. Two tables means two checks and the second is the
+    one that gets forgotten. The cost is that a dismissed row owns the pair forever, which
+    is paid by a manual connect **reviving** it: a person deliberately connecting two
+    memories is overriding their own earlier "don't suggest this", and a 409 there is a
+    dead end nobody would guess the way out of.
+  * **Symmetric relations are normalised on write.** `related_to` and `contradicts` read
+    the same from both ends, so `ConnectionService._orient` points them from the lower id.
+    Left to chance, half of them render backwards and somebody eventually "fixes" a row
+    that was never wrong.
+  * **Every RETURNING statement carries `populate_existing`** (`_FRESH` in
+    `repositories/connection.py`). SQLAlchemy's identity map hands back the object it
+    already has for a primary key rather than rebuilding it from the row, so an
+    `UPDATE ... RETURNING` against a row the session has loaded returns the **stale**
+    instance: the database is right and the response is wrong, and nothing errors. Caught
+    by the dismiss-then-reconnect test, where a revived edge came back saying `dismissed`.
+  * **There is no 403 in this feature, and there must not be.** A connection has one
+    owner, so "no such edge", "not yours" and "no such memory" are one answer; anything
+    else confirms an id exists to somebody who may not see it. Spaces need both codes only
+    because a member can be shown a Space and still be refused inside it.
+- **`/connections` with no memory named opens on the busiest memories, not the newest.**
+  `GET /connections/hubs` (`ConnectionRepository.most_connected`, one statement) exists
+  because the page is a top-level nav destination and is therefore reached with no
+  parameter every time somebody clicks it. Listing recent saves there points at exactly
+  the wrong rows: **the newest capture is usually the least connected**, since everything
+  it links to was found from its side and nothing has been saved since. Two rules with it:
+  * **Undecided edges come first.** A backfill lands a whole vault's worth of suggestions
+    at once, and until `SuggestionInbox` rendered there was no page that listed them --
+    they were reachable only by opening a memory that happened to have one. A decision
+    nobody can find is a decision nobody makes.
+  * **Hubs count confirmed edges only, and only live neighbours.** A count that included
+    suggestions or tombstones would promise cards the neighbourhood read will not return.
+  Both counting reads share `_ENDPOINTS`, the `UNION ALL` that yields one row per *end* of
+  each edge -- an edge is stored one way and read from both, so anything counting per
+  memory has to see it twice, and two copies of that is two definitions of what a
+  connection count is.
+- **A Space's connections panel shows the caller's OWN edges and nobody else's.**
+  `GET /spaces/{id}/connections` -> `ConnectionRepository.list_in_space`, which filters on
+  three things: the edge is the caller's, both of its memories are in the Space, and both
+  are still alive. This sits beside "a member sees cards, not bodies" and narrows the same
+  boundary rather than widening it. The reasoning, because it is a decision and not an
+  oversight: **a connection is a judgement its author made about their own memories.**
+  "A contradicts B" is an opinion, not a fact about the Space, and publishing everyone's
+  to everyone would make a shared context a place where your reasoning about your own
+  saves is readable by strangers -- including through a public share page. Two members
+  therefore see the same Space with different graphs, and the panel copy says so outright
+  rather than letting anyone assume it is the Space's graph. It is also the reversible
+  direction: widening this later is a decision somebody can take deliberately; un-showing
+  people each other's judgements after the fact is not. The membership gate runs **first**
+  -- inferring "not a member" from an empty edge list would save a statement and stop
+  being an access check.
+- **A derived connection is a SUGGESTION, and that is a security control rather than a
+  courtesy.** `ConnectionDeriver` (`app/services/connection_derivation.py`) runs after a
+  capture finishes, reads the vector the pipeline just wrote, and proposes the nearest few
+  memories that clear `CONNECTION_MIN_SCORE` -- always `related_to`, always `suggested`,
+  never `confirmed`. Six things go with it:
+  * **The threshold has never been measured.** `CONNECTION_MIN_SCORE` defaults to 0.62 and
+    that number came from nowhere. Run `scripts/measure_connection_floor.py` before
+    trusting it, and re-run it whenever the embedding provider changes -- this is the
+    `RECALL_MIN_SCORE` bug waiting to happen again, where Gemini's 0.55 was carried onto
+    an OpenAI vault whose true matches score 0.373.
+  * **It is a separate Celery task, enqueued after the commit**, beside `_notify_surface`
+    and fail-soft like it. Inline in `ProcessingService._enrich` the exception would travel
+    up through `process`, which writes `processing_error`, bumps `retry_count` and
+    **re-raises**: a bug in the connection scan would mark a perfectly enriched memory
+    `failed` and then pay for three more full enrichments to reach the same failure.
+    `max_retries=1`, not three -- a `UniqueViolation` from two captures racing is absorbed
+    by `ON CONFLICT`, and an item with no embedding is an *answer*.
+  * **Both completion paths call it.** `_process_item` for a fast capture and
+    `_finalize_run` for a deferred one. Wiring only the first is how the Apify half of a
+    vault silently has no connections;
+    `tests/connections/test_derivation_wiring.py` reads the source of both and requires it.
+  * **`exclude_item_id` on `search_semantic`** keeps an item off its own list. The query
+    vector belongs to one of the rows being searched, so without it the strongest candidate
+    every single time is the item itself at distance zero.
+  * **Older memories are never re-scanned.** An edge is found from the new capture's side
+    only, which is what makes this O(1) per capture rather than O(n^2) over the vault. The
+    older memory still *shows* the edge -- that is what directional storage buys -- it just
+    never goes looking. `scripts/backfill_connections.py` is the one-off for a vault that
+    predates the feature, deliberately a script rather than a beat task: a sweep that runs
+    forever over a vault that only ever grows is a cost with no ceiling. **It spends no
+    money** -- every vector it compares was already written at capture time -- which makes
+    its dry run the one honest way to check `CONNECTION_MIN_SCORE` against a real vault
+    without buying fresh embeddings. It reports the pair count *deduplicated by unordered
+    pair*, because A finds B and B finds A and the database keeps one row: counting
+    sightings reports twice the suggestions that could actually land, and that number is
+    the one somebody sets a threshold from.
+  * **`CONNECTION_MAX_PER_ITEM` counts every state**, dismissed and suggested included. A
+    wall of pending suggestions is exactly as much of a wall as a wall of confirmed ones.
+- **A connection is a new way to get attacker-controlled text into a prompt, and the
+  confirmation step is what closes it.** The text of a page somebody saves already becomes
+  `content`, `summary`, `title` and `ai_tags`; it now also becomes the embedding an edge is
+  derived from. So an attacker who guesses a topic the victim keeps memories about can
+  write a page stuffed with that vocabulary, get it saved, and have their card appear
+  beside the victim's memory -- text next to a memory the question was never about.
+  What stops it: a derived edge is `suggested` and is invisible to `GetConnections` until a
+  person taps it (**this is the reason not to auto-confirm above a threshold, and no
+  threshold replaces it**); the score floor bounds the attack to topics the attacker can
+  guess; `CONNECTION_MAX_PER_ITEM` bounds how much of one page it can occupy; `user_id` is
+  on the toolbox, on the table and re-applied in the repository, so there is nothing to aim
+  cross-tenant; `GetConnections` refuses an id this turn did not surface, so a caption
+  naming one gets the refusal; neighbours arrive inside `chain.fence_block` as quoted
+  material; and `validate_answer` still strips a citation or a URL that was never
+  surfaced. **Residual risk, stated plainly:** somebody who can get a page into a vault can
+  get that page *adjacent to a chosen memory* in a prompt. That is a relevance attack, not
+  an authorization one, and no string check closes it -- the same shape as
+  `assert_safe_url`'s residual DNS-rebinding risk.
+- **`GetConnections` is bound on the reader, not on the method** (`harness/tools.py`), the
+  way the `propose_*` tools are bound on the store: every toolbox has the method, and a
+  turn with nowhere to read edges from must not be offered a tool whose only possible
+  answer is an apology. It is **not** an overlap of `QueryMemories` -- the reasoning that
+  keeps `SearchMemories` and `ListMemories` off this lane was about two narrower versions
+  of the *same* read, and following an edge is a different read. Its results go through
+  `MemoryToolbox._render` like everything else, so they land in `SurfacedSet` and stay
+  citable and linkable; the relation rides **inside** the fence, one line, capped, worded
+  from the side the question was asked from (`part_of` read from the other end is
+  `has a part in`, and handing the model the wrong one is a quiet inversion nobody reviews).
+  There is deliberately **no write tool**: connecting from chat would be a `propose_connect`
+  minting a token through `chat_engine/proposals.py`, with the surfaced-id check on *both*
+  ids, and it is not built.
+- **A model may propose which relation an edge is, and that is the last thing built and
+  off by default.** `app/ai/connections.py` + `CONNECTION_TYPING_ENABLED`, reached only
+  from `POST /connections/{id}/retype` -- on demand, on an edge that already exists, never
+  during capture. The ordering is the point: a cosine distance can only claim two memories
+  are close, which is why `related_to` is the honest default, while a *label* can be
+  confidently and fluently wrong in the way a Bengali voice note came back as Traditional
+  Chinese. A wrong label filed automatically on every capture is one nobody goes back to
+  check. Seven things go with it:
+  * **It is a module with its own switch, not a fifth `AIProvider` method**, the same
+    reasoning `enrichment.py`, `transcription.py` and `vision.py` each give: the Protocol
+    is structural, so a provider missing a method fails at runtime inside the pipeline and
+    every fake in `tests/` has to grow it. `tests/ai/fakes.py` needed no change.
+  * **`tests/conftest.py::_no_provider_calls` gained it in the same commit** -- the switch
+    forced off *and* `_call_provider` stubbed. Off is what the connection tests want; the
+    stub is what catches a future caller that reaches past the switch. This is the third
+    time that rule has been paid for.
+  * **The prompt reads cards, never bodies.** `cards.build_card` is "the shortest
+    description that still tells two memories apart"; two article bodies in one prompt is
+    the cost the combined enrichment exists to avoid, and it buys nothing when the question
+    is how two memories relate.
+  * **The fence is local, not `chain.fence_block`.** That one labels a block with a
+    memory's real short id, and a short id in *this* prompt is an id the model learned
+    somewhere no citation validator is watching.
+  * **An unrecognised relation becomes `related_to`**, which is both this vocabulary's
+    "Other" and its weakest claim -- the fail-closed direction, exactly like
+    `enrichment._validate` mapping an unknown category to "Other". `ENRICHMENT_LANGUAGE`
+    must never reach the prompt: the relation is checked with `Relation(...)` and stored as
+    an enum value, so a translated one drops every typed edge back to the catch-all.
+  * **`reason` is one-lined and capped on the way IN**, never at render time -- a
+    redaction that happens on one render path is one the second render path forgets
+    (`safe_error_text`'s rule). It is written to `ai_reason` and **never** to `note`:
+    showing a model's sentence as words its owner typed is the one way this can lie, and
+    the frontend marks it with `ConnectChip`.
+  * **The only connection route that spends a model call, so the only one with a cap**
+    (`CONNECTION_TYPING_PER_HOUR`, keyed by user id in Redis). Off, unconfigured and
+    rate-limited all answer **503** with one sentence: they are the same thing from
+    outside, and separating them reports which of an operator's settings is off.
+- **The agent can OFFER to connect two memories, and that is the only write-shaped thing
+  it can do about them.** `ProposeConnect` mints a single-use token through
+  `chat_engine/proposals.py`; the write happens in `telegram/confirm.py::_connect` or
+  `POST /chat/proposals/{token}/accept`, code with no model in it. There is still no
+  `Connect` tool and there must not be. Four rules:
+  * **The surfaced-id check is doubled** -- *both* ids must have been shown this turn.
+    Sharper than symmetry: a connection is a route from one memory's text to another's in
+    a **later** prompt, which is the mechanism by which a scraped page ends up adjacent to
+    a memory the question was never about. An id the model read inside a memory is exactly
+    the id an attacker would want on one end of that edge.
+  * **The card shows both titles and the relation.** There is no text to check against the
+    person's own turn the way `propose_note` has, so what somebody reads before tapping is
+    *which two* memories and how they are about to be labelled.
+  * **The relation is re-derived from the enum on the way out of Redis.** It crosses the
+    store as a string; an unrecognised one becomes `related_to`, the weakest claim in the
+    vocabulary and the fail-closed direction.
+  * **Both ends are re-checked against the tapping account, per item.** The ids in a
+    proposal are not trusted because a proposal carried them --
+    `ConnectionService._assert_owns_both` runs exactly as it does for a typed request.
+  `confirm.py` takes a `ConnectionWriter` **Protocol** rather than importing
+  `ConnectionService`, whose own imports reach `app.ai.connections`. The boundary test in
+  `tests/integrations/test_telegram_callbacks.py` checks *direct* imports only, and
+  deliberately: a transitive walk was tried and flags `VaultService -> app.ai.spans`,
+  which is legitimate -- so the narrow property is the one that is true and worth keeping.
+- **`connections` is the one `QUERY_FIELDS` entry that costs a second statement**, which is
+  why it is opt-in like `excerpt` -- and why it exists at all: without it the model cannot
+  see that a result *has* neighbours, so it has no reason to ever follow them. That is the
+  same shape as the missing-`link` bug, where "never say you cannot without looking" only
+  works if there is something visible to look at. A denormalized count on `vault_items` was
+  rejected: it is wrong the moment anything is dismissed, and the agent reads this number
+  and then follows it **inside the same turn**.
+- **You may only connect memories you own, and it is checked per item.**
+  `ConnectionService._assert_owns_both` reads both endpoints through
+  `VaultRepository.owned_items` and requires *two* rows back. A request carrying two ids is
+  exactly where a stranger's is easiest to slip in, and "does this user own something here"
+  says yes to the half-owned case -- which is the shape of the cross-tenant IDOR
+  `SpaceService._attach` was fixed for. `tests/connections/test_connection_authz.py` comes
+  at it from every direction a caller has, including the ids swapped.
+- **Deleting a memory hard-deletes its edges, beside its chunks.** `VaultRepository.delete`
+  is a soft delete that scrubs; the connections are removed outright, for the reason given
+  there about the chunks: an edge asserts "this memory is about the same thing as that
+  one", which is a statement about content somebody asked to be rid of. It also frees the
+  pair, so a deletion cannot permanently block a connection drawn later between what
+  remains -- unlike a dismissal, which is meant to. Every read *also* filters `deleted_at`
+  on the neighbour, which is defence in depth rather than the only thing standing between
+  a tombstone and a live memory's page.
+- **Every mutating connection route carries `assert_same_site`**, like the Spaces and auth
+  routes and unlike the older vault ones. Same development consequence, worth knowing
+  before it reads as a bug: browsing `http://localhost:3000` while `CORS_ORIGINS` points at
+  a tunnel gets a **403 on every connection write** while reads and the whole vault keep
+  working.
 - **`item_metadata` maps to a DB column literally named `metadata`** (renamed because `metadata` is
   reserved on SQLModel classes). Raw SQL must use `metadata`; Python must use `item_metadata`.
 - **`EMBEDDING_DIM = 1536` is a padded lie under Gemini, exact under OpenAI.** `text-embedding-004`
@@ -1301,8 +1554,8 @@ app/services/telegram/confirm.py                      what a tapped button does
 - **Spaces are built; the AI half of them is not.** `/api/v1/spaces` does CRUD,
   membership, invites and the public page. Not built yet, and named here so nobody
   assumes otherwise: the AI *proposal* for a Space (`app/ai/chat/curator.py`), the
-  derived connection graph (`SPACE_CONNECTION_MIN_SCORE` is configured but nothing reads
-  it), the "memories that may belong here" suggestions, and Space-scoped Ask AI. The
+  "memories that may belong here" suggestions, and Space-scoped Ask AI. **Connections
+  are built**, both per-memory (`/api/v1/connections`) and per-Space. The
   settings for all four are in `app/core/config.py` with their reasoning; the UI shows
   honest empty states rather than placeholders.
 - `GET /search` is still `ILIKE` over title/summary/content. Vector search now exists —

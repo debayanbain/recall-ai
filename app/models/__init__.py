@@ -1,5 +1,6 @@
 """SQLModel table models. Import all here so Alembic autogenerate sees them."""
 from app.models.audit_log import AuditLog
+from app.models.connection import MemoryConnection
 from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.instagram_account import InstagramAccount
 from app.models.oauth_account import OAuthAccount
@@ -21,6 +22,7 @@ __all__ = [
     "RunStatus",
     "VaultItem",
     "VaultChunk",
+    "MemoryConnection",
     "Space",
     "SpaceItem",
     "SpaceMember",

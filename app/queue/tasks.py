@@ -18,13 +18,17 @@ from app.models.base import ProcessingStatus
 from app.models.extraction_run import RunStatus
 from app.queue.celery_app import celery_app
 from app.queue.client import (
+    enqueue_derive_connections,
     enqueue_process_item,
     enqueue_shadow_agent_turn,
     enqueue_telegram_delivery,
 )
+from app.repositories.connection import ConnectionRepository
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
 from app.services.apify import get_run
+from app.services.connection_derivation import ConnectionDeriver
+from app.services.connection_service import ConnectionService
 from app.services.processing_service import ProcessingService
 from app.storage import get_storage
 
@@ -53,6 +57,70 @@ async def _notify_surface(item_id: uuid.UUID, session: Any) -> None:
         await enqueue_telegram_delivery(item.id)
     except Exception as exc:  # noqa: BLE001 - the item is saved either way
         log.warning("telegram_delivery_enqueue_failed", error=type(exc).__name__)
+
+
+async def _derive_connections(item_id: uuid.UUID, session: Any) -> None:
+    """Queue the connection scan for an item that has just finished.
+
+    Called after the commit, beside `_notify_surface`, and for the same reason: the task
+    has to find a visible row. Enqueuing is fail-soft -- the memory is enriched and saved
+    either way, and an unreachable broker must not turn that into a failed capture.
+
+    Deliberately NOT inside `ProcessingService._enrich`. That runs inside `process`, which
+    records `processing_error`, increments `retry_count` and **re-raises** so Celery
+    retries: a bug in the connection scan would mark a perfectly enriched memory `failed`
+    and then pay for three more full enrichments to reach the same failure. It would also
+    run inside the item's transaction, so a conflict on the connection insert would roll
+    back the enrichment that earned it.
+    """
+    item = await VaultRepository(session).get_unscoped(item_id)
+    if item is None or item.processing_status is not ProcessingStatus.completed:
+        # Only a finished item has the embedding this reads. `skipped` and `failed` have
+        # nothing to compare, and re-checking here costs nothing.
+        return
+    try:
+        await enqueue_derive_connections(item.id)
+    except Exception as exc:  # noqa: BLE001 - the item is saved either way
+        log.warning("connections_enqueue_failed", error=type(exc).__name__)
+
+
+@celery_app.task(
+    name="app.queue.tasks.derive_connections",
+    bind=True,
+    # One retry, not the default three. A `UniqueViolation` from two captures racing is a
+    # normal outcome that `ON CONFLICT` already absorbs, and an item with no embedding is
+    # an *answer* rather than a fault -- the same split `VisionError`/`VisionFailed` and
+    # `PermanentExtractionError` make. One extra attempt covers a dropped connection to
+    # the database; three would spend real work to reach the same place.
+    max_retries=1,
+    default_retry_delay=30,
+    acks_late=True,
+)
+def derive_connections(self: Any, item_id: str) -> int:
+    """Propose connections for a memory that has just been enriched.
+
+    Its failure is never the capture's failure: by the time this runs the item is
+    committed, `completed`, and answered for on whatever surface it came from.
+    """
+    try:
+        return asyncio.run(_derive_connections_task(item_id))
+    except Exception as exc:
+        log.warning(
+            "derive_connections_failed", item_id=item_id, error=type(exc).__name__
+        )
+        raise self.retry(
+            exc=RuntimeError(f"{type(exc).__name__}: {str(exc)[:300]}")
+        ) from None
+
+
+async def _derive_connections_task(item_id: str) -> int:
+    async with task_session() as session:
+        deriver = ConnectionDeriver(
+            ConnectionRepository(session), VaultRepository(session)
+        )
+        written = await deriver.derive(uuid.UUID(item_id))
+        await session.commit()
+        return written
 
 
 @celery_app.task(
@@ -104,6 +172,7 @@ async def _process_item(item_id: str) -> str | None:
             # A deferred extraction is not finished yet; its reply is sent by
             # `_finalize_run` instead.
             await _notify_surface(uuid.UUID(item_id), session)
+            await _derive_connections(uuid.UUID(item_id), session)
         return run_id
 
 
@@ -140,7 +209,12 @@ async def _finalize_run(provider_run_id: str) -> None:
             log.info("finalize_run_already_terminal", run_id=provider_run_id)
             return
 
-        service = ProcessingService(VaultRepository(session), runs)
+        # `get_storage()`, like `_process_item` -- without it `ProcessingService.storage`
+        # is None and `thumbnails.mirror` returns immediately, so the whole *deferred*
+        # branch silently keeps the scraped `og:image`. That branch is Instagram and
+        # Facebook: precisely the signed `fbcdn` / `cdninstagram` stills that stop
+        # resolving after about a week, which is the reason mirroring exists at all.
+        service = ProcessingService(VaultRepository(session), runs, get_storage())
 
         # Authoritative: never trust the webhook body for status or dataset id.
         detail = await get_run(provider_run_id)
@@ -165,6 +239,9 @@ async def _finalize_run(provider_run_id: str) -> None:
             await runs.mark(run, RunStatus.succeeded)
             await session.commit()
         await _notify_surface(run.vault_item_id, session)
+        # The deferred half of the pipeline gets connections too. Wiring only
+        # `_process_item` is how the Apify side of a vault silently has none.
+        await _derive_connections(run.vault_item_id, session)
 
 
 @celery_app.task(name="app.queue.tasks.sweep_stranded_items")
@@ -261,7 +338,12 @@ async def _sweep_stale_runs() -> int:
         if not stale:
             return 0
 
-        service = ProcessingService(VaultRepository(session), runs)
+        # `get_storage()`, like `_process_item` -- without it `ProcessingService.storage`
+        # is None and `thumbnails.mirror` returns immediately, so the whole *deferred*
+        # branch silently keeps the scraped `og:image`. That branch is Instagram and
+        # Facebook: precisely the signed `fbcdn` / `cdninstagram` stills that stop
+        # resolving after about a week, which is the reason mirroring exists at all.
+        service = ProcessingService(VaultRepository(session), runs, get_storage())
         rescued = 0
         for run in stale:
             try:
@@ -396,6 +478,11 @@ async def _handle_telegram_update(update: dict[str, Any]) -> None:
             client,
             recall=_recall_responder(vault.repo),
             proposals=RedisProposalStore(),
+            # Redeems a tapped `connect`. Shares the session with everything else in this
+            # task, so the write lands in the same transaction the commit below covers.
+            connections=ConnectionService(
+                ConnectionRepository(session), VaultRepository(session)
+            ),
         )
 
         async with typing_action(client, typing_chat_id):
@@ -505,7 +592,8 @@ async def _shadow_agent_turn(
         surface=surface, router_lane=router_lane, shadow=True
     )
     async with task_session() as session:
-        service = RecallAgentService(VaultRepository(session))
+        repo = VaultRepository(session)
+        service = RecallAgentService(repo, connections=ConnectionRepository(session))
         await service.agent(uuid.UUID(user_id), question, session_id, store=False)
 
 

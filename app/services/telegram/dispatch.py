@@ -44,6 +44,7 @@ from app.services.chat_engine.engine import (
 from app.services.chat_engine.proposals import ProposalStore
 from app.services.chat_engine.router import Intent
 from app.services.chat_engine.types import InboundMessage
+from app.services.connection_service import ConnectionService
 from app.services.surfaces.telegram.parse import parse_message
 from app.services.surfaces.telegram.render import render, render_markup
 from app.services.telegram import confirm, formatting, limits
@@ -108,6 +109,7 @@ class TelegramDispatcher:
         client: TelegramClient,
         recall: RecallLanes | None = None,
         proposals: ProposalStore | None = None,
+        connections: ConnectionService | None = None,
     ) -> None:
         self.links = links
         self.vault = vault
@@ -117,6 +119,10 @@ class TelegramDispatcher:
         #: no store wired up, and a tap is then answered as expired rather than acted on
         #: -- the same answer an unknown token gets, which is the point.
         self.proposals = proposals
+        #: Executes a tapped `connect` proposal. `None` means the tool was never bound
+        #: this turn, so no token of that action can exist to redeem -- and a tap that
+        #: somehow arrives is answered as expired, like any other unredeemable one.
+        self.connections = connections
         # None when no chat model is configured. Plain text is then answered with
         # `chat_unavailable` rather than saved: links and files still capture, so nothing
         # a user meant to keep is lost, and nothing they meant as talk is kept.
@@ -319,6 +325,7 @@ class TelegramDispatcher:
             store=self.proposals,
             vault=self.vault,
             capture=self.capture,
+            connections=self.connections,
             user_id=account.user_id,
             chat_id=chat_id,
             message=message,

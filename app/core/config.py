@@ -415,26 +415,60 @@ class Settings(BaseSettings):
     # expectation.
     PROPOSAL_TTL_SECONDS: int = 600
 
+    # --- Connections ---
+    # Two memories are "connected" when their vectors are this close. Read the long note
+    # on RECALL_MIN_SCORE before touching this: it is the same kind of number and it has
+    # the same failure mode. It is NOT the same number, though, and must not be copied
+    # from it -- that threshold answers "is this memory about the question", a comparison
+    # between a short query and a document, while this one compares two documents.
+    # Document-to-document similarities sit systematically higher, so a floor borrowed
+    # from the query side draws an edge between every pair and the graph becomes a solid
+    # block that says nothing.
+    #
+    # **0.62 is a placeholder and has never been measured.** Shipping it unmeasured is the
+    # RECALL_MIN_SCORE bug again: the first draft of *that* setting carried Gemini's 0.55
+    # onto an OpenAI vault where a true match scores 0.373, and it would have reported
+    # memories the user really had saved as missing. Run
+    # `scripts/measure_connection_floor.py` against the configured embedding provider on
+    # memories you can eyeball, and check the result on deliberately unrelated ones: that
+    # set should come back nearly empty. Re-measure whenever the embedding provider
+    # changes, alongside the re-embed that change already requires.
+    #
+    # A Space-wide graph, if one is ever built, needs its OWN floor: it draws every pair
+    # rather than the nearest few, so it wants a higher one than this.
+    CONNECTION_MIN_SCORE: float = 0.62
+    # How many neighbours one new capture may propose. Feature 20's "this looks strongly
+    # related to 3 memories you saved earlier" reads as a fact at 3 and as noise at 30,
+    # and every one of these is a decision a person has to make.
+    CONNECTION_MAX_CANDIDATES: int = 5
+    # Ceiling on the edges one memory may hold. Bounds the page, bounds the radial layout,
+    # and bounds how much of one memory's page a single scraped page can occupy -- see the
+    # injection note in CLAUDE.md.
+    CONNECTION_MAX_PER_ITEM: int = 24
+    # Whether a model may propose *which* relation an edge is -- expands, contradicts,
+    # part of. Off by default and deliberately the last thing built, because it is the
+    # only part of this feature that can be confidently, fluently wrong in a way a person
+    # has to notice and correct. That is the transcription lesson: a Bengali voice note
+    # came back as fluent Traditional Chinese and every downstream artefact was correct
+    # about the wrong text. A cosine distance cannot be wrong in that way -- it only ever
+    # claims two memories are close -- so `related_to` stays the honest default and this
+    # is opt-in on top of it.
+    CONNECTION_TYPING_ENABLED: bool = False
+    # Per-user hourly cap on typing, which is the only connection endpoint that spends a
+    # model call. Keyed by user id like the other AI caps, not by IP: a cost belongs to
+    # the account that incurred it.
+    CONNECTION_TYPING_PER_HOUR: int = 30
+
     # --- Spaces ---
     # An invite is a bearer link someone pastes into a chat. Long enough to be useful
     # across a weekend, short enough that a link forgotten in a group thread stops
     # working. Single-use regardless, so this is the ceiling and not the expectation.
     SPACE_INVITE_EXPIRE_DAYS: int = 7
-    # Two memories are "connected" when their vectors are this close. Read the long note
-    # on RECALL_MIN_SCORE before touching this: it is the same kind of number and it has
-    # the same failure mode. It is NOT the same number, though, and must not be copied
-    # from it -- that threshold answers "is this memory about the question", which is a
-    # comparison between a short query and a document, while this one compares two
-    # documents. Document-to-document similarities sit systematically higher, so a floor
-    # borrowed from the query side draws an edge between every pair in the Space and the
-    # graph becomes a solid block that says nothing. **Measure it against the configured
-    # embedding provider on a Space you can eyeball**, and check the result on a Space of
-    # deliberately unrelated memories: that one should come back nearly empty.
-    SPACE_CONNECTION_MIN_SCORE: float = 0.62
-    # The pairwise scan is O(n^2). At 150 items that is ~11k comparisons, which Postgres
-    # does inside the request; at 1000 it is half a million and the request is gone. Past
-    # the cap the API answers `truncated` rather than timing out, because a Space that
-    # large is exactly the one someone will open first.
+    # The pairwise scan a Space-wide graph would need is O(n^2). At 150 items that is
+    # ~11k comparisons, which Postgres does inside the request; at 1000 it is half a
+    # million and the request is gone. Nothing reads this yet -- the Space-scoped graph is
+    # not built (see the Spaces note in CLAUDE.md) -- and it is deliberately NOT what the
+    # per-memory derivation uses, which is vault-wide and rides the HNSW index.
     SPACE_CONNECTION_MAX_ITEMS: int = 150
     # How many memories a single Space proposal may be built from. A proposal over more
     # than this is both a worse proposal -- the model averages away what made the
@@ -544,6 +578,22 @@ class Settings(BaseSettings):
     MAX_VOICE_NOTE_SECONDS: int = 300
     # Download links are minted on demand, so they only have to outlive the click.
     DOWNLOAD_LINK_TTL_SECONDS: int = 300
+
+    # --- Mirrored thumbnails ---
+    # A scraped `og:image` is a *signed* fbcdn/cdninstagram URL with an expiry measured
+    # in days. Stored as-is it stops resolving about a week after the capture -- measured
+    # 2026-09-13: eleven of twelve saved stills answered 403 -- and the card silently
+    # loses its picture with nothing anywhere to say why. So the worker copies the image
+    # into our own bucket once, and the card is served from there forever after.
+    MIRROR_THUMBNAILS: bool = True
+    # A card image, not a photo library: anything larger is not a thumbnail and is not
+    # worth the transfer or the storage. The cap is enforced while streaming, so an
+    # oversized (or lying) response is abandoned rather than read into memory.
+    THUMBNAIL_MAX_BYTES: int = 5_000_000
+    # Unlike a download link, this one is embedded in a listing the page renders, so it
+    # has to outlive the *page*, not the click. Six hours covers a tab left open for a
+    # working day's worth of glances; past it, any refetch of the listing mints a new one.
+    THUMBNAIL_LINK_TTL_SECONDS: int = 21_600
 
     # --- Recovering stranded work ---
     # An item left `processing` for this long has no worker behind it: the process died

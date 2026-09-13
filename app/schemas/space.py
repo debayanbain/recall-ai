@@ -19,7 +19,7 @@ from datetime import datetime
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from app.models.base import SpaceRole, Visibility
+from app.models.base import Relation, SpaceRole, Visibility
 from app.schemas.vault import VaultItemRead
 
 #: Matches `Space.emoji`. One or two glyphs; the column is 16 bytes because a single
@@ -148,6 +148,39 @@ class SpaceRead(BaseModel):
 class SpaceDetail(SpaceRead):
     items: list[VaultItemRead] = Field(default_factory=list)
     members: list[SpaceMemberRead] = Field(default_factory=list)
+
+
+class SpaceConnectionRead(BaseModel):
+    """One edge between two memories in a Space, with both of its ends.
+
+    Both, unlike `ConnectionRead`: a Space panel has no focus memory for the other end to
+    be relative to, so neither end can be called "the other one".
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    relation: Relation
+    note: str | None = None
+    #: Model-written. Rendered marked as such, never styled like `note`.
+    ai_reason: str | None = None
+    created_at: datetime
+    source: VaultItemRead
+    target: VaultItemRead
+
+
+class SpaceConnectionsResponse(BaseModel):
+    """**Only the caller's own edges**, both of whose memories are in this Space.
+
+    A Space is the one place somebody reads another person's rows, and this deliberately
+    does not widen that. A connection is a judgement its author made -- "A contradicts B"
+    is an opinion, not a fact about the Space -- so two members looking at the same Space
+    see different graphs. That is honest, and it is the reversible direction: widening
+    later is easy, un-showing people each other's judgements is not.
+    """
+
+    connections: list[SpaceConnectionRead] = Field(default_factory=list)
+    total: int = 0
 
 
 class PublicSpace(BaseModel):

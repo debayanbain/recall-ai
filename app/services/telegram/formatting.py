@@ -262,6 +262,10 @@ def proposal(preview: str, action: str) -> str:
             f"Delete <b>{escape(preview)}</b>?\n"
             "This removes the memory and its file for good."
         )
+    if action == "connect":
+        # Both titles, never a summary of them: the card's whole job is that a person can
+        # see *which two* memories are about to be linked before they tap.
+        return f"Connect these?\n\n<b>{escape(preview)}</b>"
     return f"Save this as a note?\n\n<code>{escape(preview)}</code>"
 
 
@@ -290,6 +294,10 @@ def proposal_expired() -> str:
 
 def proposal_declined() -> str:
     return "Okay, nothing done."
+
+
+def connected() -> str:
+    return "Connected. You'll see it on both memories."
 
 
 def deleted() -> str:

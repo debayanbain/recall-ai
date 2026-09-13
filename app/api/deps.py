@@ -16,6 +16,7 @@ from app.core.logging import get_logger
 from app.core.security import decode_access_token
 from app.db.session import get_session
 from app.models.user import User
+from app.repositories.connection import ConnectionRepository
 from app.repositories.instagram_account import InstagramAccountRepository
 from app.repositories.oauth_account import OAuthAccountRepository
 from app.repositories.space import SpaceRepository
@@ -27,6 +28,7 @@ from app.repositories.user import UserRepository
 from app.repositories.user_session import UserSessionRepository
 from app.repositories.vault import VaultRepository
 from app.services.auth_service import AuthService
+from app.services.connection_service import ConnectionService
 from app.services.instagram_service import InstagramService
 from app.services.session_service import SessionService
 from app.services.space_service import SpaceService
@@ -220,7 +222,20 @@ def get_space_service(session: SessionDep) -> SpaceService:
     # The vault repository comes in beside the space one because adding a memory to a
     # Space has to verify the *memory's* owner, not just the Space's. Owning the
     # container has never granted access to someone else's content.
-    return SpaceService(SpaceRepository(session), VaultRepository(session))
+    return SpaceService(
+        SpaceRepository(session),
+        VaultRepository(session),
+        # Drives the Space's Connections panel. Reads only the caller's own edges; the
+        # sharing boundary is in `ConnectionRepository.list_in_space`.
+        ConnectionRepository(session),
+    )
+
+
+def get_connection_service(session: SessionDep) -> ConnectionService:
+    # The vault repository comes in beside the connection one for the same reason it does
+    # for Spaces: connecting two memories has to verify *both* memories' owner, per item,
+    # and that check lives in the vault's own scoped read.
+    return ConnectionService(ConnectionRepository(session), VaultRepository(session))
 
 
 def get_instagram_service(session: SessionDep) -> InstagramService:
@@ -243,6 +258,7 @@ def get_session_service(session: SessionDep) -> SessionService:
 
 VaultServiceDep = Annotated[VaultService, Depends(get_vault_service)]
 SpaceServiceDep = Annotated[SpaceService, Depends(get_space_service)]
+ConnectionServiceDep = Annotated[ConnectionService, Depends(get_connection_service)]
 AuthServiceDep = Annotated[AuthService, Depends(get_auth_service)]
 InstagramServiceDep = Annotated[InstagramService, Depends(get_instagram_service)]
 TelegramLinkServiceDep = Annotated[

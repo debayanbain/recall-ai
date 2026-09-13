@@ -23,6 +23,12 @@ async def enqueue_finalize_run(provider_run_id: str) -> None:
     await asyncio.to_thread(finalize_run.delay, provider_run_id)
 
 
+async def enqueue_derive_connections(item_id: uuid.UUID) -> None:
+    from app.queue.tasks import derive_connections
+
+    await asyncio.to_thread(derive_connections.delay, str(item_id))
+
+
 async def enqueue_telegram_update(update: dict[str, Any]) -> None:
     """Hand a raw Telegram update to the worker.
 

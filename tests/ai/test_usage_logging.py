@@ -55,7 +55,16 @@ def events() -> Iterator[list[dict[str, Any]]]:
         captured.append(dict(event_dict))
         raise structlog.DropEvent
 
-    structlog.configure(processors=[structlog.contextvars.merge_contextvars, _processor])
+    structlog.configure(
+        processors=[structlog.contextvars.merge_contextvars, _processor],
+        # Explicitly off, whatever the process was left in. `configure_logging` turns
+        # caching ON, and any test module that imports `app.queue.tasks` does so during
+        # collection -- after which the first test here binds the capture chain into a
+        # cached logger and every later test in this file records into *that* test's list
+        # instead of its own. The symptom is an empty `events` and an IndexError three
+        # tests away from the cause.
+        cache_logger_on_first_use=False,
+    )
     try:
         yield captured
     finally:

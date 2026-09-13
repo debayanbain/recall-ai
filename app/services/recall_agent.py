@@ -30,7 +30,7 @@ from app.services.chat_engine import budget as budgets
 from app.services.chat_engine.context import Snapshot, load_snapshot, render_snapshot
 from app.services.chat_engine.guard import guard
 from app.services.chat_engine.proposals import ProposalStore, RedisProposalStore
-from app.services.chat_engine.toolbox import MemoryToolbox
+from app.services.chat_engine.toolbox import ConnectionReader, MemoryToolbox
 from app.services.chat_engine.trace import AgentTrace
 from app.services.chat_engine.types import (
     Delta,
@@ -51,6 +51,10 @@ log = get_logger("recall.agent")
 #: What a surface is told while a tool runs. Stage names, never arguments -- the same
 #: rule the older lane's `_STAGES` follows, for the same reason.
 _STAGES = {
+    # `QueryMemories` was missing here, so the agent lane's main read fell through to the
+    # generic "working" -- the one tool most likely to be running while somebody waits.
+    "QueryMemories": "searching your memories",
+    "GetConnections": "following the connections",
     "SearchMemories": "searching your memories",
     "ListMemories": "looking through your saves",
     "GetMemory": "reading a memory",
@@ -58,6 +62,7 @@ _STAGES = {
     "AskUser": "working",
     "ProposeNote": "getting that ready",
     "ProposeRetry": "getting that ready",
+    "ProposeConnect": "getting that ready",
     "FinalAnswer": "writing the answer",
 }
 
@@ -66,13 +71,20 @@ class RecallAgentService(RecallChatService):
     """`RecallChatService` with a lane in front of it that chooses its own steps."""
 
     def __init__(
-        self, repo: VaultRepository, store: ProposalStore | None = None
+        self,
+        repo: VaultRepository,
+        store: ProposalStore | None = None,
+        connections: ConnectionReader | None = None,
     ) -> None:
         super().__init__(repo)
         #: Where a proposed write is parked until somebody taps it. `None` means the
         #: propose tools are simply not bound this turn, and the prompt already tells
         #: the model what to say when it cannot offer to write.
         self.store = store
+        #: Reads the edges between this person's memories. `None` means `GetConnections`
+        #: is not bound and the `connections` projection returns nothing -- a deployment
+        #: without it answers exactly as it did before the tool existed.
+        self.connections = connections
 
     async def agent(
         self, user_id: uuid.UUID, question: str, session_id: str, *, store: bool = True
@@ -141,6 +153,7 @@ class RecallAgentService(RecallChatService):
             # The person's own message, verbatim. It is the provenance check for
             # `propose_note` and the reason a scraped caption cannot become a note.
             turn=question,
+            connections=self.connections,
         )
         if snapshot is not None:
             # The snapshot rows are in the prompt, so by the definition the surfaced set
@@ -291,4 +304,23 @@ def build_recall_agent(repo: VaultRepository) -> RecallAgentService | None:
 
     if not settings.AGENT_ENABLED or not chat_available():
         return None
-    return RecallAgentService(repo, RedisProposalStore())
+    return RecallAgentService(repo, RedisProposalStore(), _connections(repo))
+
+
+def _connections(repo: VaultRepository) -> ConnectionReader | None:
+    """A connection reader sharing the vault repository's session.
+
+    Built here rather than injected because every caller already hands over a
+    `VaultRepository`, and the two have to read inside one transaction -- a second session
+    would let the neighbourhood disagree with the snapshot in the same turn.
+
+    `None` when there is no session to share, which is every fake in the suite. That is
+    the same degradation the tool already has a name for: no reader, no `GetConnections`,
+    and a lane that answers exactly as it did before the tool existed.
+    """
+    from app.repositories.connection import ConnectionRepository
+
+    session = getattr(repo, "session", None)
+    if session is None:
+        return None
+    return ConnectionRepository(session)

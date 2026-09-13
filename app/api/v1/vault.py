@@ -7,6 +7,7 @@ from typing import Annotated
 from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.api import cards
 from app.api.deps import CurrentUser, SessionDep, VaultServiceDep
 from app.core.config import settings
 from app.models.vault import VaultItem
@@ -244,12 +245,14 @@ async def upload_limits(user: CurrentUser, response: Response) -> dict[str, obje
 async def list_vault(
     user: CurrentUser,
     service: VaultServiceDep,
+    response: Response,
     limit: int = Query(20, ge=1, le=100),
     offset: int = Query(0, ge=0),
 ) -> VaultListResponse:
     items, total = await service.list(user.id, limit, offset)
+    cards.no_store(response)
     return VaultListResponse(
-        items=[VaultItemRead.model_validate(i) for i in items],
+        items=await cards.read_cards(items),
         total=total,
         limit=limit,
         offset=offset,
@@ -258,12 +261,13 @@ async def list_vault(
 
 @router.get("/{item_id}", response_model=VaultItemDetail)
 async def get_item(
-    item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep
+    item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep, response: Response
 ) -> VaultItemDetail:
     item = await service.get(item_id, user.id)
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
-    return VaultItemDetail.model_validate(item)
+    cards.no_store(response)
+    return await cards.read_detail(item)
 
 
 @router.patch("/{item_id}/content", response_model=VaultItemDetail)
@@ -272,6 +276,7 @@ async def update_item_content(
     body: UpdateContentRequest,
     user: CurrentUser,
     service: VaultServiceDep,
+    response: Response,
 ) -> VaultItemDetail:
     """Replace this item's body with what the user wrote in the editor.
 
@@ -290,7 +295,8 @@ async def update_item_content(
         raise HTTPException(status.HTTP_422_UNPROCESSABLE_CONTENT, str(exc)) from None
     if item is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
-    return VaultItemDetail.model_validate(item)
+    cards.no_store(response)
+    return await cards.read_detail(item)
 
 
 @router.post("/{item_id}/reprocess", response_model=VaultItemRead)
@@ -298,6 +304,7 @@ async def reprocess_item(
     item_id: uuid.UUID,
     user: CurrentUser,
     service: VaultServiceDep,
+    response: Response,
     body: ReprocessRequest | None = None,
 ) -> VaultItemRead:
     """Put a failed or skipped item back on the queue.
@@ -332,7 +339,8 @@ async def reprocess_item(
             else status.HTTP_409_CONFLICT
         )
         raise HTTPException(code, str(exc)) from None
-    return VaultItemRead.model_validate(item)
+    cards.no_store(response)
+    return (await cards.read_cards([item]))[0]
 
 
 @router.get("/{item_id}/file", response_model=FileLinkResponse)

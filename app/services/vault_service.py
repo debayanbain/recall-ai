@@ -610,11 +610,15 @@ class VaultService:
         item = await self.repo.get(item_id, user_id)
         if item is None:
             return False
-        key = item.storage_key
+        # Both objects, for the same reason: the tombstone clears both columns, so a key
+        # not read here is a key nothing can ever find again.
+        keys = [k for k in (item.storage_key, item.thumbnail_key) if k]
         await self.repo.delete(item)
-        if key and self.storage is not None:
-            # After the row, and best-effort inside the provider: a bucket hiccup must not
-            # fail the user's delete. `B2Storage.delete` logs instead of raising, so the
-            # worst case is an orphaned object, not a vault item that refuses to go away.
-            await self.storage.delete(key)
+        if self.storage is not None:
+            for key in keys:
+                # After the row, and best-effort inside the provider: a bucket hiccup must
+                # not fail the user's delete. `B2Storage.delete` logs instead of raising,
+                # so the worst case is an orphaned object, not a vault item that refuses
+                # to go away.
+                await self.storage.delete(key)
         return True

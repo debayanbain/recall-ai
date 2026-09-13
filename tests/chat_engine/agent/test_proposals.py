@@ -318,3 +318,115 @@ async def test_a_delete_token_from_another_account_is_refused(
     assert token is not None
 
     assert await store.spend(token, _OTHER) is None
+
+
+# --- connect -----------------------------------------------------------------------------
+#
+# The only proposal whose surfaced-id check is doubled, and the reason is sharper than
+# symmetry: a connection is a route from one memory's text to another's in a *later*
+# prompt. It is the mechanism by which a scraped page ends up adjacent to a memory the
+# question was never about, so an id the model read inside a memory is exactly the id an
+# attacker would want on one end of it.
+
+
+def _connectable(store: Any, items: Sequence[VaultItem]) -> MemoryToolbox:
+    """A toolbox with somewhere to park a proposal *and* somewhere to read edges from.
+
+    `ProposeConnect` is bound on both, so a fake that supplies only the store would test
+    a tool the model is never offered.
+    """
+    box = _box(store, turn="connect those two", items=items)
+    box.connections = object()  # type: ignore[assignment]
+    return box
+
+
+async def test_a_connection_is_refused_when_only_one_end_was_surfaced(
+    _redis: FakeRedis,
+) -> None:
+    item = _item(ProcessingStatus.completed, title="Second brain")
+    box = _connectable(RedisProposalStore(), [item])
+
+    result = await box.propose_connect(box.allowed_ids[0], "deadbeef")
+
+    assert "not been shown both" in result
+    assert box.proposal is None
+    assert _redis.rows == {}
+
+
+async def test_a_connection_is_refused_when_neither_end_was_surfaced(
+    _redis: FakeRedis,
+) -> None:
+    box = _connectable(RedisProposalStore(), [])
+
+    result = await box.propose_connect("deadbeef", "cafebabe")
+
+    assert "not been shown both" in result
+    assert _redis.rows == {}
+
+
+async def test_a_memory_cannot_be_offered_a_connection_to_itself(
+    _redis: FakeRedis,
+) -> None:
+    item = _item(ProcessingStatus.completed, title="Lonely")
+    box = _connectable(RedisProposalStore(), [item])
+
+    result = await box.propose_connect(box.allowed_ids[0], box.allowed_ids[0])
+
+    assert "same memory" in result
+    assert box.proposal is None
+    assert _redis.rows == {}
+
+
+async def test_two_surfaced_memories_can_be_offered_for_connection(
+    _redis: FakeRedis,
+) -> None:
+    """The card names **both** memories. There is no text to check against the person's
+    own turn the way a note has, so what they read before tapping is which two."""
+    left = _item(ProcessingStatus.completed, title="Second brain")
+    right = _item(ProcessingStatus.completed, title="Smart notes")
+    box = _connectable(RedisProposalStore(), [left, right])
+
+    result = await box.propose_connect(
+        box.allowed_ids[0], box.allowed_ids[1], "expands"
+    )
+
+    assert "Offered" in result
+    assert box.proposal is not None
+    assert box.proposal.action == "connect"
+    assert "Second brain" in box.proposal.preview
+    assert "Smart notes" in box.proposal.preview
+    stored = await RedisProposalStore().spend(box.proposal.accept_token, _USER)
+    assert stored is not None
+    assert stored.action is Action.connect
+    assert stored.args["source_id"] == str(left.id)
+    assert stored.args["target_id"] == str(right.id)
+    assert stored.args["relation"] == "expands"
+
+
+async def test_a_hallucinated_relation_becomes_the_weakest_claim(
+    _redis: FakeRedis,
+) -> None:
+    """`related_to` is this vocabulary's catch-all and its weakest claim, which is the
+    fail-closed direction. A model talked into `contradicts` by a caption would still be
+    proposing a connection a person has to approve -- the label is the smaller half."""
+    left = _item(ProcessingStatus.completed, title="A")
+    right = _item(ProcessingStatus.completed, title="B")
+    box = _connectable(RedisProposalStore(), [left, right])
+
+    await box.propose_connect(box.allowed_ids[0], box.allowed_ids[1], "vaguely_about")
+
+    assert box.proposal is not None
+    stored = await RedisProposalStore().spend(box.proposal.accept_token, _USER)
+    assert stored is not None
+    assert stored.args["relation"] == "related_to"
+
+
+async def test_a_connection_cannot_be_offered_without_somewhere_to_park_it() -> None:
+    left = _item(ProcessingStatus.completed, title="A")
+    right = _item(ProcessingStatus.completed, title="B")
+    box = _connectable(None, [left, right])
+
+    result = await box.propose_connect(box.allowed_ids[0], box.allowed_ids[1])
+
+    assert "cannot offer" in result.lower()
+    assert box.proposal is None

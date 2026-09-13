@@ -12,6 +12,7 @@ from sqlmodel import col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
 from app.models.base import ContentType, ProcessingStatus
+from app.models.connection import MemoryConnection
 from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.vault import VaultChunk, VaultItem
 
@@ -68,6 +69,36 @@ class VaultRepository:
             return None
         return item
 
+    async def owned_items(
+        self, item_ids: Sequence[uuid.UUID] | set[uuid.UUID], user_id: uuid.UUID
+    ) -> dict[uuid.UUID, VaultItem]:
+        """The caller's own live rows among these ids, keyed by id. ONE statement.
+
+        For the callers that act on *several* memories at once -- connecting two of them,
+        adding a selection to a Space -- where the check has to be per item rather than
+        per request. A caller who owns one id and borrowed the other must not get through,
+        and a body carrying two ids is exactly where a stranger's is easiest to slip in.
+        `SpaceService._attach` makes the same check one item at a time; this is that rule
+        in one round trip.
+
+        Returns the rows rather than the ids because every caller needs both: the check
+        is `len(result) == len(asked)`, and the rows are what the response renders, so
+        answering with ids alone buys a second round trip to fetch what was just read.
+
+        Soft-deleted rows are excluded, so a tombstone is never a valid endpoint.
+        """
+        wanted = list(dict.fromkeys(item_ids))
+        if not wanted:
+            return {}
+        result = await self.session.exec(
+            select(VaultItem).where(
+                col(VaultItem.id).in_(wanted),
+                VaultItem.user_id == user_id,
+                col(VaultItem.deleted_at).is_(None),
+            )
+        )
+        return {item.id: item for item in result.all()}
+
     #: The columns a card needs, which is what `VaultItemRead` serializes. A listing that
     #: selects `*` also drags `content`, `item_metadata` and `ai_highlights` across the
     #: wire for every row -- an article body is kilobytes, a page is twenty of them, and
@@ -89,6 +120,10 @@ class VaultRepository:
         "file_name",
         "file_size",
         "mime_type",
+        # Not serialised -- it is what `services/thumbnails.presigned_urls` signs to
+        # produce the card's picture, and reading it off a `cards_only` row would
+        # otherwise hit `raiseload`.
+        "thumbnail_key",
     )
 
     async def _page(
@@ -209,12 +244,18 @@ class VaultRepository:
         created_after: datetime | None = None,
         content_types: Sequence[ContentType] | None = None,
         category: str | None = None,
+        exclude_item_id: uuid.UUID | None = None,
     ) -> list[tuple[VaultItem, float]]:
         """Nearest-neighbour search over the user's own chunks, closest first.
 
         The query vector MUST come from the same provider that wrote the stored ones:
         Gemini's 768 dims are zero-padded to 1536 and are not comparable with OpenAI's
         native 1536. Mixing them returns confident nonsense rather than an error.
+
+        `exclude_item_id` keeps one item off its own list, which is what connection
+        derivation needs: it searches with a vector drawn *from* a row, so that row is its
+        own nearest neighbour at distance zero and would otherwise take a candidate slot
+        every time.
 
         `user_id` is applied to both tables. `vault_chunks.user_id` is the one that keeps
         the index scan inside the caller's own rows; the predicate on `vault_items` is
@@ -246,6 +287,11 @@ class VaultRepository:
             query = query.where(col(VaultItem.type).in_(list(content_types)))
         if category:
             query = query.where(VaultItem.ai_category == category)
+        if exclude_item_id is not None:
+            # For connection derivation, whose query vector belongs to one of these rows.
+            # A memory is always its own nearest neighbour at distance zero, so without
+            # this the strongest candidate every time is the item itself.
+            query = query.where(col(VaultChunk.vault_item_id) != exclude_item_id)
 
         result = await self.session.exec(
             query.order_by(distance).limit(limit * _CHUNK_OVERSAMPLE)
@@ -391,6 +437,7 @@ class VaultRepository:
         # before calling this. Cleared here so nothing can mint a presigned URL to bytes
         # that are on their way out.
         item.storage_key = None
+        item.thumbnail_key = None
         item.file_name = None
         item.file_size = None
         item.mime_type = None
@@ -399,6 +446,35 @@ class VaultRepository:
         await self.session.execute(
             sa_delete(VaultChunk).where(col(VaultChunk.vault_item_id) == item.id)
         )
+        # The connections go too, and hard, for the same reason the chunks do: an edge is
+        # derived data asserting "this memory is about the same thing as that one", which
+        # is a statement about content somebody asked to be rid of. Leaving them would
+        # also leave a tombstone visibly related to a live memory on that memory's own
+        # page. Removing the rows frees the pair as well, so a deletion cannot
+        # permanently block a connection someone draws later between what remains.
+        await self.session.execute(
+            sa_delete(MemoryConnection).where(
+                or_(
+                    col(MemoryConnection.source_item_id) == item.id,
+                    col(MemoryConnection.target_item_id) == item.id,
+                )
+            )
+        )
+
+    async def get_chunk(self, item_id: uuid.UUID, chunk_index: int = 0) -> VaultChunk | None:
+        """One chunk of one item, by its position.
+
+        Unscoped, like `get_unscoped`, and for the same caller: the worker has no request
+        user. It is reachable only from the derivation task, which then scopes every read
+        it makes by the item's own `user_id`.
+        """
+        result = await self.session.exec(
+            select(VaultChunk).where(
+                col(VaultChunk.vault_item_id) == item_id,
+                VaultChunk.chunk_index == chunk_index,
+            )
+        )
+        return result.first()
 
     async def upsert_chunk(
         self,

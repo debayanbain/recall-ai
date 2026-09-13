@@ -39,6 +39,30 @@ def _item(title: str = "Redis persistence", **kwargs: Any) -> VaultItem:
                      title=title, **defaults)
 
 
+class FakeConnections:
+    """Just enough of `ConnectionRepository` for the `connections` projection.
+
+    That field is the only one that cannot be answered from the row -- it costs a second,
+    grouped statement -- which is exactly why the toolbox asks for it only when the model
+    requested it, and why a fake has to supply it here rather than the test skipping the
+    field. `test_every_declared_field_renders` is parametrized over every declared field
+    on purpose: a name the schema offers the model and cannot produce is a lie.
+    """
+
+    def __init__(self, counts: dict[uuid.UUID, int] | None = None) -> None:
+        self.counts = counts or {}
+        self.asked: list[Sequence[uuid.UUID]] = []
+
+    async def counts_for_items(
+        self, user_id: uuid.UUID, item_ids: Sequence[uuid.UUID]
+    ) -> dict[uuid.UUID, int]:
+        self.asked.append(list(item_ids))
+        return {item_id: self.counts.get(item_id, 0) for item_id in item_ids}
+
+    async def list_for_item(self, *_: Any, **__: Any) -> Any:
+        return [], 0
+
+
 class FakeRepo:
     def __init__(self, items: Sequence[VaultItem] = ()) -> None:
         self.items = list(items)
@@ -144,11 +168,33 @@ async def test_asking_for_nothing_returns_a_useful_default() -> None:
 @pytest.mark.parametrize("field", QUERY_FIELDS)
 async def test_every_declared_field_renders(field: str) -> None:
     """A name the schema offers the model must produce something, or it is a lie."""
-    box = MemoryToolbox(_USER, FakeRepo([_item()]))  # type: ignore[arg-type]
+    box = MemoryToolbox(
+        _USER,
+        FakeRepo([_item()]),  # type: ignore[arg-type]
+        connections=FakeConnections(),
+    )
 
     rendered = await box.query_memories(fields=[field])
 
     assert f"{field}:" in rendered
+
+
+async def test_the_connection_count_costs_a_statement_only_when_asked_for() -> None:
+    """It is the one projection field that is not on the row, so it is opt-in like
+    `excerpt`. A count cached on `vault_items` would be free to read and wrong the moment
+    anything was dismissed -- and the agent follows this number inside the same turn."""
+    reader = FakeConnections()
+    box = MemoryToolbox(
+        _USER,
+        FakeRepo([_item()]),  # type: ignore[arg-type]
+        connections=reader,
+    )
+
+    await box.query_memories(fields=["summary"])
+    assert reader.asked == []
+
+    await box.query_memories(fields=["connections"])
+    assert len(reader.asked) == 1
 
 
 # --- which rows ------------------------------------------------------------------------

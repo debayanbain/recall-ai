@@ -1246,6 +1246,182 @@
         }
       }
     },
+    "/api/v1/chat/proposals/{proposal_token}/accept": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Accept Proposal",
+        "description": "Do the thing the assistant offered to do. No model runs in this path.\n\nThe whole point of a proposal is that the write happens here rather than in a tool a\nmodel can call: tool results are scraped page text, and a write tool bound to a model\nreading them is one caption away from filing something the person never asked for.\n\nThe path parameter is `proposal_token` and not `token` on purpose. FastAPI resolves\npath-parameter names across the entire dependency tree, and `get_current_user` already\ntakes a `token` -- from a cookie, with a default, which a path parameter may not have.\nSame trap as `/spaces/invites/{invite_token}/accept`.",
+        "operationId": "accept_proposal_api_v1_chat_proposals__proposal_token__accept_post",
+        "parameters": [
+          {
+            "name": "proposal_token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Proposal Token"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat/proposals/{proposal_token}/decline": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Decline Proposal",
+        "description": "Burn the token without doing anything with it.\n\nSpending it on a decline is the point: it stops a card left open in a tab from being\ntappable later by anyone who reaches that tab.",
+        "operationId": "decline_proposal_api_v1_chat_proposals__proposal_token__decline_post",
+        "parameters": [
+          {
+            "name": "proposal_token",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "title": "Proposal Token"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ProposalResult"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/chat/ask": {
+      "post": {
+        "tags": [
+          "chat"
+        ],
+        "summary": "Ask",
+        "description": "Ask about your own memories.\n\nServer-sent events: `status` while it searches, `delta` as the answer is written,\n`items` for a listing, and `end`.\n\n`end` is always sent, including after a provider failure -- a stream that simply\nstops leaves the reader watching a cursor that will never move.",
+        "operationId": "ask_api_v1_chat_ask_post",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AskRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/spaces": {
       "get": {
         "tags": [
@@ -1787,6 +1963,66 @@
         }
       }
     },
+    "/api/v1/spaces/{space_id}/connections": {
+      "get": {
+        "tags": [
+          "spaces"
+        ],
+        "summary": "Space Connections",
+        "description": "The caller's own connections between memories in this Space.\n\n**Only their own.** A Space is where one person reads another's rows, and this does\nnot widen that: a connection is a judgement its author made about their own memories,\nso two members see the same Space with different graphs. Widening later is a decision\nsomebody can take deliberately; un-showing people each other's judgements is not.\n\nTwo statements: the membership gate, then the edges. Both ends must be in the Space\nand both must still exist, so nothing here can render a card from outside it.",
+        "operationId": "space_connections_api_v1_spaces__space_id__connections_get",
+        "parameters": [
+          {
+            "name": "space_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Space Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SpaceConnectionsResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/spaces/{space_id}/members": {
       "get": {
         "tags": [
@@ -1945,6 +2181,599 @@
               "type": "string",
               "format": "uuid",
               "title": "Member Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/suggestions": {
+      "get": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "List Suggestions",
+        "description": "Edges nobody has accepted yet, strongest first.\n\nPer user rather than per memory: an edge found from a new capture's side is a\nsuggestion on *both* of its memories, so offering it per memory offers one decision\ntwice. Declared above `/{connection_id}` -- a literal segment that could be read as a\nparameter has to be matched first.",
+        "operationId": "list_suggestions_api_v1_connections_suggestions_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SuggestionListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/hubs": {
+      "get": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "List Hubs",
+        "description": "The caller's most-connected memories, busiest first.\n\nWhat the page opens on when nobody named a memory. Reached from the nav, the only\nother option is a list to choose from -- and a list of the *newest* memories says\nnothing about which are worth opening, since the newest capture is usually the one\nwith the fewest edges.\n\nAn empty list is a real answer, not a 404: a vault with no connections yet has no hubs\nand the page falls back to offering recent memories.\n\nDeclared above `/{connection_id}` -- a literal segment that could be read as a\nparameter has to be matched first.",
+        "operationId": "list_hubs_api_v1_connections_hubs_get",
+        "parameters": [
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HubListResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/for-item/{item_id}": {
+      "get": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Neighbourhood",
+        "description": "One memory and everything connected to it, read from both ends.\n\nTwo statements: the ownership gate on the focus, then the neighbourhood and its total\ntogether. Inferring \"not yours\" from an empty edge list would save the first one and\nwould stop being an ownership check.\n\nDeclared above `/{connection_id}` for the literal-segment reason above.",
+        "operationId": "neighbourhood_api_v1_connections_for_item__item_id__get",
+        "parameters": [
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Item Id"
+            }
+          },
+          {
+            "name": "relation",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "$ref": "#/components/schemas/Relation"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Relation"
+            }
+          },
+          {
+            "name": "include_suggested",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "boolean",
+              "default": false,
+              "title": "Include Suggested"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer",
+                  "maximum": 100,
+                  "minimum": 1
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NeighbourhoodResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections": {
+      "post": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Create Connection",
+        "description": "Connect two of the caller's own memories.\n\n**200, not 201, and never 409.** The pair is unique regardless of order, so connecting\nB to A when A to B already exists re-labels the one edge rather than failing --\nre-adding is a normal outcome, not an error, and `created` says which happened. A 409\nwould make the obvious action look like a broken server.\n\nBoth ids are checked against the caller *per item*, not per request: a body carrying\ntwo ids is exactly where a stranger's is easiest to slip in.",
+        "operationId": "create_connection_api_v1_connections_post",
+        "parameters": [
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CreateConnectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreateConnectionResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/{connection_id}": {
+      "patch": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Update Connection",
+        "description": "Re-label an edge, or change its note. An empty note clears it.",
+        "operationId": "update_connection_api_v1_connections__connection_id__patch",
+        "parameters": [
+          {
+            "name": "connection_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Connection Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateConnectionRequest"
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "delete": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Delete Connection",
+        "operationId": "delete_connection_api_v1_connections__connection_id__delete",
+        "parameters": [
+          {
+            "name": "connection_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Connection Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/{connection_id}/confirm": {
+      "post": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Confirm Connection",
+        "description": "Accept a suggestion. Until this happens no lane that reads connections sees it.",
+        "operationId": "confirm_connection_api_v1_connections__connection_id__confirm_post",
+        "parameters": [
+          {
+            "name": "connection_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Connection Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/{connection_id}/retype": {
+      "post": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Retype Connection",
+        "description": "Ask a model how these two memories relate, and label the edge with its answer.\n\nThe only connection route that spends a model call, which is why it is the only one\nbehind a per-user hourly cap. 503 when typing is switched off, unconfigured, or the\ncaller has used up that cap -- one answer for three causes, because they are the same\nthing from outside and separating them would report which of an operator's settings is\noff.\n\nThe answer is written to `ai_reason`, never to `note`: one is rendered as\nmachine-written and the other as the owner's own words.",
+        "operationId": "retype_connection_api_v1_connections__connection_id__retype_post",
+        "parameters": [
+          {
+            "name": "connection_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Connection Id"
+            }
+          },
+          {
+            "name": "recall_session",
+            "in": "cookie",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Recall Session"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ConnectionRead"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Validation Error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/connections/{connection_id}/dismiss": {
+      "post": {
+        "tags": [
+          "connections"
+        ],
+        "summary": "Dismiss Connection",
+        "description": "Decline a suggestion, and never be offered that pair again.\n\nThe row is kept rather than deleted: it is what stops the derivation re-proposing the\npair. Connecting the two by hand later revives it.",
+        "operationId": "dismiss_connection_api_v1_connections__connection_id__dismiss_post",
+        "parameters": [
+          {
+            "name": "connection_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "format": "uuid",
+              "title": "Connection Id"
             }
           },
           {
@@ -2540,6 +3369,29 @@
         "title": "AddItemsResponse",
         "description": "`skipped` counts what was already there or was not the caller's to add.\n\nReported rather than raised: re-adding a memory is the normal outcome of \"add all\nsuggestions\", not an error, and the old behaviour -- a primary-key violation surfacing\nas a 500 -- made the obvious user action look like a broken server."
       },
+      "AskRequest": {
+        "properties": {
+          "question": {
+            "type": "string",
+            "maxLength": 2000,
+            "minLength": 1,
+            "title": "Question"
+          },
+          "conversation_id": {
+            "type": "string",
+            "maxLength": 64,
+            "minLength": 1,
+            "title": "Conversation Id",
+            "default": "web"
+          }
+        },
+        "type": "object",
+        "required": [
+          "question"
+        ],
+        "title": "AskRequest",
+        "description": "One question. Deliberately the only field.\n\nNo `user_id`, no memory ids, no filters, no model or prompt override: everything that\ndecides *which rows are read* comes from the session, and everything that decides how\nthey are read is server-side. A request body with nothing in it to tamper with is one\nthat cannot be tampered with."
+      },
       "Body_save_voice_note_api_v1_vault_voice_post": {
         "properties": {
           "audio": {
@@ -2612,6 +3464,104 @@
         ],
         "title": "Body_upload_document_api_v1_vault_upload_post"
       },
+      "ConnectionOrigin": {
+        "type": "string",
+        "enum": [
+          "user",
+          "ai"
+        ],
+        "title": "ConnectionOrigin",
+        "description": "Who drew the edge. Never an authorization input -- only a thing to render."
+      },
+      "ConnectionRead": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/Relation"
+          },
+          "direction": {
+            "type": "string",
+            "enum": [
+              "outgoing",
+              "incoming"
+            ],
+            "title": "Direction"
+          },
+          "origin": {
+            "$ref": "#/components/schemas/ConnectionOrigin"
+          },
+          "status": {
+            "$ref": "#/components/schemas/ConnectionStatus"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "ai_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Reason"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "memory": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "relation",
+          "direction",
+          "origin",
+          "status",
+          "created_at",
+          "memory"
+        ],
+        "title": "ConnectionRead",
+        "description": "One edge, as seen from the memory that was asked about."
+      },
+      "ConnectionStatus": {
+        "type": "string",
+        "enum": [
+          "suggested",
+          "confirmed",
+          "dismissed"
+        ],
+        "title": "ConnectionStatus",
+        "description": "Where an edge is in its life.\n\n`dismissed` lives here rather than in a table of its own, and that is load-bearing:\nthe unique constraint that stops a duplicate edge is the same one that has to stop a\nre-suggestion, so the derivation's `ON CONFLICT DO NOTHING` already refuses to\nre-propose a pair somebody declined. Two tables would mean two checks, and the second\nis the one that gets forgotten."
+      },
       "ContentType": {
         "type": "string",
         "enum": [
@@ -2628,6 +3578,61 @@
           "image"
         ],
         "title": "ContentType"
+      },
+      "CreateConnectionRequest": {
+        "properties": {
+          "source_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Source Id"
+          },
+          "target_id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Target Id"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/Relation",
+            "default": "related_to"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "required": [
+          "source_id",
+          "target_id"
+        ],
+        "title": "CreateConnectionRequest",
+        "description": "Connect two of the caller's own memories.\n\nBoth ids are in the body rather than one in the path so the self-edge check is a\nschema validator: it answers 422 before any statement runs. The database carries the\nsame rule as a CHECK constraint, which is defence in depth rather than the thing\nanyone sees."
+      },
+      "CreateConnectionResponse": {
+        "properties": {
+          "connection": {
+            "$ref": "#/components/schemas/ConnectionRead"
+          },
+          "created": {
+            "type": "boolean",
+            "title": "Created"
+          }
+        },
+        "type": "object",
+        "required": [
+          "connection",
+          "created"
+        ],
+        "title": "CreateConnectionResponse",
+        "description": "`created` is false when the pair already had an edge, in either order.\n\nThat is a 200 and not a 409: re-adding is a normal outcome, not an error. Somebody\nconnects A to B from A's page and, a week later, from B's -- the obvious action must\nnot look like a broken server."
       },
       "CreateInviteRequest": {
         "properties": {
@@ -2683,6 +3688,19 @@
           "visibility": {
             "$ref": "#/components/schemas/Visibility",
             "default": "private"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 48,
+                "pattern": "^[a-z][a-z0-9]*(-[a-z0-9]+)*$"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
           },
           "emoji": {
             "anyOf": [
@@ -2788,6 +3806,38 @@
         },
         "type": "object",
         "title": "HTTPValidationError"
+      },
+      "HubListResponse": {
+        "properties": {
+          "hubs": {
+            "items": {
+              "$ref": "#/components/schemas/HubRead"
+            },
+            "type": "array",
+            "title": "Hubs"
+          }
+        },
+        "type": "object",
+        "title": "HubListResponse",
+        "description": "The busiest memories, busiest first.\n\nWhat `/connections` opens on when no memory is named. An empty list is a real answer\n-- a vault with no edges yet -- and the page falls back to offering recent memories\nrather than inventing a focus."
+      },
+      "HubRead": {
+        "properties": {
+          "memory": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          },
+          "connection_count": {
+            "type": "integer",
+            "title": "Connection Count"
+          }
+        },
+        "type": "object",
+        "required": [
+          "memory",
+          "connection_count"
+        ],
+        "title": "HubRead",
+        "description": "One memory and how many things connect to it."
       },
       "InstagramAccountRead": {
         "properties": {
@@ -2920,6 +3970,31 @@
         "title": "InviteResponse",
         "description": "The raw token exists only in this response and in the link the user copies.\n\nTreat it as a credential: anyone holding it can join the Space until it is spent or\nexpires. It is never stored -- only its SHA-256 is."
       },
+      "NeighbourhoodResponse": {
+        "properties": {
+          "focus": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          },
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/ConnectionRead"
+            },
+            "type": "array",
+            "title": "Connections"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "required": [
+          "focus"
+        ],
+        "title": "NeighbourhoodResponse",
+        "description": "Everything connected to one memory."
+      },
       "OAuthProviderInfo": {
         "properties": {
           "id": {
@@ -2963,6 +4038,35 @@
         ],
         "title": "ProcessingStatus"
       },
+      "ProposalResult": {
+        "properties": {
+          "status": {
+            "type": "string",
+            "title": "Status"
+          },
+          "message": {
+            "type": "string",
+            "title": "Message"
+          },
+          "item": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/VaultItemRead"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "type": "object",
+        "required": [
+          "status",
+          "message"
+        ],
+        "title": "ProposalResult",
+        "description": "What a tapped confirmation did. Deliberately thin.\n\nIt reports an outcome and, when one was created, the card for it -- the same\n`VaultItemRead` every other listing returns, so nothing reaches the browser here that\na listing would not already show."
+      },
       "ProvidersResponse": {
         "properties": {
           "providers": {
@@ -2995,6 +4099,17 @@
               }
             ],
             "title": "Description"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
           },
           "emoji": {
             "anyOf": [
@@ -3041,6 +4156,7 @@
         "required": [
           "name",
           "description",
+          "icon",
           "emoji",
           "accent",
           "ai_overview",
@@ -3073,6 +4189,21 @@
         ],
         "title": "RefreshResponse",
         "description": "Answer to POST /auth/refresh. The tokens themselves travel as HttpOnly cookies and\ndeliberately never appear in a body -- a body is readable by script, a cookie is not.\n\n`expires_in` lets the SPA schedule a refresh slightly before the access token dies\ninstead of discovering it through a failed request."
+      },
+      "Relation": {
+        "type": "string",
+        "enum": [
+          "related_to",
+          "expands",
+          "supports",
+          "contradicts",
+          "inspired_by",
+          "depends_on",
+          "example_of",
+          "part_of"
+        ],
+        "title": "Relation",
+        "description": "How one memory relates to another.\n\nStored as `Text` rather than as a PG enum, like `SpaceRole` and\n`extraction_runs.status`: adding `refutes` one day must not need an `ALTER TYPE`\ninside a migration. The column is not the check -- values are re-validated on the way\nin, and an unrecognised one is read as `related_to`.\n\n`related_to` is the weakest claim in the list and doubles as this vocabulary's\n\"Other\". A derived edge is always this one: a cosine distance says two memories are\n*close*, which is the only thing it can say -- two documents that flatly contradict\neach other are maximally close. Anything stronger is a person's judgement, or a\nmodel's, and is labelled as whichever it was."
       },
       "ReprocessRequest": {
         "properties": {
@@ -3180,6 +4311,80 @@
         "title": "SessionRead",
         "description": "One live device in the user's own session list.\n\nCarries no credential: `id` is a row id whose only power is `DELETE /auth/sessions/\n{id}`, and that is ownership-checked."
       },
+      "SpaceConnectionRead": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/Relation"
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          },
+          "ai_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Reason"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "source": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          },
+          "target": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "relation",
+          "created_at",
+          "source",
+          "target"
+        ],
+        "title": "SpaceConnectionRead",
+        "description": "One edge between two memories in a Space, with both of its ends.\n\nBoth, unlike `ConnectionRead`: a Space panel has no focus memory for the other end to\nbe relative to, so neither end can be called \"the other one\"."
+      },
+      "SpaceConnectionsResponse": {
+        "properties": {
+          "connections": {
+            "items": {
+              "$ref": "#/components/schemas/SpaceConnectionRead"
+            },
+            "type": "array",
+            "title": "Connections"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "SpaceConnectionsResponse",
+        "description": "**Only the caller's own edges**, both of whose memories are in this Space.\n\nA Space is the one place somebody reads another person's rows, and this deliberately\ndoes not widen that. A connection is a judgement its author made -- \"A contradicts B\"\nis an opinion, not a fact about the Space -- so two members looking at the same Space\nsee different graphs. That is honest, and it is the reversible direction: widening\nlater is easy, un-showing people each other's judgements is not."
+      },
       "SpaceDetail": {
         "properties": {
           "id": {
@@ -3208,6 +4413,17 @@
           },
           "visibility": {
             "$ref": "#/components/schemas/Visibility"
+          },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
           },
           "emoji": {
             "anyOf": [
@@ -3302,6 +4518,7 @@
           "slug",
           "description",
           "visibility",
+          "icon",
           "emoji",
           "accent",
           "pinned",
@@ -3385,6 +4602,17 @@
           "visibility": {
             "$ref": "#/components/schemas/Visibility"
           },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
           "emoji": {
             "anyOf": [
               {
@@ -3464,6 +4692,7 @@
           "slug",
           "description",
           "visibility",
+          "icon",
           "emoji",
           "accent",
           "pinned",
@@ -3485,6 +4714,79 @@
         ],
         "title": "SpaceRole",
         "description": "What a person may do inside a Space they did not create.\n\nOrdered least-to-most on purpose so `_RANK` in the service is a comparison rather than\na table of cases. `owner` is never stored in `space_members` -- it is `spaces.user_id`\n-- but it appears here because the API reports a caller's effective role and the\nowner's answer has to be sayable."
+      },
+      "SuggestionListResponse": {
+        "properties": {
+          "suggestions": {
+            "items": {
+              "$ref": "#/components/schemas/SuggestionRead"
+            },
+            "type": "array",
+            "title": "Suggestions"
+          },
+          "total": {
+            "type": "integer",
+            "title": "Total",
+            "default": 0
+          }
+        },
+        "type": "object",
+        "title": "SuggestionListResponse"
+      },
+      "SuggestionRead": {
+        "properties": {
+          "id": {
+            "type": "string",
+            "format": "uuid",
+            "title": "Id"
+          },
+          "relation": {
+            "$ref": "#/components/schemas/Relation"
+          },
+          "score": {
+            "anyOf": [
+              {
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Score"
+          },
+          "ai_reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Ai Reason"
+          },
+          "created_at": {
+            "type": "string",
+            "format": "date-time",
+            "title": "Created At"
+          },
+          "source": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          },
+          "target": {
+            "$ref": "#/components/schemas/VaultItemRead"
+          }
+        },
+        "type": "object",
+        "required": [
+          "id",
+          "relation",
+          "created_at",
+          "source",
+          "target"
+        ],
+        "title": "SuggestionRead",
+        "description": "An edge nobody has accepted yet, with both of its memories.\n\nBoth ends, unlike `ConnectionRead`: a suggestion is read from an inbox rather than\nfrom one memory's page, so there is no \"the memory you asked about\" to be the other\nend of."
       },
       "TelegramAccountRead": {
         "properties": {
@@ -3591,6 +4893,35 @@
         "title": "TelegramLinkResponse",
         "description": "A freshly minted, single-use deep link. Shown once and never stored client-side."
       },
+      "UpdateConnectionRequest": {
+        "properties": {
+          "relation": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/Relation"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "note": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 500
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Note"
+          }
+        },
+        "type": "object",
+        "title": "UpdateConnectionRequest",
+        "description": "Re-label or re-caption an edge.\n\n`None` means \"leave it alone\"; the empty string is how a note is cleared. A nullable\nfield with two meanings for null is a field nobody can use correctly -- the same rule\n`UpdateSpaceRequest` follows for `icon` and `accent`."
+      },
       "UpdateContentRequest": {
         "properties": {
           "blocks": {
@@ -3647,6 +4978,18 @@
               }
             ]
           },
+          "icon": {
+            "anyOf": [
+              {
+                "type": "string",
+                "maxLength": 48
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Icon"
+          },
           "emoji": {
             "anyOf": [
               {
@@ -3685,7 +5028,7 @@
         },
         "type": "object",
         "title": "UpdateSpaceRequest",
-        "description": "Every field optional, and every field one a caller is allowed to set.\n\n`None` means \"leave it alone\" rather than \"clear it\", except for `emoji` and `accent`\nwhere the empty string is the way to clear -- a nullable field with two meanings for\nnull is a field nobody can use correctly."
+        "description": "Every field optional, and every field one a caller is allowed to set.\n\n`None` means \"leave it alone\" rather than \"clear it\", except for `icon`, `emoji` and\n`accent` where the empty string is the way to clear -- a nullable field with two\nmeanings for null is a field nobody can use correctly. That is also why `icon` carries\nno pattern here: `\"\"` has to be accepted, and a pattern that allows the empty string\nallows it everywhere. `_validate_icon` does the check instead."
       },
       "UserRead": {
         "properties": {

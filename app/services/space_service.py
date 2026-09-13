@@ -28,6 +28,7 @@ import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from typing import Any
 
 from slugify import slugify
 
@@ -38,6 +39,7 @@ from app.models.base import SpaceRole, Visibility
 from app.models.space import Space, SpaceInvite
 from app.models.user import User
 from app.models.vault import VaultItem
+from app.repositories.connection import ConnectionRepository
 from app.repositories.space import SpaceRepository
 from app.repositories.vault import VaultRepository
 
@@ -89,9 +91,18 @@ class IssuedInvite:
 
 
 class SpaceService:
-    def __init__(self, repo: SpaceRepository, vault_repo: VaultRepository) -> None:
+    def __init__(
+        self,
+        repo: SpaceRepository,
+        vault_repo: VaultRepository,
+        connection_repo: ConnectionRepository | None = None,
+    ) -> None:
         self.repo = repo
         self.vault_repo = vault_repo
+        #: Reads the edges between memories in a Space. Optional so every existing caller
+        #: and fake keeps working; a `None` here means the panel answers empty rather than
+        #: raising, which is the same thing it answered before the feature existed.
+        self.connection_repo = connection_repo
 
     # ---- reading ------------------------------------------------------------
 
@@ -149,6 +160,27 @@ class SpaceService:
             items,
             owner,
             members,
+        )
+
+    async def connections(
+        self, space_id: uuid.UUID, user_id: uuid.UUID, *, limit: int | None = None
+    ) -> tuple[list[tuple[Any, VaultItem, VaultItem]], int]:
+        """The caller's own connections between memories in this Space. Two statements.
+
+        The membership gate first, because everything else is about rows inside a Space
+        the caller has to be entitled to open at all -- inferring "not a member" from an
+        empty edge list would save a statement and stop being an access check.
+
+        **Only the caller's own edges.** See `ConnectionRepository.list_in_space`: a
+        connection is a judgement its author made, not a fact about the Space, and this is
+        the one place in the product where widening that would be invisible to the person
+        whose judgement it is.
+        """
+        await self._viewable(space_id, user_id)
+        if self.connection_repo is None:
+            return [], 0
+        return await self.connection_repo.list_in_space(
+            user_id, space_id, limit=_connection_limit(limit)
         )
 
     async def get_public(self, slug: str) -> tuple[Space, Sequence[VaultItem]] | None:
@@ -416,6 +448,13 @@ class SpaceService:
         while await self.repo.slug_exists(slug):
             slug = f"{base}-{secrets.token_hex(3)}"
         return slug
+
+
+def _connection_limit(value: int | None) -> int:
+    """How many edges one Space panel returns. Same ceiling a neighbourhood uses."""
+    if not value or value < 1:
+        return 24
+    return min(int(value), 100)
 
 
 def _require(role: SpaceRole, needed: SpaceRole) -> None:

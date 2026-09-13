@@ -28,6 +28,7 @@ from app.core.middleware import (
 )
 from app.db.session import warm_pool
 from app.queue.client import close_pool
+from app.services.connection_service import ConnectionNotFound, TypingUnavailable
 from app.services.space_service import SpaceForbidden, SpaceNotFound
 from app.services.telegram.webhook import can_register, ensure_registered_quietly
 
@@ -136,7 +137,7 @@ def create_app() -> FastAPI:
 
 
 def _register_domain_errors(app: FastAPI) -> None:
-    """Turn the Space domain's two refusals into HTTP, in one place.
+    """Turn the domains' refusals into HTTP, in one place.
 
     Without this every route repeats the same try/except, and the route that forgets it
     answers a 500 with a traceback -- which is both an unhelpful reply and a disclosure.
@@ -158,6 +159,25 @@ def _register_domain_errors(app: FastAPI) -> None:
     @app.exception_handler(SpaceForbidden)
     async def _space_forbidden(_: Request, exc: SpaceForbidden) -> JSONResponse:
         return JSONResponse(status_code=403, content={"detail": str(exc) or "Not allowed"})
+
+    # Connections have exactly one owner, so there is no 403 here and there must not be:
+    # "no such edge", "not yours" and "no such memory" are one answer, because any other
+    # arrangement confirms an id exists to somebody who may not see it. Spaces need both
+    # codes only because a member can be shown a Space and still be refused inside it.
+    @app.exception_handler(ConnectionNotFound)
+    async def _connection_not_found(_: Request, __: ConnectionNotFound) -> JSONResponse:
+        return JSONResponse(status_code=404, content={"detail": "Connection not found"})
+
+    # 503 rather than 403 or 429: switched off, unconfigured and rate-limited are one
+    # answer from outside -- "ask again later, or not at all" -- and telling them apart
+    # would report which of an operator's settings is off. The message is the service's
+    # own wording, which is written here and never built from user input.
+    @app.exception_handler(TypingUnavailable)
+    async def _typing_unavailable(_: Request, exc: TypingUnavailable) -> JSONResponse:
+        return JSONResponse(
+            status_code=503,
+            content={"detail": str(exc) or "Relation labelling is not available."},
+        )
 
 
 app = create_app()

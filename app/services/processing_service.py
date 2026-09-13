@@ -33,7 +33,7 @@ from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.vault import VaultItem
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
-from app.services import transcription, video, video_doc, vision
+from app.services import thumbnails, transcription, video, video_doc, vision
 from app.storage import ObjectStorage, StorageError
 
 #: Ceiling on a body assembled from more than one source (a caption plus a video
@@ -90,6 +90,10 @@ class ProcessingService:
 
                 extracted = await extractor.extract(item.source_url)  # type: ignore[union-attr]
                 self._apply(item, extracted)
+                # Before the `enrich` branch, so a source we deliberately do not pay to
+                # read still keeps its picture -- that card is *only* a picture and a
+                # title, which is exactly when losing the image costs the most.
+                await thumbnails.mirror(item, self.storage)
                 if extracted.enrich:
                     await self._read_video(item)
                 if not extracted.enrich:
@@ -149,6 +153,7 @@ class ProcessingService:
         try:
             extractor = get_extractor(item.source_url or "")
             self._apply(item, extractor.build(items))  # type: ignore[union-attr]
+            await thumbnails.mirror(item, self.storage)
             # Before `_enrich`, so the summary, tags, label and embedding are all drawn
             # from what the video actually said rather than from the caption alone.
             await self._read_video(item)

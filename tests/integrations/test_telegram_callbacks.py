@@ -324,6 +324,13 @@ def test_the_write_path_imports_no_model() -> None:
         elif isinstance(node, ast.ImportFrom) and node.module:
             imported.append(node.module)
 
+    # **Direct imports only, deliberately.** A transitive walk was tried and is wrong:
+    # `confirm.py` imports `VaultService`, which legitimately imports `app.ai.spans` for
+    # highlight checking, so a graph walk flags the whole service layer and proves
+    # nothing. The property that is true and worth keeping is narrower -- *this file*
+    # does not reach for the model stack -- which is why `_connect` takes a
+    # `ConnectionWriter` Protocol rather than importing `ConnectionService`, whose own
+    # imports include the relation-typing module.
     banned = ("app.ai", "langchain", "langgraph")
     offenders = [
         name for name in imported if any(name.startswith(bad) for bad in banned)
