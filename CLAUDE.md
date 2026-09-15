@@ -131,9 +131,12 @@ stubbed it does not fail — it *works*, slowly, over the network, and bills per
 suite still passes green. That happened twice while the tool lane and combined enrichment were
 being added. `tests/conftest.py`'s autouse `_no_provider_calls` closes every one of them: it
 patches `factory.get_chat_model` / `build_chat_model` / `fallback_models`, the copy
-`ai/chat/tools.py` imported by name, and both the switch and the client for combined
-enrichment. **A new outbound AI capability must be added there in the same commit.** A suite
-that suddenly takes 40s instead of 10s is the symptom.
+`ai/chat/tools.py` imported by name, both the switch and the client for combined
+enrichment, relation typing, and the **connection judge**. **A new outbound AI capability
+must be added there in the same commit.** A suite that suddenly takes 40s instead of 10s is
+the symptom. The judge is the fourth time that rule has been paid for, and the first that
+ships with its switch **on** -- a derivation test that did not know about it would reach a
+provider on any machine with a key, rather than merely failing to.
 
 `tests/conftest.py` needs a real PostgreSQL (pgvector `Vector`, JSONB, `PGUUID`, GIN/HNSW
 indexes rule out SQLite). It skips every DB test when none is reachable, so `pytest -q` stays
@@ -1068,12 +1071,38 @@ catch-all and must stay last, so new extractors get appended *before* it.
     owner, so "no such edge", "not yours" and "no such memory" are one answer; anything
     else confirms an id exists to somebody who may not see it. Spaces need both codes only
     because a member can be shown a Space and still be refused inside it.
-- **`/connections` with no memory named opens on the busiest memories, not the newest.**
-  `GET /connections/hubs` (`ConnectionRepository.most_connected`, one statement) exists
-  because the page is a top-level nav destination and is therefore reached with no
-  parameter every time somebody clicks it. Listing recent saves there points at exactly
-  the wrong rows: **the newest capture is usually the least connected**, since everything
-  it links to was found from its side and nothing has been saved since. Two rules with it:
+- **`/connections` with no memory named opens on the CANVAS, and the list is the panel
+  beside it.** `GET /connections/graph` (`ConnectionRepository.graph`, one statement)
+  answers with every edge plus each memory an edge touches **once** -- nodes derived from
+  edges server-side, so the two cannot disagree about what is on screen, and a hub's card
+  is not sent six times to be presigned six times. The frontend
+  (`app/connections/vault-canvas.tsx`, React Flow + `lib/graph-layout.ts`) draws it, and
+  the reason it replaced a list is that a column of suggestions to approve one at a time
+  is a chore rather than a place: it shows what the system decided, with no way to see what
+  else a memory sits near and no way to connect two things without first opening one. On
+  the canvas **both ways an edge comes into existence are the same gesture in the same
+  place** -- a model proposes one and it appears as a ghost you accept where it is drawn,
+  or you drag one card onto another and it is yours immediately. Five rules:
+  * **A suggestion is drawn as a ghost, never as a fact** -- dashed, faint, labelled with
+    the model's own sentence. Rendering a proposal identically to an accepted edge is the
+    one way the canvas can lie about what its owner has agreed to.
+  * **Dismissed edges are never drawn.** The row is kept so the derivation cannot
+    re-propose the pair; putting somebody's own "no" back on the canvas makes a decision
+    they already took look undone. `include_dismissed` exists for debugging and is off.
+  * **The layout is solved once and then owned by the person.** `forceLayout` runs
+    d3-force synchronously to completion and stops -- a graph still settling under a cursor
+    is a graph that moves out from under a click. It is keyed on the *topology*, so the
+    30s poll moves nothing and confirming a suggestion recolours an edge rather than
+    rearranging the vault.
+  * **Every canvas action is also in the list.** Drag-to-connect has no keyboard
+    equivalent worth pretending about, so the review panel is the accessible path -- the
+    same actions rendered for a different input, not a fallback view.
+  * **A vault with no edges still gets the old picker.** A canvas of nothing is a worse
+    empty state than a list of memories somebody could connect.
+  `GET /connections/hubs` (`ConnectionRepository.most_connected`, one statement) is what
+  that picker lists, and it stays ordered by how connected each memory is rather than by
+  date: **the newest capture is usually the least connected**, since everything it links
+  to was found from its side and nothing has been saved since. Two rules with it:
   * **Undecided edges come first.** A backfill lands a whole vault's worth of suggestions
     at once, and until `SuggestionInbox` rendered there was no page that listed them --
     they were reachable only by opening a memory that happened to have one. A decision
@@ -1099,16 +1128,64 @@ catch-all and must stay last, so new extractors get appended *before* it.
   people each other's judgements after the fact is not. The membership gate runs **first**
   -- inferring "not a member" from an empty edge list would save a statement and stop
   being an access check.
+- **Derivation is RECALL then JUDGEMENT, and the judge's main job is saying no.** The
+  first version was arithmetic end to end -- nearest few vectors, one floor, everything
+  written as `related_to` -- and it worked exactly as designed while filling the review
+  inbox with four copies of the same reel and no reason attached. A cosine distance cannot
+  tell "these are the same video" from "these are both in Bengali" from "these are two
+  halves of one subject". Three stages replace that number:
+  1. **Recall over-offers.** The vector half runs at `CONNECTION_RECALL_FLOOR`, well
+     *below* the decision floor, and a second half searches `ai_tags`
+     (`VaultRepository.search_by_tags`): two notes about one job application share `jobs`
+     and `visa` and can still sit far apart in embedding space, because a summary about a
+     form and a summary about an interview genuinely are different text. That tag query is
+     an **OR of `@>` containments**, not `?|` -- the GIN index is `jsonb_path_ops`, which
+     serves containment and nothing else, so the obvious operator is the one that silently
+     falls back to a sequential scan over the vault.
+  2. **Signals**, free and deterministic, computed in `connection_derivation.py`: shared
+     tags, shared `ai_category`, the similarity, and whether both rows canonicalise to the
+     same URL. They reach the prompt as *measured facts about two rows*, not as something
+     a model has to infer.
+  3. **Judgement** -- `app/ai/connection_judge.py`, ONE call with every candidate in it.
+     One call and not one per candidate: the subject card is the expensive half and is
+     identical for each pair, and it is the only way the model can see that three
+     candidates are the same video, which a pairwise judge cannot -- each pair looks
+     connected on its own.
+  `CONNECTION_JUDGE_ENABLED` ships **on**, unlike `CONNECTION_TYPING_ENABLED`, and the
+  difference is the direction of the failure: typing puts a confident label on an edge a
+  person already accepted, where a wrong one is filed somewhere nobody looks again; this
+  one rejects, and its failure mode is a suggestion that should not have been offered --
+  which is what the review inbox is for. Off, unconfigured, or failed, `_floor_only` is
+  what runs: `CONNECTION_MIN_SCORE` over the recall list, everything `related_to`, no
+  reason. That is the behaviour the feature shipped with and the path with the most tests
+  behind it -- the same ladder `RecallAgentService` climbs down to `RecallChatService`.
+  **A tag-only candidate is deliberately not proposed by the fallback**: with no judge
+  there is nothing to tell a shared subject from a shared vocabulary, and `jobs` belongs to
+  hundreds of items.
 - **A derived connection is a SUGGESTION, and that is a security control rather than a
-  courtesy.** `ConnectionDeriver` (`app/services/connection_derivation.py`) runs after a
-  capture finishes, reads the vector the pipeline just wrote, and proposes the nearest few
-  memories that clear `CONNECTION_MIN_SCORE` -- always `related_to`, always `suggested`,
-  never `confirmed`. Six things go with it:
+  courtesy.** Judged or not, nothing the derivation writes is ever `confirmed`. A judge
+  that is right nine times in ten still writes a wrong edge every tenth capture, and an
+  edge is a route from one page's text into another memory's prompt context. Confidence
+  (`CONNECTION_JUDGE_MIN_CONFIDENCE`) sorts the inbox and feeds a floor; it never replaces
+  the tap. Seven things go with it:
+  * **The key a judgement names is re-checked against the keys that were sent.**
+    Candidates are `c1..cN`, local to one prompt and deliberately *not* short ids -- a
+    short id there is an id the model learned somewhere no citation validator is watching.
+    A key that was never sent is discarded, which is the same claim `GetMemory`'s
+    surfaced-id check makes: the model may choose among what it was handed and may not
+    name anything else.
   * **The threshold has never been measured.** `CONNECTION_MIN_SCORE` defaults to 0.62 and
     that number came from nowhere. Run `scripts/measure_connection_floor.py` before
     trusting it, and re-run it whenever the embedding provider changes -- this is the
     `RECALL_MIN_SCORE` bug waiting to happen again, where Gemini's 0.55 was carried onto
-    an OpenAI vault whose true matches score 0.373.
+    an OpenAI vault whose true matches score 0.373. It now only decides the *fallback*,
+    which makes it less load-bearing and no less wrong.
+  * **Dismissals are shown back to the judge as taste** (`recent_declines`,
+    `CONNECTION_DECLINED_HINTS`). A hint in a prompt and nothing stronger -- no model is
+    trained and no threshold moves -- and what it buys is the difference between a system
+    that offers the same wrong kind of connection forever and one that stops after being
+    told twice. Fail-soft: a capture must not lose its connections because that read
+    failed.
   * **It is a separate Celery task, enqueued after the commit**, beside `_notify_surface`
     and fail-soft like it. Inline in `ProcessingService._enrich` the exception would travel
     up through `process`, which writes `processing_error`, bumps `retry_count` and
@@ -1129,14 +1206,26 @@ catch-all and must stay last, so new extractors get appended *before* it.
     never goes looking. `scripts/backfill_connections.py` is the one-off for a vault that
     predates the feature, deliberately a script rather than a beat task: a sweep that runs
     forever over a vault that only ever grows is a cost with no ceiling. **It spends no
-    money** -- every vector it compares was already written at capture time -- which makes
-    its dry run the one honest way to check `CONNECTION_MIN_SCORE` against a real vault
-    without buying fresh embeddings. It reports the pair count *deduplicated by unordered
+    money unless you pass `--judge`** -- every vector it compares was already written at
+    capture time -- which makes its dry run the one honest way to check
+    `CONNECTION_MIN_SCORE` against a real vault without buying fresh embeddings. The
+    judge is opt-in there precisely because over a whole vault it is one model call per
+    memory, and because an apply decided by a model would no longer be the report the dry
+    run just printed. It reports the pair count *deduplicated by unordered
     pair*, because A finds B and B finds A and the database keeps one row: counting
     sightings reports twice the suggestions that could actually land, and that number is
     the one somebody sets a threshold from.
   * **`CONNECTION_MAX_PER_ITEM` counts every state**, dismissed and suggested included. A
     wall of pending suggestions is exactly as much of a wall as a wall of confirmed ones.
+  * **`duplicate_of` is mechanical, not semantic.** It is a claim about two *rows* -- the
+    same video, article or link kept twice -- which is why the judge is handed a measured
+    "same source" signal rather than asked to infer one. `_canonical_url` drops the query
+    string (a share link arrives as `?igsh=` from one place and `?fbclid=` from another),
+    the fragment, `www.` and a trailing slash, and **refuses a non-http scheme** -- two
+    rows sharing `about:blank` are not one page. Short links are deliberately **not**
+    resolved: that is a network fetch, per candidate per capture, against a URL from a
+    scraped page, which is the SSRF surface `assert_safe_url` exists for. Like everything
+    else it is still only a suggestion.
 - **A connection is a new way to get attacker-controlled text into a prompt, and the
   confirmation step is what closes it.** The text of a page somebody saves already becomes
   `content`, `summary`, `title` and `ai_tags`; it now also becomes the embedding an edge is
@@ -1168,8 +1257,10 @@ catch-all and must stay last, so new extractors get appended *before* it.
   There is deliberately **no write tool**: connecting from chat would be a `propose_connect`
   minting a token through `chat_engine/proposals.py`, with the surfaced-id check on *both*
   ids, and it is not built.
-- **A model may propose which relation an edge is, and that is the last thing built and
-  off by default.** `app/ai/connections.py` + `CONNECTION_TYPING_ENABLED`, reached only
+- **A model may propose which relation an edge is *on demand*, and that is off by
+  default.** Not to be confused with the capture-time judge above, which also labels: this
+  one re-labels an edge that already exists, at a person's request, and is the only
+  connection route that spends a model call per *request* rather than per capture. `app/ai/connections.py` + `CONNECTION_TYPING_ENABLED`, reached only
   from `POST /connections/{id}/retype` -- on demand, on an edge that already exists, never
   during capture. The ordering is the point: a cosine distance can only claim two memories
   are close, which is why `related_to` is the honest default, while a *label* can be
@@ -1256,6 +1347,38 @@ catch-all and must stay last, so new extractors get appended *before* it.
   before it reads as a bug: browsing `http://localhost:3000` while `CORS_ORIGINS` points at
   a tunnel gets a **403 on every connection write** while reads and the whole vault keep
   working.
+- **Deleting is two steps now, and only the second one destroys anything.**
+  `DELETE /vault/{id}` writes `deleted_at` and stops (`VaultRepository.trash`). Because
+  every read in that file already filters the column, that single statement is the whole
+  removal as far as the product is concerned -- the memory leaves listings, search, chat
+  retrieval, connections, the sweepers and the worker at once -- while the row, its
+  chunks and its bucket objects all survive. `VaultRepository.purge` is the old delete
+  (scrub, chunks, edges, every version of every object) and runs either on request --
+  `DELETE /vault/{id}/permanent`, or `DELETE /vault/trash` for the lot -- or from the beat
+  task `purge_expired_trash`, `TRASH_RETENTION_DAYS` (15) later. Six things go with it:
+  * **`purged_at` is what separates the two**, and it is not optional: a purged row still
+    carries `deleted_at`, so without it the trash page would list empty shells and offer
+    a restore that returns a memory with no title, no body and no file. `0017` backfills
+    it onto every row deleted under the old behaviour, for exactly that reason.
+  * **The chunks survive the trash on purpose.** They carry the vector a restore has to
+    put back, and re-deriving them would mean re-embedding -- a restore that costs money
+    and can fail. They are already invisible: `search_semantic` joins the item and filters
+    `deleted_at`.
+  * **`purge` is reachable only for a row already in the trash.** "Delete forever" is a
+    second, deliberate action on something the person has already thrown away; a live item
+    answers 404 there, which is what stops the route being a one-call destroy.
+  * **The two permanent routes carry `assert_same_site`, unlike the rest of this router.**
+    The ordinary delete is recoverable now, so the Origin check went to the half that is
+    not. Same development consequence as Spaces: browsing `http://localhost:3000` while
+    `CORS_ORIGINS` points at a tunnel gets a 403 on those two and nothing else.
+  * **The batch is a ceiling, not a page.** Each purge deletes bucket objects one at a
+    time, so both the sweep and "empty trash" do `TRASH_PURGE_BATCH` rows per call rather
+    than holding one transaction open across hundreds of network round trips. The cutoff
+    only moves forward, so a backlog drains over ticks.
+  * **Nothing may still call a delete permanent.** The Telegram reply, the agent's
+    `ProposeDelete` schema, `AGENT_SYSTEM` and the toolbox's post-mint sentence all say
+    trash now: somebody told "gone for good" does not go looking for the restore that
+    exists, which is the more expensive half of getting this wrong.
 - **`item_metadata` maps to a DB column literally named `metadata`** (renamed because `metadata` is
   reserved on SQLModel classes). Raw SQL must use `metadata`; Python must use `item_metadata`.
 - **`EMBEDDING_DIM = 1536` is a padded lie under Gemini, exact under OpenAI.** `text-embedding-004`
@@ -1536,9 +1659,10 @@ app/services/telegram/confirm.py                      what a tapped button does
     from them. `search_semantic`'s join also hides them, which is now defence in depth
     rather than the only thing standing between a deleted memory and the index built to
     find it.
-  * **The object is deleted for real**, every version of it -- `VaultService.delete`
-    reads `storage_key` before the scrub clears it. See the bucket-versioning note above.
-  `tests/vault/test_soft_delete.py` pins each one.
+  * **The object is deleted for real**, every version of it -- the purge reads
+    `storage_key` before the scrub clears it. See the bucket-versioning note above.
+  All three now describe the **purge**, not the delete -- see the trash below.
+  `tests/vault/test_trash.py` pins each one.
 - ~~Rate limiting (`core/middleware.py`) is per-process in-memory.~~ **Fixed.** It counts
   in Redis through `core/rate_limit.consume`, the same function the per-user caps use, so
   there is one implementation of "count things in a window" and one set of fail-open

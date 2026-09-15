@@ -137,8 +137,9 @@ class ProposeRetry(BaseModel):
 class ProposeDelete(BaseModel):
     """Offer to delete a memory. This does NOT delete it: the person sees which memory
     and confirms with one tap. Only ever offer a memory they asked you to remove, and
-    only one whose id you have actually been shown. Deleting is permanent -- the text is
-    scrubbed and the file is removed -- so say that plainly when you offer it."""
+    only one whose id you have actually been shown. Deleting moves the memory to the
+    trash, where they can restore it for a while -- say that when you offer it rather
+    than calling it permanent."""
 
     memory_id: str = Field(
         description="The id of the memory to remove, as it was shown to you."

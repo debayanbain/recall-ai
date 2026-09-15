@@ -1,4 +1,4 @@
-"""Vault use-cases: save URL/note, list, get, search, delete.
+"""Vault use-cases: save URL/note, list, get, search, trash and purge.
 
 Saving NEVER blocks on AI — it stores the item, enqueues a job, returns fast.
 """
@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import uuid
 from collections.abc import Sequence
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from app.ai.spans import keep_verbatim
@@ -599,26 +599,110 @@ class VaultService:
         return item
 
     async def delete(self, item_id: uuid.UUID, user_id: uuid.UUID) -> bool:
-        """Remove a memory. The row becomes a scrubbed tombstone; the bytes go entirely.
+        """Move a memory to the trash. Nothing is destroyed here.
 
-        The key is read *before* the delete because the tombstone clears it -- nothing
-        should be able to mint a presigned URL to an object on its way out. The object is
-        then removed for real, every version of it: the bucket keeps all versions, so a
-        plain S3 DELETE writes a marker and leaves the bytes, which for a person who
-        asked for their document to be removed means it is still stored and still billed.
+        The row keeps everything it held and the bucket keeps its objects; only
+        `deleted_at` is written, and because every read in the repository filters that
+        column the memory leaves the vault, search, chat retrieval, connections and the
+        worker on the same statement. The real deletion happens
+        `TRASH_RETENTION_DAYS` later in `purge_expired`, or immediately if the owner
+        asks for it through `purge`.
+
+        Answers False for "no such item" and "not yours" alike -- the repository scopes
+        on `user_id`, so a guessed id from another account is indistinguishable from a
+        missing one, which is the point.
         """
         item = await self.repo.get(item_id, user_id)
         if item is None:
             return False
-        # Both objects, for the same reason: the tombstone clears both columns, so a key
-        # not read here is a key nothing can ever find again.
+        await self.repo.trash(item)
+        log.info("vault_item_trashed", item_id=str(item_id), user_id=str(user_id))
+        return True
+
+    async def list_trash(
+        self, user_id: uuid.UUID, limit: int, offset: int
+    ) -> tuple[Sequence[VaultItem], int]:
+        """This user's trashed memories, most recently deleted first."""
+        return await self.repo.list_trashed(user_id, limit, offset)
+
+    async def restore(self, item_id: uuid.UUID, user_id: uuid.UUID) -> VaultItem | None:
+        """Put a trashed memory back where it was.
+
+        Nothing is rebuilt because nothing was taken apart: the row, its chunks and its
+        connections all survived the trash stage, so the memory comes back searchable and
+        with its neighbourhood intact rather than as a stub that needs re-processing.
+
+        `None` for anything that is not a restorable item of this user's -- missing, not
+        theirs, never deleted, or already purged are one answer for the same reason
+        `get()` collapses them.
+        """
+        item = await self.repo.get_trashed(item_id, user_id)
+        if item is None:
+            return None
+        await self.repo.restore(item)
+        log.info("vault_item_restored", item_id=str(item_id), user_id=str(user_id))
+        return item
+
+    async def purge(self, item_id: uuid.UUID, user_id: uuid.UUID) -> bool:
+        """Delete one trashed memory for real, now, at the owner's request.
+
+        Only reachable for a row that is already in the trash: "delete forever" is a
+        second, deliberate action on something the person has already thrown away, not a
+        shortcut past the window from a live memory.
+        """
+        item = await self.repo.get_trashed(item_id, user_id)
+        if item is None:
+            return False
+        await self._purge(item)
+        log.info("vault_item_purged", item_id=str(item_id), user_id=str(user_id), reason="manual")
+        return True
+
+    async def empty_trash(self, user_id: uuid.UUID) -> int:
+        """Purge a batch of this user's trash and report how many went.
+
+        One batch per call rather than "everything": each purge deletes bucket objects
+        one at a time, so an unbounded loop would hold a request open across hundreds of
+        network round trips with no way for the caller to know it was still alive. A
+        caller that gets `TRASH_PURGE_BATCH` back can call again -- the page is already
+        refetching the listing at that point anyway.
+        """
+        rows = await self.repo.list_trash_rows(user_id, settings.TRASH_PURGE_BATCH)
+        for item in rows:
+            await self._purge(item)
+        if rows:
+            log.info("vault_trash_emptied", user_id=str(user_id), purged=len(rows))
+        return len(rows)
+
+    async def purge_expired(self, now: datetime | None = None) -> int:
+        """Beat task body: delete what has sat in the trash past the window.
+
+        Unscoped -- there is no request user behind a scheduled sweep -- and bounded to
+        `TRASH_PURGE_BATCH` rows per tick for the reason above. Whatever is left is taken
+        by the next tick; the cutoff only ever moves forward.
+        """
+        cutoff = (now or datetime.now(UTC)) - timedelta(days=settings.TRASH_RETENTION_DAYS)
+        rows = await self.repo.list_expired_trash(cutoff, settings.TRASH_PURGE_BATCH)
+        for item in rows:
+            await self._purge(item)
+        if rows:
+            log.info("vault_trash_purged", purged=len(rows), cutoff=cutoff.isoformat())
+        return len(rows)
+
+    async def _purge(self, item: VaultItem) -> None:
+        """The irreversible half: scrub the row, then remove the bytes.
+
+        The keys are read *before* the purge because the scrub clears them -- a key not
+        read here is a key nothing can ever find again, which would leave the object in
+        the bucket, still stored and still billed, for a person who asked to be rid of it.
+        Every version is removed, not just the latest: the bucket keeps all versions, so a
+        plain S3 DELETE writes a marker and leaves the bytes.
+        """
+        # Both objects, for the same reason: the scrub clears both columns.
         keys = [k for k in (item.storage_key, item.thumbnail_key) if k]
-        await self.repo.delete(item)
+        await self.repo.purge(item)
         if self.storage is not None:
             for key in keys:
                 # After the row, and best-effort inside the provider: a bucket hiccup must
-                # not fail the user's delete. `B2Storage.delete` logs instead of raising,
-                # so the worst case is an orphaned object, not a vault item that refuses
-                # to go away.
+                # not fail the purge. `B2Storage.delete` logs instead of raising, so the
+                # worst case is an orphaned object, not a row that refuses to go away.
                 await self.storage.delete(key)
-        return True

@@ -91,6 +91,15 @@ celery_app.conf.update(
             "task": "app.queue.tasks.purge_expired_telegram_tokens",
             "schedule": crontab(hour="4", minute="30"),
         },
+        # The trash is a delay before deletion, not a place things accumulate: this is
+        # what makes the second half true. Daily, because the window is measured in days
+        # -- a finer tick only adds queries against a database in another region. Bounded
+        # per run (TRASH_PURGE_BATCH), so a backlog drains over several ticks rather than
+        # holding one transaction open across hundreds of bucket deletes.
+        "purge-expired-trash": {
+            "task": "app.queue.tasks.purge_expired_trash",
+            "schedule": crontab(hour="4", minute="45"),
+        },
     },
 )
 

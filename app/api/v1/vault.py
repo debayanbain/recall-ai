@@ -4,11 +4,21 @@ from __future__ import annotations
 import uuid
 from typing import Annotated
 
-from fastapi import APIRouter, File, Form, HTTPException, Query, Response, UploadFile, status
+from fastapi import (
+    APIRouter,
+    Depends,
+    File,
+    Form,
+    HTTPException,
+    Query,
+    Response,
+    UploadFile,
+    status,
+)
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api import cards
-from app.api.deps import CurrentUser, SessionDep, VaultServiceDep
+from app.api.deps import CurrentUser, SessionDep, VaultServiceDep, assert_same_site
 from app.core.config import settings
 from app.models.vault import VaultItem
 from app.schemas.vault import (
@@ -16,6 +26,8 @@ from app.schemas.vault import (
     FileLinkResponse,
     ReprocessRequest,
     SaveUrlRequest,
+    TrashListResponse,
+    TrashPurgeResponse,
     UpdateContentRequest,
     VaultItemDetail,
     VaultItemRead,
@@ -35,6 +47,14 @@ from app.services.vault_service import ItemNotFound, ReprocessError, VaultServic
 from app.storage import StorageError
 
 router = APIRouter(prefix="/vault", tags=["vault"])
+
+#: The two routes that destroy something with no undo carry the Origin check, unlike
+#: the rest of this router. `DELETE /vault/{id}` is recoverable now -- it fills the
+#: trash -- so the irreversible half is what gets the extra gate. SameSite=lax already
+#: covers the default deployment; this is what still covers one that has to set
+#: SESSION_COOKIE_SAMESITE=none. In development it means browsing an origin that is
+#: not in CORS_ORIGINS answers 403 here while everything else keeps working.
+_PERMANENT = [Depends(assert_same_site)]
 
 
 async def _commit_then_enqueue(
@@ -259,6 +279,78 @@ async def list_vault(
     )
 
 
+@router.get("/trash", response_model=TrashListResponse)
+async def list_trash(
+    user: CurrentUser,
+    service: VaultServiceDep,
+    response: Response,
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+) -> TrashListResponse:
+    """Deleted memories that can still come back, most recently deleted first.
+
+    Declared above `/{item_id}` deliberately. The path parameter is typed `uuid.UUID`, so
+    "trash" would fail to parse rather than be served as an item -- but relying on that is
+    relying on a type annotation to do routing, and the next id-like path added here
+    would not have the same luck.
+    """
+    items, total = await service.list_trash(user.id, limit, offset)
+    cards.no_store(response)
+    return TrashListResponse(
+        items=await cards.read_trash_cards(items),
+        total=total,
+        limit=limit,
+        offset=offset,
+        retention_days=settings.TRASH_RETENTION_DAYS,
+    )
+
+
+@router.delete("/trash", response_model=TrashPurgeResponse, dependencies=_PERMANENT)
+async def empty_trash(user: CurrentUser, service: VaultServiceDep) -> TrashPurgeResponse:
+    """Destroy this user's trashed memories now, one batch at a time.
+
+    Answers with the number actually purged: each one deletes bucket objects one at a
+    time, so the batch bounds how long a single request can run. A caller that gets the
+    full batch back can call again.
+    """
+    return TrashPurgeResponse(purged=await service.empty_trash(user.id))
+
+
+@router.post("/{item_id}/restore", response_model=VaultItemDetail)
+async def restore_item(
+    item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep, response: Response
+) -> VaultItemDetail:
+    """Put a trashed memory back, with its chunks and connections intact.
+
+    404 covers every way this can fail -- no such item, not yours, never deleted, already
+    purged -- because a caller able to tell them apart is a caller able to enumerate ids
+    that are not theirs.
+    """
+    item = await service.restore(item_id, user.id)
+    if item is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+    cards.no_store(response)
+    return await cards.read_detail(item)
+
+
+@router.delete(
+    "/{item_id}/permanent",
+    status_code=status.HTTP_204_NO_CONTENT,
+    dependencies=_PERMANENT,
+)
+async def purge_item(
+    item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep
+) -> None:
+    """Delete one trashed memory for real, without waiting out the window.
+
+    Only reachable for an item already in the trash: this is a second, deliberate action
+    on something the person has already thrown away, not a shortcut past the window from
+    a live memory. A live item answers 404 here, same as one that is not theirs.
+    """
+    if not await service.purge(item_id, user.id):
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")
+
+
 @router.get("/{item_id}", response_model=VaultItemDetail)
 async def get_item(
     item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep, response: Response
@@ -375,6 +467,13 @@ async def get_item_file(
 async def delete_item(
     item_id: uuid.UUID, user: CurrentUser, service: VaultServiceDep
 ) -> None:
+    """Move a memory to the trash.
+
+    Nothing is destroyed: the row keeps its content and the bucket keeps its objects,
+    only `deleted_at` is written -- which is enough for the memory to leave every read
+    this API has. `purge_expired_trash` does the real deletion TRASH_RETENTION_DAYS
+    later, and `DELETE /vault/{id}/permanent` does it on request.
+    """
     deleted = await service.delete(item_id, user.id)
     if not deleted:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Item not found")

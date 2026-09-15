@@ -10,12 +10,20 @@ run twice.
     uv run python scripts/backfill_connections.py --apply         # write the suggestions
     uv run python scripts/backfill_connections.py --min-score 0.7 # try a different floor
 
-**It spends no money.** Every vector it compares was written by the pipeline at capture
-time; this reads them back and does arithmetic. That is worth stating because it makes the
-dry run the one honest way to check `CONNECTION_MIN_SCORE` against *your own vault*
-without paying for a fresh set of embeddings -- `scripts/measure_connection_floor.py`
-measures a handful of pairs you write by hand and does spend money; this measures every
-pair the feature would actually propose and does not.
+**The dry run spends no money, and `--apply` spends none by default.** Every vector it
+compares was written by the pipeline at capture time; this reads them back and does
+arithmetic. That is worth stating because it makes the dry run the one honest way to check
+`CONNECTION_MIN_SCORE` against *your own vault* without paying for a fresh set of
+embeddings -- `scripts/measure_connection_floor.py` measures a handful of pairs you write
+by hand and does spend money; this measures every pair the feature would actually propose
+and does not.
+
+**`--judge` is the exception and it is opt-in for that reason.** A live capture asks a
+model which of its recalled neighbours are really connected; over a whole vault that is
+one call per memory, which is a bill nobody agreed to by typing `--apply`. So the script
+forces the judge OFF unless asked, which also keeps `--apply` writing exactly what the
+dry run just reported -- a report produced by arithmetic and an apply decided by a model
+would be two different answers presented as one.
 
 So the intended order is: run this with no flags, read the distribution, decide whether
 `CONNECTION_MIN_SCORE` sits in the right place, change it if not, then run with `--apply`.
@@ -224,7 +232,26 @@ def main() -> int:
     parser.add_argument(
         "--show", type=int, default=15, help="how many example pairs to print"
     )
-    return asyncio.run(run(parser.parse_args()))
+    parser.add_argument(
+        "--judge",
+        action="store_true",
+        help=(
+            "let the model decide and label each edge, as a live capture does. "
+            "One model call per memory -- see the module docstring"
+        ),
+    )
+    args = parser.parse_args()
+    if not args.judge:
+        # Mutating the cached settings singleton, which is what `tests/conftest.py` does
+        # to the same flag and for the same reason: there is one switch, and a second way
+        # to express "off" would be a second thing to keep in step.
+        settings.CONNECTION_JUDGE_ENABLED = False
+    elif args.apply:
+        print(
+            "--judge: this will make one model call per memory. "
+            "Ctrl-C now if that was not the intention.\n"
+        )
+    return asyncio.run(run(args))
 
 
 if __name__ == "__main__":

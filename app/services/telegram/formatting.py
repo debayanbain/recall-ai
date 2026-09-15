@@ -301,12 +301,15 @@ def connected() -> str:
 
 
 def deleted() -> str:
-    """Said once the row is a tombstone and the file is gone from the bucket.
+    """Said once the memory is in the trash.
 
-    Plain about permanence, because it is: the text is scrubbed and every version of the
-    object is removed. Offering an undo we do not have would be the unkinder message.
+    The tap no longer destroys anything -- `VaultService.delete` writes `deleted_at` and
+    stops -- so promising permanence here would be a false claim in the safer direction's
+    favour: somebody told "gone for good" does not go looking for the restore that exists.
+    The sentence names where it went and that it can come back, without a day count,
+    because the window is a setting and this string is not rebuilt when it changes.
     """
-    return "🗑 Deleted. That one's gone for good."
+    return "🗑 Moved to Trash. You can restore it from Trash in the app."
 
 
 def still_working(item: VaultItem) -> str:

@@ -461,11 +461,15 @@ async def test_a_question_reply_carries_one_button_per_option() -> None:
 
 
 async def test_yes_on_a_delete_removes_the_memory() -> None:
-    """The write path for the one action that cannot be undone.
+    """The write path for a tapped delete, and what it now promises.
 
     Scoped by the service underneath: `VaultService.delete` re-checks ownership through
     `repo.get`, so a token cannot remove a row it did not name or one belonging to
     somebody else.
+
+    The reply names the trash rather than permanence, and that is the half worth pinning:
+    the tap stopped destroying anything when the trash was added, and somebody told "gone
+    for good" does not go looking for the restore that exists.
     """
     item_id = uuid.uuid4()
     store = FakeStore(Proposal(_USER, Action.delete, {"memory_id": str(item_id)}))
@@ -474,7 +478,7 @@ async def test_yes_on_a_delete_removes_the_memory() -> None:
     result = await _dispatcher(store, vault).handle(_callback("p:tok"))
 
     assert vault.deleted == [(item_id, _USER)]
-    assert result.reply is not None and "Deleted" in result.reply
+    assert result.reply is not None and "Trash" in result.reply
 
 
 async def test_a_delete_of_something_already_gone_reads_as_expired() -> None:

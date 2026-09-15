@@ -458,6 +458,42 @@ class Settings(BaseSettings):
     # model call. Keyed by user id like the other AI caps, not by IP: a cost belongs to
     # the account that incurred it.
     CONNECTION_TYPING_PER_HOUR: int = 30
+    # Whether a model decides which of the nearby memories are really connected, and
+    # how. ON by default, unlike CONNECTION_TYPING_ENABLED, and the difference is worth
+    # stating: typing puts a confident label on an edge a person already accepted, so a
+    # wrong one is filed where nobody goes back to check. This one *rejects* -- its job
+    # is to throw away the candidates a cosine distance could not tell apart, and its
+    # failure mode is a suggestion that should not have been offered, which is the exact
+    # thing the review inbox exists to catch. It also never writes `confirmed`: the tap
+    # is still what stands between a scraped page and the agent's prompt context.
+    #
+    # Gated on OPENAI_API_KEY alone, like enrichment, transcription and vision. With no
+    # key, or off, or on any failure, derivation degrades to the cosine-only behaviour
+    # this feature shipped with -- `related_to` suggestions above CONNECTION_MIN_SCORE.
+    CONNECTION_JUDGE_ENABLED: bool = True
+    # The floor the *recall* stage applies, deliberately well below CONNECTION_MIN_SCORE.
+    # Two filters doing different jobs, the same split `RECALL_MIN_SCORE` and
+    # `RECALL_SCORE_MARGIN` make: this one widens the net so the judge has something to
+    # reject, while CONNECTION_MIN_SCORE stays the *decision* floor used whenever there
+    # is no judge. Raising this does not make suggestions better -- it makes them fewer
+    # before anything has read them.
+    CONNECTION_RECALL_FLOOR: float = 0.30
+    # How many memories the tag/subject half of recall may contribute. This is the half
+    # that finds what a vector misses: two notes about one job application written months
+    # apart share `jobs` and `visa` and can still sit far apart in embedding space.
+    CONNECTION_TAG_CANDIDATES: int = 10
+    # How many candidates reach one judge call. Both halves of recall, deduped, capped
+    # here. Past a dozen the prompt stops being cheap and the answers stop being
+    # considered -- and a recall stage handing over thirty things has a floor problem.
+    CONNECTION_JUDGE_MAX_CANDIDATES: int = 8
+    # The judge's own confidence floor. A kept candidate below this is dropped rather
+    # than offered: every suggestion is a decision a person has to make, and one the
+    # model itself is unsure of is the worst kind to spend that on.
+    CONNECTION_JUDGE_MIN_CONFIDENCE: float = 0.55
+    # How many of the person's recent dismissals are shown to the judge as taste. Small
+    # on purpose: it is a hint in a prompt, not a training signal, and a long list of
+    # them crowds out the candidates it is supposed to help weigh.
+    CONNECTION_DECLINED_HINTS: int = 6
 
     # --- Spaces ---
     # An invite is a bearer link someone pastes into a chat. Long enough to be useful
@@ -613,6 +649,20 @@ class Settings(BaseSettings):
     # click and a script.
     REPROCESS_COOLDOWN_SECONDS: int = 30
 
+    # --- Trash ---
+    # How long a deleted memory stays recoverable. `DELETE /vault/{id}` moves the row to
+    # the trash (`deleted_at` set, nothing scrubbed, the object left in the bucket); the
+    # beat task `purge_expired_trash` runs the real deletion once the row has been there
+    # this long. Deleting is the one action in this product with no undo, and a mistaken
+    # tap is indistinguishable from a deliberate one at the moment it happens -- so the
+    # window exists to make the irreversible half explicit and delayed, not to keep a
+    # copy of anything. `DELETE /vault/{id}/permanent` skips the wait on purpose.
+    TRASH_RETENTION_DAYS: int = 15
+    # Rows purged per beat tick. The purge deletes bucket objects one at a time, so an
+    # unbounded sweep would hold one transaction open across hundreds of network calls.
+    # Whatever is left over is taken by the next tick.
+    TRASH_PURGE_BATCH: int = 200
+
     # --- Rate limiting ---
     RATE_LIMIT_PER_MINUTE: int = 60
 
@@ -739,6 +789,19 @@ def validate_deployment_config(config: Settings) -> None:
     if config.LOG_RETENTION_DAYS < 1:
         raise RuntimeError(
             f"LOG_RETENTION_DAYS must be >= 1 (got {config.LOG_RETENTION_DAYS})."
+        )
+
+    # Every environment, same reasoning: a zero or negative retention makes the purge
+    # task delete rows the user has just trashed, which is the exact thing the trash
+    # exists to prevent -- and it would look like "restore is broken" rather than like a
+    # setting. Refused at boot instead of clamped, so the operator is told which one.
+    if config.TRASH_RETENTION_DAYS < 1:
+        raise RuntimeError(
+            f"TRASH_RETENTION_DAYS must be >= 1 (got {config.TRASH_RETENTION_DAYS})."
+        )
+    if config.TRASH_PURGE_BATCH < 1:
+        raise RuntimeError(
+            f"TRASH_PURGE_BATCH must be >= 1 (got {config.TRASH_PURGE_BATCH})."
         )
 
     # Also every environment. This value is interpolated into the enrichment prompts, so

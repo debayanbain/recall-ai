@@ -174,6 +174,16 @@ def _no_provider_calls(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(settings, "CONNECTION_TYPING_ENABLED", False)
     monkeypatch.setattr("app.ai.connections._call_provider", _refuse)
 
+    # The connection *judge* -- which decides which recalled memories are really
+    # connected -- is a fourth way out. It differs from relation typing in one way that
+    # matters here: it ships ON, so a derivation test that did not know about it would
+    # reach a provider on a machine with a key rather than merely failing to. Off is what
+    # the existing tests assert against (the cosine floor writing `related_to`), and the
+    # stub is what catches a caller that reaches past the switch. Fourth time this rule
+    # has been paid for; a new outbound AI capability belongs here in the same commit.
+    monkeypatch.setattr(settings, "CONNECTION_JUDGE_ENABLED", False)
+    monkeypatch.setattr("app.ai.connection_judge._call_provider", _refuse)
+
 
 @pytest.fixture(autouse=True)
 def _no_shared_redis_state(monkeypatch: pytest.MonkeyPatch) -> None:

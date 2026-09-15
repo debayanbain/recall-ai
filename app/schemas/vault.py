@@ -2,11 +2,12 @@
 from __future__ import annotations
 
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any
 
-from pydantic import BaseModel, ConfigDict, Field, HttpUrl
+from pydantic import BaseModel, ConfigDict, Field, HttpUrl, computed_field
 
+from app.core.config import settings
 from app.models.base import ContentType, ProcessingStatus
 from app.services.editor_doc import MAX_BLOCKS
 
@@ -88,6 +89,42 @@ class VaultListResponse(BaseModel):
     total: int
     limit: int
     offset: int
+
+
+class TrashItemRead(VaultItemRead):
+    """A card in the trash, with the date that page is actually about.
+
+    `purge_after` is computed per response from `deleted_at` and the configured window
+    rather than stored. A stored date would be a second source of truth that goes stale
+    the moment the setting changes -- and the sweep reads the setting, so the row would
+    be promising a day the purge does not honour.
+    """
+
+    deleted_at: datetime
+
+    @computed_field  # type: ignore[prop-decorator]
+    @property
+    def purge_after(self) -> datetime:
+        return self.deleted_at + timedelta(days=settings.TRASH_RETENTION_DAYS)
+
+
+class TrashListResponse(BaseModel):
+    items: list[TrashItemRead]
+    total: int
+    limit: int
+    offset: int
+    #: So the page can say "deleted memories are removed after N days" without hardcoding
+    #: a number the server is free to change.
+    retention_days: int
+
+
+class TrashPurgeResponse(BaseModel):
+    """How many memories "empty trash" actually destroyed on this call.
+
+    One batch per request, so a caller that gets the batch size back has more to do.
+    """
+
+    purged: int
 
 
 class FileLinkResponse(BaseModel):

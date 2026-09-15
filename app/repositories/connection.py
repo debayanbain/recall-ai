@@ -40,7 +40,12 @@ from sqlalchemy.orm import aliased, load_only
 from sqlmodel import col, func, or_, select
 from sqlmodel.ext.asyncio.session import AsyncSession
 
-from app.models.base import ConnectionOrigin, ConnectionStatus, Relation
+from app.models.base import (
+    SYMMETRIC_RELATIONS,
+    ConnectionOrigin,
+    ConnectionStatus,
+    Relation,
+)
 from app.models.connection import MemoryConnection
 from app.models.space import SpaceItem
 from app.models.vault import VaultItem
@@ -49,6 +54,13 @@ from app.repositories.vault import VaultRepository
 #: What a neighbourhood returns when the caller names no ceiling. Matches what a page can
 #: show without the radial layout becoming a scribble.
 DEFAULT_NEIGHBOUR_LIMIT = 24
+
+#: How many edges one canvas is drawn from. A graph past a few hundred edges is a picture
+#: of a hairball rather than of a vault, and the layout cost is quadratic in the browser
+#: long before the query is the problem. The response carries the true total beside it, so
+#: a vault over the ceiling can be told it is seeing part of itself.
+DEFAULT_GRAPH_EDGES = 300
+MAX_GRAPH_EDGES = 1000
 
 #: Postgres' own answer to "did that INSERT ... ON CONFLICT insert, or update?". A freshly
 #: inserted tuple has no deleting-transaction id, so `xmax` is 0; one that replaced an
@@ -108,6 +120,30 @@ class Neighbour:
     connection: MemoryConnection
     item: VaultItem
     direction: str
+
+
+@dataclass(frozen=True, slots=True)
+class Proposal:
+    """One edge the derivation wants to offer, already judged.
+
+    A dataclass rather than the `(id, score)` tuple this used to be, because there are now
+    four things to carry and three of them are easy to transpose. `relation` and
+    `ai_reason` come from `ai/connection_judge.py` when it ran and are the defaults
+    otherwise -- `related_to` and no reason, which is exactly what a cosine distance
+    supports on its own.
+    """
+
+    target_id: uuid.UUID
+    #: `1 - cosine_distance`, or None for a candidate found by tags alone and never
+    #: scored. NULL is honest there: "not measured" and "not similar" are different
+    #: claims, and the UI renders the first as nothing rather than as a zero.
+    score: float | None = None
+    relation: Relation = Relation.related_to
+    #: The judge's one sentence, already flattened and capped by the module that wrote it.
+    ai_reason: str | None = None
+    #: True when the label only reads correctly from the candidate's side. Applied here by
+    #: swapping the two ids, which is free: the unique key is the unordered pair.
+    swap: bool = False
 
 
 class ConnectionRepository:
@@ -240,6 +276,131 @@ class ConnectionRepository:
             for row in rows
         ]
         return found, int(rows[0][3])
+
+    async def graph(
+        self,
+        user_id: uuid.UUID,
+        *,
+        statuses: Sequence[ConnectionStatus] | None = None,
+        limit: int = DEFAULT_GRAPH_EDGES,
+    ) -> tuple[list[tuple[MemoryConnection, VaultItem, VaultItem]], int]:
+        """Every edge in the caller's vault, with both of its memories. ONE statement.
+
+        What the canvas is drawn from. It answers with *edges* and not with nodes on
+        purpose: a node with no edge has no place on a connections graph, and deriving
+        the node set from the edges in the client means the two can never disagree about
+        which memories are on screen.
+
+        `limit` is a real ceiling and the response says so through the window total. A
+        graph is not a list -- nobody pages through one -- so a vault past the ceiling
+        gets its strongest edges and a count, rather than a second page nothing would
+        render. Confirmed edges sort first within that, because a suggestion cut off by
+        the ceiling is one the inbox still shows and a confirmed edge cut off is simply
+        missing from the picture.
+
+        Suggestions are included by default and are what the ghost edges on the canvas
+        are. `dismissed` is excluded unless asked for: the row is kept so the derivation
+        cannot re-propose the pair, and drawing somebody's own "no" back onto the canvas
+        would make the decision they already took look undone.
+        """
+        wanted = [
+            status.value
+            for status in (
+                statuses
+                or (ConnectionStatus.confirmed, ConnectionStatus.suggested)
+            )
+        ]
+        source = aliased(VaultItem)
+        target = aliased(VaultItem)
+        total_col = func.count().over().label("total")
+        query = (
+            select(MemoryConnection, source, target, total_col)
+            .join(source, col(source.id) == col(MemoryConnection.source_item_id))
+            .join(target, col(target.id) == col(MemoryConnection.target_item_id))
+            .where(
+                MemoryConnection.user_id == user_id,
+                col(MemoryConnection.status).in_(wanted),
+                # Deliberate duplication -- see `list_for_item`.
+                col(source.user_id) == user_id,
+                col(target.user_id) == user_id,
+                col(source.deleted_at).is_(None),
+                col(target.deleted_at).is_(None),
+            )
+            .order_by(
+                # Confirmed before suggested: `confirmed` sorts before `suggested`
+                # alphabetically, which is luck rather than design, so it is written out.
+                (col(MemoryConnection.status) == ConnectionStatus.confirmed.value)
+                .desc(),
+                col(MemoryConnection.score).desc().nullslast(),
+                col(MemoryConnection.created_at).desc(),
+            )
+            .limit(limit)
+            .options(
+                load_only(*_card_columns(source), raiseload=True),
+                load_only(*_card_columns(target), raiseload=True),
+            )
+        )
+        rows = (await self.session.execute(query)).all()
+        if not rows:
+            return [], 0
+        found = [
+            (
+                cast("MemoryConnection", row[0]),
+                cast("VaultItem", row[1]),
+                cast("VaultItem", row[2]),
+            )
+            for row in rows
+        ]
+        return found, int(rows[0][3])
+
+    async def recent_declines(
+        self, user_id: uuid.UUID, *, limit: int = 6
+    ) -> list[tuple[str, str]]:
+        """The subjects of connections this person recently said no to. ONE statement.
+
+        The taste signal the judge is shown. It is a *hint in a prompt* and nothing
+        stronger -- there is no model being trained here and no threshold being moved.
+        What it buys is the difference between a system that offers the same wrong kind of
+        connection forever and one that stops after being told twice.
+
+        Labels rather than ids, because the judge reads subjects and has no vault to look
+        an id up in -- and because a short id in that prompt is an id the model learned
+        somewhere no citation validator is watching. `ai_label` first, which exists to be
+        the line that tells two memories apart; the title only when a memory has no label
+        yet. A pair where neither end has either is dropped by the caller rather than
+        rendered as two blanks.
+
+        Ordered by when the dismissal happened, newest first: taste is recent, and an
+        opinion from four hundred captures ago is not the one to spend prompt budget on.
+        """
+        source = aliased(VaultItem)
+        target = aliased(VaultItem)
+        query = (
+            select(source, target)
+            .select_from(MemoryConnection)
+            .join(source, col(source.id) == col(MemoryConnection.source_item_id))
+            .join(target, col(target.id) == col(MemoryConnection.target_item_id))
+            .where(
+                MemoryConnection.user_id == user_id,
+                MemoryConnection.status == ConnectionStatus.dismissed.value,
+                # Deliberate duplication -- see `list_for_item`.
+                col(source.user_id) == user_id,
+                col(target.user_id) == user_id,
+                col(source.deleted_at).is_(None),
+                col(target.deleted_at).is_(None),
+            )
+            .order_by(col(MemoryConnection.dismissed_at).desc().nullslast())
+            .limit(limit)
+            .options(
+                load_only(*_card_columns(source), raiseload=True),
+                load_only(*_card_columns(target), raiseload=True),
+            )
+        )
+        rows = (await self.session.execute(query)).all()
+        return [
+            (_subject(cast("VaultItem", row[0])), _subject(cast("VaultItem", row[1])))
+            for row in rows
+        ]
 
     async def most_connected(
         self, user_id: uuid.UUID, *, limit: int = DEFAULT_NEIGHBOUR_LIMIT
@@ -476,7 +637,7 @@ class ConnectionRepository:
         self,
         user_id: uuid.UUID,
         source_item_id: uuid.UUID,
-        candidates: Sequence[tuple[uuid.UUID, float]],
+        candidates: Sequence[Proposal],
     ) -> int:
         """Propose edges from one new memory. Returns how many were actually new.
 
@@ -496,19 +657,23 @@ class ConnectionRepository:
         """
         if not candidates:
             return 0
-        rows = [
-            {
-                "user_id": user_id,
-                "source_item_id": source_item_id,
-                "target_item_id": target_id,
-                "relation": Relation.related_to.value,
-                "origin": ConnectionOrigin.ai.value,
-                "status": ConnectionStatus.suggested.value,
-                "score": score,
-            }
-            for target_id, score in candidates
-            if target_id != source_item_id
-        ]
+        rows: list[dict[str, Any]] = []
+        for proposal in candidates:
+            if proposal.target_id == source_item_id:
+                continue
+            source, target = _stored_ends(source_item_id, proposal)
+            rows.append(
+                {
+                    "user_id": user_id,
+                    "source_item_id": source,
+                    "target_item_id": target,
+                    "relation": proposal.relation.value,
+                    "origin": ConnectionOrigin.ai.value,
+                    "status": ConnectionStatus.suggested.value,
+                    "score": proposal.score,
+                    "ai_reason": proposal.ai_reason,
+                }
+            )
         if not rows:
             return 0
         result = await self.session.execute(
@@ -640,6 +805,46 @@ class ConnectionRepository:
             )
         )
         return int(cast("CursorResult[Any]", result).rowcount or 0)
+
+
+def _subject(item: VaultItem) -> str:
+    """The shortest honest name for a memory, for a prompt that has no vault to look in.
+
+    `ai_label` is the field that exists to tell two memories apart; the title is the
+    fallback, and an item that has neither is named by nothing rather than by "Untitled",
+    which would read to a model as a subject somebody keeps saving.
+    """
+    return " ".join(((item.ai_label or item.title) or "").split())
+
+
+def _stored_ends(
+    source_item_id: uuid.UUID, proposal: Proposal
+) -> tuple[uuid.UUID, uuid.UUID]:
+    """Which way round a proposed edge is written down.
+
+    Two rules, in order, and they are the same two `ConnectionService._orient` and
+    `_normalise` apply to a hand-made edge -- written here as well rather than called from
+    there because a repository must not reach up into a service, and because the
+    derivation is a second writer that would otherwise drift.
+
+    **A directional relation the judge read backwards is stored with its ends swapped**,
+    never with an inverted label. "The candidate is part of the new memory" arrives as
+    `part_of` + `b_to_a`; swapping is free, since the unique key is the unordered pair, and
+    it means every reader can take the stored direction at face value.
+
+    **A symmetric relation is pointed from the lower id.** `related_to`, `contradicts` and
+    `duplicate_of` read the same from both ends, so the stored direction carries no
+    meaning; left to chance half of them render backwards from one of their two pages and
+    somebody eventually "fixes" a row that was never wrong.
+    """
+    source, target = (
+        (proposal.target_id, source_item_id)
+        if proposal.swap
+        else (source_item_id, proposal.target_id)
+    )
+    if proposal.relation in SYMMETRIC_RELATIONS and source > target:
+        return target, source
+    return source, target
 
 
 def _card_columns(entity: Any) -> tuple[Any, ...]:

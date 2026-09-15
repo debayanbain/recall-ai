@@ -15,7 +15,7 @@ from collections.abc import Sequence
 from fastapi import Response
 
 from app.models.vault import VaultItem
-from app.schemas.vault import VaultItemDetail, VaultItemRead
+from app.schemas.vault import TrashItemRead, VaultItemDetail, VaultItemRead
 from app.services import thumbnails
 from app.storage import get_storage
 
@@ -57,3 +57,21 @@ async def read_detail(item: VaultItem) -> VaultItemDetail:
     if mirrored:
         detail.thumbnail_url = mirrored
     return detail
+
+
+async def read_trash_cards(items: Sequence[VaultItem]) -> list[TrashItemRead]:
+    """The same cards, plus when each one stops being recoverable.
+
+    `purge_after` rides along as a computed field on the schema, derived from the row's
+    own `deleted_at` and the live setting -- so the date a person reads is the date the
+    sweep will act on, not a copy written when the memory was deleted.
+    """
+    urls = await thumbnails.presigned_urls(items, get_storage())
+    cards: list[TrashItemRead] = []
+    for item in items:
+        card = TrashItemRead.model_validate(item)
+        mirrored = urls.get(item.id)
+        if mirrored:
+            card.thumbnail_url = mirrored
+        cards.append(card)
+    return cards

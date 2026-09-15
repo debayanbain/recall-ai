@@ -27,7 +27,8 @@ class _Repo:
     def __init__(self, existing: VaultItem | None = None) -> None:
         self.added: list[VaultItem] = []
         self.existing = existing
-        self.deleted: list[VaultItem] = []
+        self.trashed: list[VaultItem] = []
+        self.purged: list[VaultItem] = []
 
     async def add(self, item: VaultItem) -> VaultItem:
         self.added.append(item)
@@ -36,8 +37,20 @@ class _Repo:
     async def get(self, _item_id: uuid.UUID, _user_id: uuid.UUID) -> VaultItem | None:
         return self.existing
 
-    async def delete(self, item: VaultItem) -> None:
-        self.deleted.append(item)
+    async def get_trashed(
+        self, _item_id: uuid.UUID, _user_id: uuid.UUID
+    ) -> VaultItem | None:
+        return self.existing
+
+    async def trash(self, item: VaultItem) -> None:
+        self.trashed.append(item)
+
+    async def purge(self, item: VaultItem) -> None:
+        self.purged.append(item)
+        # The real repository scrubs the keys here, which is why the service has to read
+        # them first. Mirrored so a service that read them late would fail this test.
+        item.storage_key = None
+        item.thumbnail_key = None
 
 
 class _Storage:
@@ -299,19 +312,48 @@ async def test_no_link_for_an_item_without_a_file() -> None:
     assert result is None
 
 
-async def test_deleting_an_item_removes_its_object() -> None:
-    stored = VaultItem(
+def _stored_image() -> VaultItem:
+    return VaultItem(
         user_id=uuid.uuid4(),
         type=ContentType.image,
         storage_key="users/u/i/abc.png",
         file_name="holiday.png",
     )
+
+
+async def test_deleting_an_item_keeps_its_object() -> None:
+    """Delete fills the trash, and the trash has to be restorable.
+
+    A delete that removed the bytes would make the restore a lie: the row would come
+    back with a file name, a download button and nothing behind it. The object goes when
+    the purge does.
+    """
+    stored = _stored_image()
     storage = _Storage()
     repo = _Repo(existing=stored)
 
     assert await vs.VaultService(repo, storage).delete(stored.id, stored.user_id) is True
-    assert repo.deleted == [stored]
-    assert storage.deleted == ["users/u/i/abc.png"]
+    assert repo.trashed == [stored]
+    assert repo.purged == []
+    assert storage.deleted == []
+    assert stored.storage_key == "users/u/i/abc.png"
+
+
+async def test_purging_an_item_removes_its_object() -> None:
+    """The irreversible half, and the ordering that makes it work.
+
+    The keys are read before the scrub clears them -- a key read afterwards is a key
+    nothing can find again, which leaves the object in the bucket for somebody who asked
+    to be rid of it, still stored and still billed.
+    """
+    stored = _stored_image()
+    stored.thumbnail_key = "users/u/i/thumb.png"
+    storage = _Storage()
+    repo = _Repo(existing=stored)
+
+    assert await vs.VaultService(repo, storage).purge(stored.id, stored.user_id) is True
+    assert repo.purged == [stored]
+    assert storage.deleted == ["users/u/i/abc.png", "users/u/i/thumb.png"]
 
 
 # --- the download header --------------------------------------------------------------

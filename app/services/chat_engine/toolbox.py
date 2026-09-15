@@ -727,7 +727,8 @@ class MemoryToolbox:
         log.info("proposal_minted", action="delete")
         return (
             "Offered. The person will see which memory, with a Yes/No button. Name it, "
-            "say that deleting is permanent, and stop -- do not claim it is deleted."
+            "say it goes to the trash and can be restored, and stop -- do not claim it "
+            "is deleted."
         )
 
     async def propose_retry(self, memory_id: str) -> str:

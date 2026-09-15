@@ -30,7 +30,12 @@ from app.core.logging import get_logger
 from app.models.base import SYMMETRIC_RELATIONS, ConnectionStatus, Relation
 from app.models.connection import MemoryConnection
 from app.models.vault import VaultItem
-from app.repositories.connection import ConnectionRepository, Neighbour
+from app.repositories.connection import (
+    DEFAULT_GRAPH_EDGES,
+    MAX_GRAPH_EDGES,
+    ConnectionRepository,
+    Neighbour,
+)
 from app.repositories.vault import VaultRepository
 from app.services.chat_engine.cards import build_card
 
@@ -106,6 +111,23 @@ class ConnectionService:
         self, user_id: uuid.UUID, *, limit: int | None = None
     ) -> tuple[list[tuple[MemoryConnection, VaultItem, VaultItem]], int]:
         return await self.repo.list_suggestions(user_id, limit=_limit(limit))
+
+    async def graph(
+        self,
+        user_id: uuid.UUID,
+        *,
+        statuses: Sequence[ConnectionStatus] | None = None,
+        limit: int | None = None,
+    ) -> tuple[list[tuple[MemoryConnection, VaultItem, VaultItem]], int]:
+        """The whole vault as edges. One statement, no ownership gate needed.
+
+        Like `hubs` and unlike `neighbourhood`: the scan is already scoped to `user_id`
+        and there is no id the caller named to check first. This answers a question about
+        their own vault rather than about a row they pointed at.
+        """
+        return await self.repo.graph(
+            user_id, statuses=statuses, limit=_graph_limit(limit)
+        )
 
     # ---- writes --------------------------------------------------------------
 
@@ -328,6 +350,20 @@ def _clean_note(note: str | None) -> str | None:
         return None
     cleaned = note.strip()
     return cleaned or None
+
+
+def _graph_limit(value: int | None) -> int:
+    """The canvas's own ceiling, which is much larger than a neighbourhood's.
+
+    A separate function rather than an argument to `_limit`, because the two bound
+    different things: `_limit` bounds what a radial layout can draw around one memory and
+    how much of that page a single scraped page may occupy, while this bounds a whole
+    graph. Sharing one number would mean a canvas that shows twenty-four edges or a
+    memory page that shows three hundred.
+    """
+    if not value or value < 1:
+        return DEFAULT_GRAPH_EDGES
+    return min(int(value), MAX_GRAPH_EDGES)
 
 
 def _limit(value: int | None) -> int:

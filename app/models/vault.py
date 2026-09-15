@@ -31,6 +31,10 @@ class VaultItem(SQLModel, table=True):
         Index("ix_vault_items_user_created", "user_id", "created_at"),
         Index("ix_vault_items_user_status", "user_id", "processing_status"),
         Index("ix_vault_items_user_type", "user_id", "type"),
+        # The trash listing reads by owner and deletion time, which no other index
+        # covers: every one above is built for live rows, and those are exactly the
+        # rows this query excludes.
+        Index("ix_vault_items_user_deleted", "user_id", "deleted_at"),
         Index("ix_vault_items_ai_tags", "ai_tags", postgresql_using="gin",
               postgresql_ops={"ai_tags": "jsonb_path_ops"}),
     )
@@ -100,7 +104,17 @@ class VaultItem(SQLModel, table=True):
         default_factory=utcnow,
         sa_column=Column(DateTime(timezone=True), server_default=func.now(), onupdate=func.now()),
     )
+    #: Set when the memory is moved to the trash. Every read in the repository already
+    #: filters on it, so a trashed row is invisible to listings, search, chat retrieval,
+    #: connections and the worker -- but nothing about it is destroyed yet.
     deleted_at: Optional[datetime] = Field(
+        default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
+    )
+    #: Set when the trash window ran out (or the owner chose "delete forever") and the row
+    #: was scrubbed for real. This is what separates a *recoverable* row from a tombstone:
+    #: both carry `deleted_at`, and without this column the trash page would list empty
+    #: shells of memories that are already gone. Never cleared -- a purge has no undo.
+    purged_at: datetime | None = Field(
         default=None, sa_column=Column(DateTime(timezone=True), nullable=True)
     )
 

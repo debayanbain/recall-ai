@@ -120,6 +120,53 @@ class SuggestionListResponse(BaseModel):
     total: int = 0
 
 
+class GraphEdge(BaseModel):
+    """One edge on the canvas, named by both of its memories.
+
+    Unlike `ConnectionRead` this carries `source_id` / `target_id` rather than a card and
+    a direction. A graph is wired from ids -- the nodes arrive once in `nodes`, however
+    many edges touch them -- and shipping a card per edge would send a memory with six
+    connections six times.
+
+    The stored direction is reported as-is and is meaningful: `part_of` and `depends_on`
+    read differently each way, and the service normalises the symmetric relations on write
+    so the arrow a client draws is always the one the label belongs to.
+    """
+
+    model_config = ConfigDict(from_attributes=True)
+
+    id: uuid.UUID
+    source_id: uuid.UUID
+    target_id: uuid.UUID
+    relation: Relation
+    origin: ConnectionOrigin
+    status: ConnectionStatus
+    score: float | None = None
+    note: str | None = None
+    ai_reason: str | None = None
+    created_at: datetime
+
+
+class GraphResponse(BaseModel):
+    """Every edge in the vault, and each memory an edge touches, once.
+
+    `nodes` is derived from `edges` rather than queried separately, which is what makes
+    the two incapable of disagreeing about which memories are on screen. A memory with no
+    connections is deliberately absent: it has nothing to draw, and a canvas of unattached
+    cards is a vault listing with worse ergonomics.
+
+    `truncated` is the honest half of a ceiling. A graph is not a list and nobody pages
+    through one, so a vault past the limit gets its strongest edges plus a count -- and
+    the client says so rather than presenting a partial picture as the whole one.
+    """
+
+    nodes: list[VaultItemRead] = Field(default_factory=list)
+    edges: list[GraphEdge] = Field(default_factory=list)
+    #: How many edges exist, which is not how many were returned.
+    total: int = 0
+    truncated: bool = False
+
+
 class HubRead(BaseModel):
     """One memory and how many things connect to it."""
 

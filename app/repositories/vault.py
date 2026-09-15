@@ -117,6 +117,9 @@ class VaultRepository:
         "processing_status",
         "processing_error",
         "created_at",
+        # Read by the trash listing to say how many days a memory has left. A
+        # `cards_only` row that did not load it would hit `raiseload` instead.
+        "deleted_at",
         "file_name",
         "file_size",
         "mime_type",
@@ -133,6 +136,7 @@ class VaultRepository:
         offset: int,
         *,
         cards_only: bool = False,
+        order_by: Any = None,
     ) -> tuple[Sequence[VaultItem], int]:
         """Run a filtered listing and its total in ONE round trip.
 
@@ -153,7 +157,10 @@ class VaultRepository:
         total_col = func.count().over().label("total")
         query = (
             base.add_columns(total_col)
-            .order_by(col(VaultItem.created_at).desc())
+            # Newest first everywhere except the trash, which is read by when a memory
+            # was deleted rather than by when it was saved -- "what did I just throw
+            # away" is the question that page exists to answer.
+            .order_by(order_by if order_by is not None else col(VaultItem.created_at).desc())
             .limit(limit)
             .offset(offset)
         )
@@ -234,6 +241,64 @@ class VaultRepository:
             base = base.where(col(VaultItem.processing_status).in_(list(statuses)))
 
         return await self._page(base, limit, offset)
+
+    async def search_by_tags(
+        self,
+        user_id: uuid.UUID,
+        tags: Sequence[str],
+        *,
+        limit: int = 10,
+        exclude_item_id: uuid.UUID | None = None,
+    ) -> list[VaultItem]:
+        """The caller's memories carrying any of these tags, newest first. ONE statement.
+
+        The half of connection recall a vector search cannot do. Two notes about one job
+        application written three months apart both carry `jobs` and `visa` and can still
+        sit far apart in embedding space -- a summary about a form and a summary about an
+        interview genuinely are different text. The tags are the subject the enrichment
+        already worked out, and they are free to reuse.
+
+        **Written as an OR of containments, on purpose.** `ai_tags` is JSONB behind a GIN
+        `jsonb_path_ops` index, which serves `@>` and nothing else: `?|` (has any key)
+        would be the obvious operator and that index cannot answer it, so the query would
+        fall back to a sequential scan over the whole vault. One `@>` per tag is one
+        index scan per tag, which the planner unions itself.
+
+        Overlap is counted in Python by the caller rather than in SQL. Ranking inside the
+        statement would mean a lateral over `jsonb_array_elements` per row, and the
+        candidate list is already bounded to `limit` -- the cost of being approximate here
+        is that a memory sharing three tags can lose a slot to one sharing one, and what
+        sits behind that is a judge that reads both.
+
+        `deleted_at` is filtered, so a tombstone is never a candidate. Card columns only:
+        every caller renders these into a prompt or a card, and none reads a body.
+        """
+        wanted = [tag for tag in dict.fromkeys(t.strip() for t in tags) if tag][:8]
+        if not wanted or limit < 1:
+            return []
+        matches: Any = or_(
+            *(col(VaultItem.ai_tags).contains([tag]) for tag in wanted)
+        )
+        query = (
+            select(VaultItem)
+            .where(
+                VaultItem.user_id == user_id,
+                col(VaultItem.deleted_at).is_(None),
+                matches,
+            )
+            .order_by(col(VaultItem.created_at).desc())
+            .limit(limit)
+            .options(
+                load_only(
+                    *(getattr(VaultItem, name) for name in self._CARD_COLUMNS),
+                    raiseload=True,
+                )
+            )
+        )
+        if exclude_item_id is not None:
+            query = query.where(col(VaultItem.id) != exclude_item_id)
+        rows = (await self.session.execute(query)).scalars().all()
+        return list(rows)
 
     async def search_semantic(
         self,
@@ -399,28 +464,137 @@ class VaultRepository:
         )
         return result.all()
 
-    async def delete(self, item: VaultItem) -> None:
-        """Tombstone the row and scrub everything it held.
+    async def get_trashed(
+        self, item_id: uuid.UUID, user_id: uuid.UUID
+    ) -> VaultItem | None:
+        """One of this user's trashed memories, if it can still come back.
 
-        Every read in this file already filters `deleted_at`, and has since the column
-        was added -- but the write was a hard `session.delete()`, so the filters could
-        never match anything and a soft-deleted row would have been fully readable
-        through `get()`. Both halves are fixed here: this writes the tombstone, and `get`
-        and `get_unscoped` now honour it.
+        Four ways to answer `None`, and they are deliberately one answer: no such row,
+        not yours, not deleted, or already purged. A caller that can tell them apart can
+        enumerate ids that are not theirs, which is the reason `get()` collapses the same
+        cases.
+
+        A purged row is excluded because there is nothing left in it to restore -- the
+        scrub already ran.
+        """
+        item = await self.session.get(VaultItem, item_id)
+        if (
+            item is None
+            or item.user_id != user_id
+            or item.deleted_at is None
+            or item.purged_at is not None
+        ):
+            return None
+        return item
+
+    async def list_trashed(
+        self, user_id: uuid.UUID, limit: int = 20, offset: int = 0
+    ) -> tuple[Sequence[VaultItem], int]:
+        """The trash page: this user's deleted-but-recoverable memories, newest first."""
+        base = select(VaultItem).where(
+            VaultItem.user_id == user_id,
+            col(VaultItem.deleted_at).is_not(None),
+            col(VaultItem.purged_at).is_(None),
+        )
+        return await self._page(
+            base,
+            limit,
+            offset,
+            cards_only=True,
+            order_by=col(VaultItem.deleted_at).desc(),
+        )
+
+    async def list_trash_rows(
+        self, user_id: uuid.UUID, limit: int
+    ) -> Sequence[VaultItem]:
+        """Full rows of one user's trash, for "empty trash".
+
+        Full rows and not cards: the caller has to read `storage_key` and `thumbnail_key`
+        before the scrub clears them, and a `cards_only` row would raise on both.
+        """
+        result = await self.session.exec(
+            select(VaultItem)
+            .where(VaultItem.user_id == user_id)
+            .where(col(VaultItem.deleted_at).is_not(None))
+            .where(col(VaultItem.purged_at).is_(None))
+            .order_by(col(VaultItem.deleted_at))
+            .limit(limit)
+        )
+        return result.all()
+
+    async def list_expired_trash(
+        self, cutoff: datetime, limit: int
+    ) -> Sequence[VaultItem]:
+        """Rows whose trash window has run out, oldest first.
+
+        Unscoped, like `get_unscoped`, and for the same caller: the beat task has no
+        request user. It is bounded because the purge deletes bucket objects one at a
+        time -- an unbounded sweep would hold a transaction open across hundreds of
+        network calls, and whatever is left is taken by the next tick anyway.
+        """
+        result = await self.session.exec(
+            select(VaultItem)
+            .where(col(VaultItem.deleted_at).is_not(None))
+            .where(col(VaultItem.deleted_at) < cutoff)
+            .where(col(VaultItem.purged_at).is_(None))
+            .order_by(col(VaultItem.deleted_at))
+            .limit(limit)
+        )
+        return result.all()
+
+    async def trash(self, item: VaultItem) -> None:
+        """Move a memory to the trash: gone from everywhere, destroyed nowhere.
+
+        Every read in this file filters `deleted_at`, so writing it is the whole of the
+        removal as far as the product is concerned -- the item leaves listings, search,
+        chat retrieval, connections and the worker on the same statement. What it does
+        *not* do is scrub the row, delete the chunks or touch the bucket. That is
+        `purge`, and it runs TRASH_RETENTION_DAYS later.
+
+        The chunks stay on purpose. They carry the words and the vector drawn from them,
+        which is exactly what a restore has to put back -- and re-deriving them would mean
+        re-embedding, so a restore would cost money and could quietly fail. They are
+        already invisible: `search_semantic` joins the item and filters `deleted_at`.
+        """
+        item.deleted_at = datetime.now(UTC)
+        self.session.add(item)
+        await self.session.flush()
+
+    async def restore(self, item: VaultItem) -> None:
+        """Put a trashed memory back. Nothing to rebuild -- nothing was taken away.
+
+        Callers reach this through `get_trashed`, which already refuses a purged row, so
+        this cannot resurrect a tombstone into an empty memory.
+        """
+        item.deleted_at = None
+        self.session.add(item)
+        await self.session.flush()
+
+    async def purge(self, item: VaultItem) -> None:
+        """The real deletion: scrub the row and take the derived data with it.
+
+        This is the old `delete`, now reached either when the trash window runs out or
+        when the owner asks for it outright. It is the irreversible half, which is why it
+        is a separate call from `trash` rather than a flag on it.
 
         **The content is scrubbed, not kept.** A tombstone exists for referential
         integrity and so a row's absence is explainable; it is not a copy of a memory
-        somebody asked to be rid of. Keeping the title and body around to enable a
-        hypothetical undo is exactly the thing a person deleting a memory does not want,
-        and it would sit in the database until the account was closed. What survives is
-        the id, the owner, the kind and the timestamps -- enough to explain a gap, not
-        enough to reconstruct anything.
+        somebody asked to be rid of. Keeping the title and body around past the trash
+        window is exactly the thing a person deleting a memory does not want, and it
+        would sit in the database until the account was closed. What survives is the id,
+        the owner, the kind and the timestamps -- enough to explain a gap, not enough to
+        reconstruct anything.
 
         The chunks go with it. They are derived data carrying the same words *and* the
         vector drawn from them, so leaving them would keep the deleted text searchable in
         the one index built to find it.
         """
-        item.deleted_at = datetime.now(UTC)
+        item.purged_at = datetime.now(UTC)
+        # A purge reached directly ("delete forever") never passed through `trash`, so
+        # this may be the first tombstone the row gets. Set rather than overwritten: the
+        # trash window is measured from when the user deleted it, not from the purge.
+        if item.deleted_at is None:
+            item.deleted_at = item.purged_at
         item.title = None
         item.summary = None
         item.content = None
@@ -433,7 +607,7 @@ class VaultRepository:
         item.ai_category = None
         item.item_metadata = {}
         item.processing_error = None
-        # The object itself is removed by `VaultService.delete`, which reads the key
+        # The objects themselves are removed by `VaultService`, which reads the keys
         # before calling this. Cleared here so nothing can mint a presigned URL to bytes
         # that are on their way out.
         item.storage_key = None
@@ -452,6 +626,10 @@ class VaultRepository:
         # also leave a tombstone visibly related to a live memory on that memory's own
         # page. Removing the rows frees the pair as well, so a deletion cannot
         # permanently block a connection someone draws later between what remains.
+        #
+        # They survive the *trash* stage, where they are already hidden by every read
+        # filtering the neighbour's `deleted_at` -- which is what lets a restore bring a
+        # memory back with its neighbourhood intact.
         await self.session.execute(
             sa_delete(MemoryConnection).where(
                 or_(

@@ -80,6 +80,11 @@ class Relation(StrEnum):
     """
 
     related_to = "related_to"
+    #: The same thing kept twice -- same video, same article, same link. Mechanical
+    #: rather than semantic: it is a claim about two *rows*, not about what they say,
+    #: which is why the judge is handed "same source" as a measured signal rather than
+    #: being asked to infer it. It reads the same from both ends, so it is symmetric.
+    duplicate_of = "duplicate_of"
     expands = "expands"
     supports = "supports"
     contradicts = "contradicts"
@@ -95,7 +100,9 @@ class Relation(StrEnum):
 #: carries no meaning, so the service normalises them (`source_item_id == pair_low`) and
 #: both ends render one label. Without that, a `contradicts` edge reads backwards half
 #: the time and somebody eventually "fixes" it.
-SYMMETRIC_RELATIONS = frozenset({Relation.related_to, Relation.contradicts})
+SYMMETRIC_RELATIONS = frozenset(
+    {Relation.related_to, Relation.contradicts, Relation.duplicate_of}
+)
 
 
 class ConnectionOrigin(StrEnum):

@@ -34,6 +34,8 @@ from app.schemas.connection import (
     ConnectionRead,
     CreateConnectionRequest,
     CreateConnectionResponse,
+    GraphEdge,
+    GraphResponse,
     HubListResponse,
     HubRead,
     NeighbourhoodResponse,
@@ -101,6 +103,61 @@ async def list_suggestions(
             for row, source, target in found
         ],
         total=total,
+    )
+
+
+@router.get("/graph", response_model=GraphResponse)
+async def read_graph(
+    user: CurrentUser,
+    service: ConnectionServiceDep,
+    response: Response,
+    limit: int | None = Query(default=None, ge=1, le=1000),
+    include_dismissed: bool = Query(default=False),
+) -> GraphResponse:
+    """Every edge in the caller's vault, with each memory an edge touches sent once.
+
+    What the canvas is drawn from. Declared above `/{connection_id}` for the same reason
+    `/suggestions` and `/hubs` are -- a literal segment that could be read as a parameter
+    has to be matched first.
+
+    `include_dismissed` is off by default and is a debugging affordance rather than a
+    view: a dismissed row is kept so the derivation cannot re-propose the pair, and
+    drawing somebody's own "no" back onto the canvas would make a decision they already
+    took look undone.
+
+    `no_store`, like every response carrying presigned thumbnail URLs -- those embed a
+    credential with a six-hour life, and a shared cache is exactly where one should not
+    sit.
+    """
+    cards.no_store(response)
+    statuses = (
+        (ConnectionStatus.confirmed, ConnectionStatus.suggested, ConnectionStatus.dismissed)
+        if include_dismissed
+        else None
+    )
+    found, total = await service.graph(user.id, statuses=statuses, limit=limit)
+
+    # One card per memory however many edges touch it. `read_cards` presigns thumbnails,
+    # which is a request per distinct key -- sending a hub's card six times would pay for
+    # that six times and hand the browser six URLs for one picture.
+    seen: dict[uuid.UUID, VaultItem] = {}
+    for _row, source, target in found:
+        seen.setdefault(source.id, source)
+        seen.setdefault(target.id, target)
+    nodes = await cards.read_cards(list(seen.values()))
+
+    return GraphResponse(
+        nodes=nodes,
+        edges=[
+            GraphEdge(
+                **row.model_dump(include=_PUBLIC_FIELDS),
+                source_id=row.source_item_id,
+                target_id=row.target_item_id,
+            )
+            for row, _source, _target in found
+        ],
+        total=total,
+        truncated=total > len(found),
     )
 
 

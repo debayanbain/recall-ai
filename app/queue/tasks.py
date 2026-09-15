@@ -378,6 +378,35 @@ async def _sweep_stale_runs() -> int:
         return rescued
 
 
+@celery_app.task(name="app.queue.tasks.purge_expired_trash")
+def purge_expired_trash() -> int:
+    """Beat task: destroy memories that have sat in the trash past the window.
+
+    `DELETE /vault/{id}` only writes `deleted_at` -- the row keeps its content and the
+    bucket keeps its objects -- so without this the trash is a place things accumulate
+    rather than a delay before deletion. Here is where the scrub, the chunk delete, the
+    connection delete and the bucket delete actually happen, TRASH_RETENTION_DAYS later.
+
+    Bounded per tick (`TRASH_PURGE_BATCH`): each row's purge deletes its objects one at a
+    time, and an unbounded sweep would hold one transaction open across hundreds of
+    network calls. The cutoff only moves forward, so whatever is left is taken next time.
+
+    Daily rather than every few minutes: the window is measured in days, so a tick finer
+    than that buys nothing and only adds queries against a database in another region.
+    """
+    return asyncio.run(_purge_expired_trash())
+
+
+async def _purge_expired_trash() -> int:
+    from app.services.vault_service import VaultService
+
+    async with task_session() as session:
+        vault = VaultService(VaultRepository(session), get_storage())
+        purged = await vault.purge_expired()
+        await session.commit()
+        return purged
+
+
 @celery_app.task(name="app.queue.tasks.purge_expired_sessions")
 def purge_expired_sessions() -> int:
     """Beat task: delete refresh-session rows that can no longer prove anything.
