@@ -99,7 +99,7 @@ async def test_the_bytes_go_to_the_model_not_a_signed_url(
     private object externally fetchable for the length of its TTL."""
     sent: list[str] = []
 
-    async def _call(data_url: str) -> Any:
+    async def _call(data_url: str, _prompt: str, _max_tokens: int) -> Any:
         sent.append(data_url)
         return _Completion("A receipt for two litres of paint.")
 
@@ -140,7 +140,7 @@ def test_oversized_images_are_never_queued(monkeypatch: pytest.MonkeyPatch) -> N
 async def test_a_provider_fault_answers_in_our_own_words(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _call(_data_url: str) -> Any:
+    async def _call(_data_url: str, _prompt: str, _max_tokens: int) -> Any:
         raise RuntimeError("401 Incorrect API key sk-proj-abc123 provided")
 
     monkeypatch.setattr(vision, "_call_provider", _call)
@@ -154,7 +154,7 @@ async def test_a_provider_fault_answers_in_our_own_words(
 async def test_an_empty_description_is_unreadable_not_broken(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    async def _call(_data_url: str) -> Any:
+    async def _call(_data_url: str, _prompt: str, _max_tokens: int) -> Any:
         return _Completion("   ")
 
     monkeypatch.setattr(vision, "_call_provider", _call)
@@ -236,3 +236,34 @@ async def test_no_vision_key_leaves_the_image_skipped(
 
     await service.process(item.id)
     assert item.processing_status is ProcessingStatus.skipped
+
+
+async def test_a_slide_is_transcribed_not_described(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The photo prompt is the wrong question for a slide, and it showed.
+
+    Asked what the picture *shows*, the model opened two paragraphs about the Brandenburg
+    Gate before reaching any of the job sites the slide is a list of, then dumped the text
+    loosely enough that one slide came back as "1 2 3 4 5 1 2 3 4 5" with every name
+    detached from its rank. The rows and their order are the content.
+    """
+    seen: list[tuple[str, int]] = []
+
+    async def _call(_data_url: str, prompt: str, max_tokens: int) -> Any:
+        seen.append((prompt, max_tokens))
+        return _Completion("GERMANY (PART 2)\n1. HeyJobs — Hiring Platform")
+
+    monkeypatch.setattr(vision, "_call_provider", _call)
+    monkeypatch.setattr(vision.settings, "OPENAI_API_KEY", "sk-test")
+
+    await vision.describe_image(b"\x89PNG\r\n\x1a\n" + b"0" * 32, "image/png", purpose="slide")
+    prompt, budget = seen[0]
+    assert prompt is vision._SLIDE_PROMPT
+    # A ten-row table with labels does not fit the photo budget, and a clipped
+    # transcription loses the last rows -- the half nobody notices is missing.
+    assert budget > 800
+
+    seen.clear()
+    await vision.describe_image(b"\x89PNG\r\n\x1a\n" + b"0" * 32, "image/png")
+    assert seen[0][0] is vision._PROMPT, "an upload is still a photograph"

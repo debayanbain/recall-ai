@@ -10,6 +10,7 @@ field of a response model, and nothing below the router needs it.
 """
 from __future__ import annotations
 
+import asyncio
 from collections.abc import Sequence
 
 from fastapi import Response
@@ -50,12 +51,22 @@ async def read_cards(items: Sequence[VaultItem]) -> list[VaultItemRead]:
 
 
 async def read_detail(item: VaultItem) -> VaultItemDetail:
-    """The same substitution for a single memory's detail response."""
-    urls = await thumbnails.presigned_urls([item], get_storage())
+    """The same substitution for a single memory's detail response, plus its slides.
+
+    A carousel's pictures are signed here and nowhere else. `read_cards` deliberately does
+    not: a listing renders one image per memory, and minting fourteen URLs for a card that
+    shows one of them would pay the signing cost per card for pictures nothing displays.
+    """
+    storage = get_storage()
+    urls, slides = await asyncio.gather(
+        thumbnails.presigned_urls([item], storage),
+        thumbnails.presigned_slide_urls(item, storage),
+    )
     detail = VaultItemDetail.model_validate(item)
     mirrored = urls.get(item.id)
     if mirrored:
         detail.thumbnail_url = mirrored
+    detail.slide_urls = slides
     return detail
 
 

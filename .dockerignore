@@ -1,13 +1,35 @@
-.venv
-__pycache__/
-*.py[oc]
-.git
+# .env is the first entry for a reason: it carries live provider keys, the Fernet
+# TOKEN_ENCRYPTION_KEY that decrypts stored OAuth and Instagram Page tokens, and the
+# database URL. An image layer is readable by anyone who can pull the image, and
+# deleting the file in a later layer does not remove it from the earlier one. Secrets
+# reach a container at RUN time -- a k8s Secret, envFrom -- never at build time.
 .env
 .env.*
-!.env.example
+*.pem
+*.key
+
+.git
+.github
+.venv
+venv
+__pycache__/
+*.py[cod]
 .pytest_cache
 .ruff_cache
 .mypy_cache
+.DS_Store
+
+# Not runtime: the suite, the writing, the dev log spool, scratch uploads.
 tests
+docs
+logs
+files
 *.md
-uv.lock
+!README.md
+
+# Never copy a build recipe or a run plan into the thing it builds.
+Dockerfile*
+docker-compose*.yml
+Makefile
+deploy
+k8s

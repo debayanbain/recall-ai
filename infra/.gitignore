@@ -1,0 +1,21 @@
+# ─── Terraform, all stacks ───────────────────────────────────────────────────
+# State files contain every value Terraform manages, in PLAINTEXT, including
+# resource IDs and any secret it owns the value of. They never go in git.
+*.tfstate
+*.tfstate.*
+*.tfstate.backup
+
+# Provider binaries and module cache — hundreds of MB, re-downloadable.
+.terraform/
+
+# Your real variable values (account-specific, sometimes sensitive).
+terraform.tfvars
+*.auto.tfvars
+
+# Saved plans — they embed the full resource diff.
+*.tfplan
+tf.plan
+
+# Crash logs can contain request/response bodies.
+crash.log
+crash.*.log

@@ -60,6 +60,10 @@ _GIF = b"GIF8"
 _RIFF = b"RIFF"
 _WEBP = b"WEBP"
 
+#: How many slides are fetched at once. See `mirror_slides` -- a burst at one CDN is
+#: throttled rather than faster, and the pipeline is not waiting on wall-clock here.
+_SLIDE_CONCURRENCY = 4
+
 #: How many redirects to follow. A share shortlink resolves in one or two; a chain longer
 #: than this is not a picture, it is a loop.
 _MAX_HOPS = 4
@@ -193,6 +197,143 @@ async def mirror(item: VaultItem, storage: ObjectStorage | None) -> None:
             await storage.delete(previous)
         except Exception as exc:  # noqa: BLE001
             log.info("thumbnail_cleanup_failed", error=type(exc).__name__)
+
+
+def mime_for_key(key: str) -> str | None:
+    """The stored type of an object this module wrote, or None if it is not one.
+
+    Recovered from the extension **we** chose when `_sniff` decided what the bytes were,
+    which is why it cannot be steered by a scraped URL or a `Content-Type` header. Public
+    because reading a slide needs the same answer signing one does: a provider refuses an
+    image with no declared type, and guessing one is how a PNG gets sent as a JPEG.
+    """
+    return _MIME_BY_EXT.get(key.rsplit(".", 1)[-1].lower())
+
+
+def slide_key(user_id: uuid.UUID, item_id: uuid.UUID, index: int, ext: str) -> str:
+    """`users/<user>/<item>/slide-<n>-<random>.<ext>`.
+
+    The index rides in the name because a carousel is ordered and a bucket listing that
+    cannot say which picture is slide 9 is a listing nobody can repair from. Everything in
+    the path is still server-generated, so a scraped URL contributes no path component --
+    the rule `object_key` and `documents.object_key` both follow.
+    """
+    return f"users/{user_id}/{item_id}/slide-{index:02d}-{uuid.uuid4().hex}.{ext}"
+
+
+async def mirror_slides(item: VaultItem, storage: ObjectStorage | None) -> None:
+    """Copy a carousel's slides into our bucket, in order.
+
+    The same argument as `mirror`, multiplied: the scraped slide URLs are signed fbcdn
+    links with about a week on them, and a carousel whose pictures 403 is not a degraded
+    memory, it is fourteen broken images. Mirroring is what makes the post readable in a
+    month.
+
+    Four things beyond what `mirror` already does:
+
+    * **Slides are fetched with bounded concurrency.** Fourteen parallel downloads from
+      one CDN is a burst that gets throttled and is no faster for it; a small gate keeps
+      the pipeline polite and predictable.
+    * **Order is preserved and gaps are kept.** A slide that fails to fetch leaves `None`
+      in its place rather than shifting the ones after it, because "slide 9" is how the
+      caption refers to a picture. The stored list drops trailing `None`s only.
+    * **It is idempotent against the same source list.** Reprocessing hands back the same
+      URLs; re-copying them would spend fourteen downloads to produce identical objects
+      and orphan the old ones.
+    * **Failure stays silent and total**, exactly like `mirror`. A capture must never fail
+      because a picture did not arrive.
+    """
+    sources = [u for u in (item.item_metadata.get("slides") or []) if isinstance(u, str)]
+    if not settings.MIRROR_THUMBNAILS or storage is None or not sources:
+        return
+    if item.item_metadata.get("slide_source_urls") == sources and item.item_metadata.get(
+        "slide_keys"
+    ):
+        return
+
+    gate = asyncio.Semaphore(_SLIDE_CONCURRENCY)
+
+    async def one(index: int, url: str) -> str | None:
+        async with gate:
+            try:
+                fetched = await _fetch(url)
+            except UnsafeUrlError as exc:
+                log.warning("slide_unsafe_url", item_id=str(item.id), reason=str(exc))
+                return None
+            except Exception as exc:  # noqa: BLE001 - decoration must never fail a capture
+                log.info(
+                    "slide_fetch_failed", item_id=str(item.id), error=type(exc).__name__
+                )
+                return None
+            if fetched is None:
+                return None
+            data, mime, ext = fetched
+            key = slide_key(item.user_id, item.id, index, ext)
+            try:
+                await storage.upload(key, data, mime)
+            except Exception as exc:  # noqa: BLE001
+                log.info(
+                    "slide_store_failed", item_id=str(item.id), error=type(exc).__name__
+                )
+                return None
+            return key
+
+    keys = list(await asyncio.gather(*(one(i, u) for i, u in enumerate(sources))))
+    while keys and keys[-1] is None:
+        keys.pop()
+    stored = [k for k in keys if k]
+    if not stored:
+        log.info("slides_not_mirrored", item_id=str(item.id), tried=len(sources))
+        return
+
+    previous = [k for k in (item.item_metadata.get("slide_keys") or []) if isinstance(k, str)]
+    item.item_metadata = {
+        **item.item_metadata,
+        "slide_keys": keys,
+        "slide_source_urls": sources,
+    }
+    log.info("slides_mirrored", item_id=str(item.id), stored=len(stored), tried=len(sources))
+
+    for old_key in previous:
+        if old_key in stored:
+            continue
+        try:
+            await storage.delete(old_key)
+        except Exception as exc:  # noqa: BLE001
+            log.info("slide_cleanup_failed", error=type(exc).__name__)
+
+
+async def presigned_slide_urls(
+    item: VaultItem, storage: ObjectStorage | None
+) -> list[str | None]:
+    """Signed URLs for one memory's mirrored slides, in slide order.
+
+    A list with holes rather than a compacted one: a missing slide is a missing slide, and
+    renumbering the rest would make slide 10 render where the caption says 9. The detail
+    response is the only place this is called from -- a listing shows one card image, and
+    signing fourteen URLs per card is the round-trip arithmetic `presigned_urls` exists to
+    avoid.
+    """
+    keys = [k if isinstance(k, str) else None for k in (item.item_metadata.get("slide_keys") or [])]
+    if storage is None or not any(keys):
+        return []
+
+    async def one(key: str | None) -> str | None:
+        if not key:
+            return None
+        ext = key.rsplit(".", 1)[-1]
+        try:
+            return await storage.presigned_get(
+                key,
+                filename=f"slide.{ext}",
+                content_type=_MIME_BY_EXT.get(ext, "application/octet-stream"),
+                expires=settings.THUMBNAIL_LINK_TTL_SECONDS,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.info("slide_sign_failed", item_id=str(item.id), error=type(exc).__name__)
+            return None
+
+    return list(await asyncio.gather(*(one(k) for k in keys)))
 
 
 async def presigned_urls(

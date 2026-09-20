@@ -82,6 +82,15 @@ class VaultItemDetail(VaultItemRead):
     #: detail because they are meaningless without the text they index into.
     ai_highlights: list[str] = Field(default_factory=list)
     item_metadata: dict[str, Any] = Field(default_factory=dict)
+    #: A carousel's slides, in order, as URLs the browser can render.
+    #:
+    #: Signed per response from our mirrored copies, exactly like `thumbnail_url` -- the
+    #: scraped fbcdn links in `item_metadata["slides"]` carry about a week of life and
+    #: `slide_keys` never leaves the server. `None` in a position is a slide that failed
+    #: to mirror; the hole is kept because a carousel is ordered and renumbering would put
+    #: slide 10 where the caption says 9. Detail only: a listing shows one card image, and
+    #: signing fourteen URLs per card is the arithmetic `cards.read_cards` avoids.
+    slide_urls: list[str | None] = Field(default_factory=list)
 
 
 class VaultListResponse(BaseModel):

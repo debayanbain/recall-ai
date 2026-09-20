@@ -50,6 +50,31 @@ _PROMPT = (
     "detail that is not visible. Plain prose, no markdown headings."
 )
 
+#: A carousel slide is a document, not a photograph, and the two want opposite answers.
+#:
+#: `_PROMPT` asks what a picture *shows*, which is right for a screenshot of a receipt and
+#: wrong for a slide that is a numbered table of job sites: the first run produced two
+#: paragraphs about the Brandenburg Gate and a street scene before reaching any of the
+#: names, then a loose 'Text in image:' dump where the numbering came apart -- one slide
+#: transcribed as "1 2 3 4 5 1 2 3 4 5" with the names detached from their ranks. The
+#: names and their order ARE the content; the background is not.
+_SLIDE_PROMPT = (
+    "This is one slide from a social-media carousel. It is a document, not a photograph: "
+    "transcribe it, do not describe it.\n"
+    "Rules:\n"
+    "1. Start with the slide's own heading on its own line, exactly as written.\n"
+    "2. If the slide is a numbered or bulleted list, reproduce EVERY row on its own line "
+    "in the slide's own order, as `N. Name — label`, where N is the number printed on the "
+    "slide. Never renumber, never merge two rows, never emit a number without its name.\n"
+    "3. Copy names, brands, domains and URLs character for character, including things "
+    "like relocate.me, Jobbörse.de or arbeitsagentur.de. These are the point of the "
+    "slide; a misspelt one is worse than a missing one.\n"
+    "4. Keep any closing line, call to action or footnote as its own line.\n"
+    "5. Describe the imagery in ONE short sentence at the end, prefixed 'Image: ', and "
+    "only if it carries meaning the text does not.\n"
+    "6. Transcribe only what is legible. Never invent a row, a rank, a label or a domain."
+)
+
 
 class VisionError(ValueError):
     """This image cannot be read. Not a fault -- the item is `skipped`, not `failed`."""
@@ -87,7 +112,7 @@ def can_describe(mime_type: str | None, size: int) -> bool:
 # Two attempts, not three: a retry re-uploads the whole image and pays for a second
 # reading of it, so a persistent failure costs real money to confirm.
 @retry(stop=stop_after_attempt(2), wait=wait_exponential(min=1, max=8), reraise=True)
-async def _call_provider(data_url: str) -> Any:
+async def _call_provider(data_url: str, prompt: str, max_tokens: int) -> Any:
     from openai import AsyncOpenAI  # lazy import, mirrors ai/openai.py
 
     if not settings.OPENAI_API_KEY:
@@ -100,7 +125,7 @@ async def _call_provider(data_url: str) -> Any:
             {
                 "role": "user",
                 "content": [
-                    {"type": "text", "text": _PROMPT},
+                    {"type": "text", "text": prompt},
                     {"type": "image_url", "image_url": {"url": data_url}},
                 ],
             }
@@ -108,12 +133,19 @@ async def _call_provider(data_url: str) -> Any:
         # Low but non-zero, matching the other providers: a description should not drift
         # between two runs over the same picture.
         temperature=0.2,
-        max_tokens=800,
+        max_tokens=max_tokens,
     )
 
 
-async def describe_image(data: bytes, mime_type: str | None) -> str:
-    """Describe an image and transcribe any text in it. Raises on anything unusable."""
+async def describe_image(
+    data: bytes, mime_type: str | None, *, purpose: str = "photo"
+) -> str:
+    """Read an image. Raises on anything unusable.
+
+    `purpose="slide"` swaps in `_SLIDE_PROMPT` and a larger output budget: a carousel
+    slide is a document whose rows are the content, and describing it as a picture buries
+    them. See that constant for what the photo prompt actually produced on one.
+    """
     if not vision_enabled():
         raise VisionUnavailable("Image reading is not configured.")
     if (mime_type or "") not in _SUPPORTED_MIME:
@@ -128,8 +160,13 @@ async def describe_image(data: bytes, mime_type: str | None) -> str:
 
     data_url = f"data:{mime_type};base64,{base64.b64encode(data).decode('ascii')}"
 
+    slide = purpose == "slide"
+    # A ten-row table with labels, a heading and a footer does not fit the photo budget;
+    # a clipped transcription loses the last rows, which is the half nobody notices.
     try:
-        response = await _call_provider(data_url)
+        response = await _call_provider(
+            data_url, _SLIDE_PROMPT if slide else _PROMPT, 1600 if slide else 800
+        )
     except VisionUnavailable:
         raise
     except Exception as exc:  # noqa: BLE001 - one opaque answer for every provider fault

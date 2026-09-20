@@ -16,6 +16,7 @@ unchanged by the split.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from typing import Any
 
@@ -33,7 +34,14 @@ from app.models.extraction_run import ExtractionRun, RunStatus
 from app.models.vault import VaultItem
 from app.repositories.extraction_run import ExtractionRunRepository
 from app.repositories.vault import VaultRepository
-from app.services import thumbnails, transcription, video, video_doc, vision
+from app.services import (
+    slide_links,
+    thumbnails,
+    transcription,
+    video,
+    video_doc,
+    vision,
+)
 from app.storage import ObjectStorage, StorageError
 
 #: Ceiling on a body assembled from more than one source (a caption plus a video
@@ -94,8 +102,10 @@ class ProcessingService:
                 # read still keeps its picture -- that card is *only* a picture and a
                 # title, which is exactly when losing the image costs the most.
                 await thumbnails.mirror(item, self.storage)
+                await self._keep_slides(item)
                 if extracted.enrich:
                     await self._read_video(item)
+                    await self._read_slides(item)
                 if not extracted.enrich:
                     # Deliberately unenriched (an Instagram post we do not pay to scrape).
                     # `skipped`, not `failed`: nothing went wrong, there is just nothing
@@ -154,9 +164,13 @@ class ProcessingService:
             extractor = get_extractor(item.source_url or "")
             self._apply(item, extractor.build(items))  # type: ignore[union-attr]
             await thumbnails.mirror(item, self.storage)
+            await self._keep_slides(item)
             # Before `_enrich`, so the summary, tags, label and embedding are all drawn
-            # from what the video actually said rather than from the caption alone.
+            # from what the video actually said rather than from the caption alone. The
+            # slides are read for the same reason and it matters more here: a carousel's
+            # caption describes pictures the caption itself does not contain.
             await self._read_video(item)
+            await self._read_slides(item)
             await self._enrich(item)
         except Exception as exc:  # noqa: BLE001 - same policy as phase 1
             await self._fail(item, exc)
@@ -201,8 +215,28 @@ class ProcessingService:
 
     @staticmethod
     def _apply(item: VaultItem, extracted: ExtractedContent) -> None:
+        """Write an extraction onto the row.
+
+        **The title rule is `or` only for a title a person gave.** It used to be `or`
+        for everyone, which is right exactly once -- on a first capture, where a title
+        the user typed must survive a scrape. On a *re-run* it freezes whatever the
+        previous extraction wrote, and a previous extraction can be much worse than the
+        current one: a carousel captured before `INSTAGRAM_SCRAPE_POSTS` existed kept
+        "Instagram post Dc0V-e-jdVm" forever, while the new run was handing back the
+        caption's own first line.
+
+        So the check is provenance, not emptiness. `title_source == "user"` is set by
+        `VaultService.save_url` when a caller supplied one, and only that is protected.
+        A row with no marker predates this and is treated as replaceable -- which is only
+        reachable through an explicit reprocess, since an item is applied once on its
+        first capture and never again on its own.
+        """
         item.type = extracted.type
-        item.title = item.title or extracted.title
+        user_titled = item.item_metadata.get("title_source") == "user"
+        if extracted.title and not (user_titled and item.title):
+            item.title = extracted.title
+        else:
+            item.title = item.title or extracted.title
         item.content = extracted.content
         item.thumbnail_url = extracted.thumbnail_url
         item.item_metadata = {**item.item_metadata, **extracted.metadata}
@@ -425,6 +459,115 @@ class ProcessingService:
             chars=len(transcript.text),
         )
         return True
+
+    async def _keep_slides(self, item: VaultItem) -> None:
+        """Copy a carousel's slides into our bucket. Never raises, like the thumbnail."""
+        await thumbnails.mirror_slides(item, self.storage)
+
+    async def _read_slides(self, item: VaultItem) -> None:
+        """Read the words baked into a carousel's pictures into `content`.
+
+        A carousel is where this pipeline was quietly at its worst: the caption arrives
+        intact and says things like "in this carousel I've shared 80+ trusted job
+        platforms", while the platforms themselves are pixels. Everything downstream --
+        the summary, the tags, the embedding, every search that will ever look for one of
+        those names -- was drawn from a caption describing content the vault did not have.
+
+        Five rules, and the first two are why this is safe to leave on:
+
+        * **It is capped by `INSTAGRAM_SLIDE_VISION_MAX`, and 0 turns it off.** One model
+          call per slide is the whole bill, so the ceiling is the budget. The slides are
+          still kept as pictures either way -- reading is the expensive half, not keeping.
+        * **Failure never fails the capture.** A slide that cannot be read is dropped and
+          the rest are kept; the item still has its caption, which is what it had before
+          this existed. `VisionFailed` is a provider fault and is swallowed here for the
+          same reason a thumbnail is: the memory is already worth saving.
+        * **Bytes come from our own bucket, never the scraped URL.** Handing a provider a
+          presigned link would send a live bearer credential to a third party and make a
+          private object externally fetchable for its lifetime -- the rule `_describe`
+          follows for uploads.
+        * **The text is appended and labelled, never substituted.** The caption is what a
+          person wrote; a model's account of a picture is not, and the two are marked
+          apart in `item_metadata` so the reader can say which is which.
+        * **Slides are read concurrently, under a deadline.** They were read serially
+          once, so that a rate limit would cost one slide rather than the batch -- and
+          the batch was then lost wholesale to `SoftTimeLimitExceeded`, because ten
+          serial calls do not fit in a task that also has to scrape, copy fourteen images
+          and enrich. `INSTAGRAM_SLIDE_READ_CONCURRENCY` and
+          `INSTAGRAM_SLIDE_READ_SECONDS` are the two halves of that lesson: go wide, and
+          stop early with what you have rather than being killed holding all of it.
+        * **The type is recovered from the key we wrote**, never guessed and never left
+          out. `describe_image` refuses an image whose type it was not told -- the first
+          run of this code passed `None` and every slide came back `VisionError`, which
+          is indistinguishable in the log from fourteen unreadable pictures.
+        """
+        budget = settings.INSTAGRAM_SLIDE_VISION_MAX
+        keys = [k for k in (item.item_metadata.get("slide_keys") or []) if isinstance(k, str)]
+        if budget <= 0 or not keys or self.storage is None or not vision.vision_enabled():
+            return
+
+        deadline = time.monotonic() + settings.INSTAGRAM_SLIDE_READ_SECONDS
+        gate = asyncio.Semaphore(max(1, settings.INSTAGRAM_SLIDE_READ_CONCURRENCY))
+        storage = self.storage
+
+        async def one(index: int, key: str) -> tuple[int, str] | None:
+            async with gate:
+                if time.monotonic() >= deadline:
+                    # Checked after the gate, not before: a slide that waited its turn
+                    # past the deadline is one the task no longer has room for.
+                    log.info("slide_read_skipped", item_id=str(item.id), slide=index)
+                    return None
+                try:
+                    data = await storage.download(key)
+                    text = (
+                        await vision.describe_image(
+                            data, thumbnails.mime_for_key(key), purpose="slide"
+                        )
+                    ).strip()
+                except Exception as exc:  # noqa: BLE001 - a slide must not fail a capture
+                    log.info(
+                        "slide_read_failed",
+                        item_id=str(item.id),
+                        slide=index,
+                        error=type(exc).__name__,
+                    )
+                    return None
+            return (index, text) if text else None
+
+        results = await asyncio.gather(
+            *(one(i, k) for i, k in enumerate(keys[:budget]))
+        )
+        # Back into slide order: `gather` preserves it, but the filtering below would
+        # otherwise depend on that rather than saying so, and slide 9 means slide 9.
+        read = [
+            f"Slide {index + 1}: {text}"
+            for index, text in sorted(r for r in results if r is not None)
+        ]
+
+        if not read:
+            return
+
+        body = "Slides:\n" + "\n\n".join(read)
+        item.content = f"{item.content}\n\n{body}" if item.content else body
+        # The sites the slides name, kept separately from the prose they were read out
+        # of: a "top 10 websites" carousel is a list of destinations, and finding them by
+        # eye in fourteen thousand characters is the problem this solves. They are model
+        # readings of pixels, never links the author handed us -- see `slide_links`.
+        links = slide_links.extract(body)
+        item.item_metadata = {
+            **item.item_metadata,
+            "slides_read": len(read),
+            "slide_text_source": "vision",
+            "slide_links": links,
+            "vision_model": settings.OPENAI_VISION_MODEL,
+        }
+        log.info(
+            "slides_read",
+            item_id=str(item.id),
+            slides=len(read),
+            chars=len(body),
+            links=len(links),
+        )
 
     async def _describe(self, item: VaultItem) -> bool:
         """Read an uploaded image into `content`. False means "nothing to enrich".

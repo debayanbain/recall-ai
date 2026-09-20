@@ -461,3 +461,133 @@ def test_every_route_that_embeds_a_signed_thumbnail_forbids_shared_caching() -> 
                 f"{module.__name__}.{node.name} serves signed thumbnails "
                 "without marking the response uncacheable"
             )
+
+
+# --- carousels ---------------------------------------------------------------
+#
+# A carousel is the case where losing the pictures loses the memory: the caption says
+# "in this carousel I've shared 80+ trusted job platforms" and the platforms are pixels.
+# Fourteen signed fbcdn URLs with a week on them is not a saved post, so these pin the
+# mirroring rather than the fetching, which the tests above already cover.
+
+
+def _carousel(n: int = 3) -> VaultItem:
+    item = _item(url=None)
+    item.item_metadata = {
+        "slides": [f"https://cdn.example.com/slide-{i}.jpg" for i in range(n)]
+    }
+    return item
+
+
+async def test_slides_are_mirrored_in_order(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, _always(_JPEG))
+    storage = _Storage()
+    item = _carousel(3)
+
+    await thumbnails.mirror_slides(item, storage)
+
+    keys = item.item_metadata["slide_keys"]
+    assert len(keys) == 3
+    # The index is in the name so a bucket listing can say which picture is which slide.
+    for index, key in enumerate(keys):
+        assert key.startswith(f"users/{item.user_id}/{item.id}/slide-{index:02d}-")
+        assert key in storage.objects
+
+
+async def test_a_slide_that_fails_leaves_a_hole_rather_than_shifting_the_rest(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Slide 3 means the third picture. Compacting would silently renumber the carousel."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path.endswith("slide-1.jpg"):
+            return httpx.Response(404)
+        return httpx.Response(200, content=_JPEG, headers={"content-type": "image/jpeg"})
+
+    _serve(monkeypatch, handler)
+    storage = _Storage()
+    item = _carousel(3)
+
+    await thumbnails.mirror_slides(item, storage)
+
+    keys = item.item_metadata["slide_keys"]
+    assert len(keys) == 3
+    assert keys[1] is None
+    assert keys[0] and keys[2]
+    assert keys[2].startswith(f"users/{item.user_id}/{item.id}/slide-02-")
+
+
+async def test_mirroring_the_same_slides_twice_copies_nothing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reprocessing hands back the same URLs; re-copying spends N downloads for nothing."""
+    _serve(monkeypatch, _always(_JPEG))
+    storage = _Storage()
+    item = _carousel(3)
+
+    await thumbnails.mirror_slides(item, storage)
+    first = list(item.item_metadata["slide_keys"])
+    await thumbnails.mirror_slides(item, storage)
+
+    assert item.item_metadata["slide_keys"] == first
+    assert len(storage.objects) == 3
+    assert storage.deleted == []
+
+
+async def test_slides_never_raise_into_the_pipeline(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Same policy as the thumbnail: a picture must not decide whether a capture works."""
+    _serve(monkeypatch, _always(_JPEG))
+    item = _carousel(2)
+
+    await thumbnails.mirror_slides(item, _FailingStorage())
+
+    assert "slide_keys" not in item.item_metadata
+
+
+async def test_an_unsafe_slide_url_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The URLs were written by a scraped page -- the same SSRF surface as an extractor."""
+
+    def guard(url: str) -> None:
+        raise UnsafeUrlError("link-local")
+
+    monkeypatch.setattr(thumbnails, "assert_safe_url", guard)
+    _serve(monkeypatch, _always(_JPEG))
+    storage = _Storage()
+    item = _carousel(2)
+
+    await thumbnails.mirror_slides(item, storage)
+
+    assert storage.objects == {}
+    assert "slide_keys" not in item.item_metadata
+
+
+async def test_presigned_slide_urls_keep_the_holes(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve(monkeypatch, _always(_JPEG))
+    storage = _Storage()
+    item = _carousel(3)
+    item.item_metadata = {**item.item_metadata, "slide_keys": ["a/one.jpg", None, "a/two.png"]}
+
+    urls = await thumbnails.presigned_slide_urls(item, storage)
+
+    assert len(urls) == 3
+    assert urls[1] is None
+    assert urls[0] and urls[0].startswith("https://bucket.invalid/a/one.jpg")
+    # The type is recovered from the extension *we* wrote, never from anything scraped.
+    assert "type=image/png" in (urls[2] or "")
+
+
+def test_mime_for_key_reads_the_extension_we_wrote() -> None:
+    """The bug this pins cost fourteen vision calls that could only fail.
+
+    `describe_image` refuses an image whose type it was not told, so reading a slide with
+    `mime_type=None` raises `VisionError` for every slide -- which in the log is
+    indistinguishable from fourteen genuinely unreadable pictures.
+    """
+    assert thumbnails.mime_for_key("users/a/b/slide-00-abc.jpg") == "image/jpeg"
+    assert thumbnails.mime_for_key("users/a/b/slide-01-abc.PNG") == "image/png"
+    assert thumbnails.mime_for_key("users/a/b/thumb-abc.webp") == "image/webp"
+    # Not a type this module ever wrote, so there is nothing to claim about the bytes.
+    assert thumbnails.mime_for_key("users/a/b/slide-02-abc.svg") is None
+    assert thumbnails.mime_for_key("no-extension") is None

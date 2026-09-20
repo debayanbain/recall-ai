@@ -49,11 +49,45 @@ def test_reel_urls_route_to_the_paid_extractor() -> None:
         assert isinstance(get_extractor(url), InstagramReelExtractor), url
 
 
-def test_posts_never_reach_apify() -> None:
-    """A post is a caption and an image — not worth an actor run."""
+def test_posts_reach_apify_by_default() -> None:
+    """A `/p/` post is a caption, and a caption is the memory.
+
+    The free path produced a row titled "Instagram post <shortcode>" with no text, no
+    tags and no summary -- `skipped`, and reported to its owner as "nothing readable to
+    index". Pinned here because the routing is one regex away from silently reverting.
+    """
+    extractor = get_extractor("https://instagram.com/p/C1xYzAbCdEf/")
+    assert isinstance(extractor, InstagramReelExtractor)
+    assert extractor.deferred is True, "an actor run must not block a worker"
+
+
+def test_posts_fall_back_to_a_link_when_scraping_is_off(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """`INSTAGRAM_SCRAPE_POSTS=false` restores the free behaviour exactly."""
+    monkeypatch.setattr(settings, "INSTAGRAM_SCRAPE_POSTS", False)
     extractor = get_extractor("https://instagram.com/p/C1xYzAbCdEf/")
     assert isinstance(extractor, InstagramPostExtractor)
     assert extractor.deferred is False
+
+
+def test_exactly_one_extractor_claims_a_post_in_either_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The two must never both answer for the same URL.
+
+    `_EXTRACTORS` order decides the winner today, so a double claim would be invisible --
+    until somebody reorders the list and `/p/` silently goes back to empty rows.
+    """
+    url = "https://instagram.com/p/C1xYzAbCdEf/"
+    for scraping in (True, False):
+        monkeypatch.setattr(settings, "INSTAGRAM_SCRAPE_POSTS", scraping)
+        claimed = [
+            e
+            for e in (InstagramReelExtractor(), InstagramPostExtractor())
+            if e.can_handle(url)
+        ]
+        assert len(claimed) == 1, f"scraping={scraping} claimed {claimed}"
 
 
 async def test_a_post_is_saved_as_a_link_without_enrichment() -> None:
@@ -178,3 +212,59 @@ def test_webhook_config_encodes_the_callback(monkeypatch: pytest.MonkeyPatch) ->
     # Failure events matter as much as success: without them a failed run never calls
     # back and only the sweeper would ever notice.
     assert "ACTOR.RUN.FAILED" in hooks[0]["eventTypes"]
+
+
+# --- carousels ---------------------------------------------------------------
+#
+# Shapes taken from a real run against `/p/Dc0V-e-jdVm` on 2026-09-18: `type: "Sidecar"`,
+# fourteen entries in both `images` and `childPosts`, and every child's `alt` the same
+# generated sentence. That last detail is why the slides have to be read as pictures --
+# there is no per-slide text in the payload at all.
+
+SIDECAR: dict[str, Any] = {
+    "type": "Sidecar",
+    "shortCode": "Dc0V1e2jdVm",
+    "caption": "In this carousel I've shared 80+ trusted job platforms",
+    "ownerUsername": "someone",
+    "images": [
+        "https://cdn.example.com/a.jpg",
+        "https://cdn.example.com/b.jpg",
+        "https://cdn.example.com/c.jpg",
+    ],
+    "childPosts": [{"alt": "Photo by someone on September 03, 2026."}] * 3,
+}
+
+
+def test_a_carousel_keeps_every_slide_in_order() -> None:
+    out = InstagramReelExtractor()._build([SIDECAR], "https://instagram.com/p/Dc0V1e2jdVm")
+    assert out.metadata["slides"] == SIDECAR["images"]
+    assert out.metadata["slide_count"] == 3
+
+
+def test_a_carousel_says_so_in_the_text_the_model_reads() -> None:
+    """The caption refers to slides; without this the model is reading half a sentence."""
+    out = InstagramReelExtractor()._build([SIDECAR], "https://instagram.com/p/Dc0V1e2jdVm")
+    assert out.content is not None
+    assert "carousel of 3 slides" in out.content
+    assert "Instagram carousel by @someone" in out.content
+
+
+def test_a_single_image_post_is_not_a_carousel() -> None:
+    """Its one picture is already the thumbnail; calling it a slide renders it twice."""
+    single = {**SIDECAR, "type": "Image", "images": ["https://cdn.example.com/a.jpg"]}
+    out = InstagramReelExtractor()._build([single], "https://instagram.com/p/Dc0V1e2jdVm")
+    assert out.metadata["slides"] == []
+    assert out.metadata["slide_count"] == 0
+
+
+def test_slides_are_capped_and_deduped_without_reordering(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(settings, "INSTAGRAM_SLIDE_MAX", 2)
+    payload = {
+        **SIDECAR,
+        "images": ["https://x/2.jpg", "https://x/1.jpg", "https://x/2.jpg", "https://x/3.jpg"],
+    }
+    out = InstagramReelExtractor()._build([payload], "https://instagram.com/p/Dc0V1e2jdVm")
+    # First-seen order, not sorted: a carousel is read left to right.
+    assert out.metadata["slides"] == ["https://x/2.jpg", "https://x/1.jpg"]

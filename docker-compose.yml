@@ -70,7 +70,20 @@ services:
     # Floor and ceiling for the container itself. The autoscaler moves the ceiling with
     # `docker update`; the reservation keeps a working set from being reclaimed the
     # moment the host is under pressure.
-    mem_limit: ${REDIS_MEM_LIMIT:-512m}
+    #
+    # The ceiling is THREE times `maxmemory`, not two, and the default here has to say so
+    # on its own: `scripts/autoscale.sh` keeps that multiple (CONTAINER_MULT=3) but it is
+    # not always running, so a plain `make redis` boots at whatever this line says. It
+    # said 512m against a 256mb maxmemory -- the 2x ratio that was measured killing the
+    # broker mid-AOF-rewrite. A rewrite forks, and a fork under writes can transiently
+    # approach double the dataset in resident pages on top of client buffers; the cgroup
+    # SIGKILLs it, so there is no shutdown line and `docker inspect` reports
+    # OOMKilled=false, which presents as a mystery restart rather than as a limit.
+    #
+    # Override both together or the ratio breaks: REDIS_MAXMEMORY=128mb needs
+    # REDIS_MEM_LIMIT=384m. On a 2GiB host that pair is the sensible start, since Redis
+    # shares the box with the API, the worker, beat and the web app.
+    mem_limit: ${REDIS_MEM_LIMIT:-768m}
     mem_reservation: ${REDIS_MEM_RESERVATION:-64m}
     healthcheck:
       # `depends_on: condition: service_healthy` is what stops a worker from racing the

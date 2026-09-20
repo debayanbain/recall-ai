@@ -69,7 +69,15 @@ class InstagramReelExtractor(DeferredExtractor):
         # Claimed even when Apify is unconfigured, on purpose: falling through to the
         # article fetcher would "succeed" with an empty login-wall page, which reads as a
         # silent product failure. Failing loudly names the missing setting instead.
-        return bool(_IG_REEL_RE.search(url))
+        #
+        # Static `/p/` posts are claimed here too while `INSTAGRAM_SCRAPE_POSTS` is on,
+        # which is the switch between a memory and an empty row -- see the setting. The
+        # actor needs no change for them: `_actor_input` sends `directUrls` with
+        # `resultsType: "posts"`, which is the same request either way, and `_to_content`
+        # already words itself "post" when nothing in the payload is a video.
+        if _IG_REEL_RE.search(url):
+            return True
+        return settings.INSTAGRAM_SCRAPE_POSTS and bool(_IG_POST_RE.search(url))
 
     def _require_token(self) -> None:
         if not settings.APIFY_TOKEN:
@@ -197,6 +205,7 @@ class InstagramReelExtractor(DeferredExtractor):
                 )
             raise RuntimeError(f"Instagram scrape failed: {code} {detail}".strip())
 
+        slides = self._slides(post)
         caption = (post.get("caption") or "").strip()
         hashtags = [h for h in (post.get("hashtags") or []) if isinstance(h, str)]
         mentions = [m for m in (post.get("mentions") or []) if isinstance(m, str)]
@@ -208,7 +217,12 @@ class InstagramReelExtractor(DeferredExtractor):
         # what mattered. Everything is labelled so the model is not guessing at fragments.
         parts: list[str] = []
         if owner:
-            parts.append(f"Instagram {'reel' if is_video else 'post'} by @{owner}")
+            kind = "reel" if is_video else ("carousel" if slides else "post")
+            parts.append(f"Instagram {kind} by @{owner}")
+        if slides:
+            # Said in the text the model reads, because "this is 14 pictures" is context
+            # for a caption that refers to them ("in this carousel I've shared 80+...").
+            parts.append(f"This is a carousel of {len(slides)} slides.")
         if caption:
             parts.append(caption)
         if hashtags:
@@ -259,24 +273,68 @@ class InstagramReelExtractor(DeferredExtractor):
                 "mentions": mentions,
                 "shortcode": post.get("shortCode"),
                 "source": "apify",
+                # The scraped slide URLs. Signed fbcdn links with about a week on them,
+                # so they are a record of where the pictures came from and never the
+                # answer served to a browser -- `thumbnails.mirror_slides` copies them
+                # into our own bucket and `slide_keys` is what a response is built from.
+                "slides": slides,
+                "slide_count": len(slides),
             },
         )
 
+    @staticmethod
+    def _slides(post: dict[str, Any]) -> list[str]:
+        """Every picture in a carousel, in order, or `[]` for a single-image post.
+
+        Read from `images` rather than from `childPosts`: the actor returns both and they
+        were byte-identical on the run this was written against, and `images` is already
+        the flat list of display URLs this needs. `childPosts` carries per-slide `alt`,
+        which sounds useful and is not -- all fourteen were the same generated sentence.
+
+        A single-image post has `images` of length one; that is the thumbnail, already
+        mirrored by `thumbnails.mirror`, so calling it a carousel would put the same
+        picture on the page twice.
+        """
+        if (post.get("type") or "").lower() != "sidecar":
+            return []
+        urls = [u for u in (post.get("images") or []) if isinstance(u, str) and u.strip()]
+        # Order matters -- a carousel is read left to right and slide 9 means nothing on
+        # its own -- so dedupe without sorting.
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for url in urls:
+            if url in seen:
+                continue
+            seen.add(url)
+            ordered.append(url)
+        return ordered[: settings.INSTAGRAM_SLIDE_MAX]
+
 
 class InstagramPostExtractor(Extractor):
-    """Static Instagram posts — saved as a link, never sent to Apify.
+    """Static Instagram posts, saved as a link — the free path, now off by default.
 
-    A deliberate cost decision: a post is a caption and an image, which is not worth an
-    actor run, whereas a reel carries a caption, audio, hashtags and a comment thread.
-    Instagram serves a login wall to server-side fetches, so there is no free way to read
-    the caption — the honest outcome is a saved link with no summary, marked `skipped`
-    rather than `failed` so it does not look broken.
+    This is what `/p/` URLs got when scraping them was judged not worth an actor run, and
+    it is still the behaviour whenever `INSTAGRAM_SCRAPE_POSTS` is off. It is kept rather
+    than deleted because the trade is real: Instagram serves a login wall to server-side
+    fetches, so with no actor run there is no way to read the caption, and a saved link
+    with no summary is the honest outcome — `skipped` rather than `failed`, since nothing
+    went wrong.
+
+    What it produces, though, is a row titled "Instagram post <shortcode>" with no text,
+    no tags, no summary and no picture, which does not read as a saved memory to the
+    person who saved it. That is why the default moved.
+
+    **It must not claim a URL the reel extractor is also claiming.** Both are in
+    `_EXTRACTORS` and the reel one is first, so the order alone would be enough today;
+    the switch is re-read here so the two cannot disagree if that order ever changes.
     """
 
     content_type = ContentType.instagram
     deferred = False
 
     def can_handle(self, url: str) -> bool:
+        if settings.INSTAGRAM_SCRAPE_POSTS:
+            return False
         return bool(_IG_POST_RE.search(url))
 
     async def extract(self, url: str) -> ExtractedContent:

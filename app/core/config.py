@@ -183,6 +183,47 @@ class Settings(BaseSettings):
     # actor that accepts a *single reel* URL (the first-party one walks a page), and
     # only when comments or engagement counts are worth paying per run for.
     FACEBOOK_USE_APIFY: bool = False
+    # Static `/p/` posts go through the same actor as reels.
+    #
+    # They did not, and the reasoning was a cost one: a post is a caption and an image,
+    # where a reel carries caption, audio, hashtags and a comment thread. What that
+    # reasoning missed is what the alternative actually produces -- an item titled
+    # "Instagram post Dc0V-e-jdVm" with no text, no tags, no summary and no thumbnail,
+    # which the pipeline marks `skipped` and the reader reports as "nothing readable to
+    # index". A caption is the whole memory for most posts, so the free option was not a
+    # cheaper memory, it was an empty one. Off restores the link-only behaviour exactly.
+    INSTAGRAM_SCRAPE_POSTS: bool = True
+    # A carousel is N pictures and the words are inside them.
+    #
+    # Measured on a real save (`/p/Dc0V-e-jdVm`, 2026-09-18): `type: "Sidecar"`, 14
+    # slides, every child's `alt` the same generated boilerplate -- "Photo by <name> on
+    # September 03, 2026." -- repeated fourteen times. So the actor hands back pictures
+    # and no text for them, while the caption itself said "in this carousel I've shared
+    # 80+ trusted job platforms". Those platform names exist only as pixels.
+    #
+    # `INSTAGRAM_SLIDE_MAX` caps how many slides are kept and mirrored at all; Instagram
+    # allows 20 and a cap keeps one post from writing twenty objects.
+    INSTAGRAM_SLIDE_MAX: int = 20
+    # How many of those are read by the vision model, which is the only way their text
+    # reaches search. One call per slide, so this is the per-carousel bill -- and it is
+    # separate from the cap above on purpose: the pictures are cheap to keep and the
+    # reading is what costs. 0 turns reading off and leaves the slides as pictures.
+    INSTAGRAM_SLIDE_VISION_MAX: int = 10
+    # How many slides are read at once, and for how long in total.
+    #
+    # These exist because the first version read them one at a time "so a provider rate
+    # limit halfway through would not cost the whole batch" -- and then the whole batch
+    # was lost anyway, to `SoftTimeLimitExceeded`: ten serial calls at 7-12s each do not
+    # fit inside `CELERY_TASK_TIME_LIMIT` (300s, soft 270s) alongside a scrape, fourteen
+    # image copies and the enrichment that follows. Politeness to the provider was paid
+    # for with a task that died holding everything it had read.
+    #
+    # Concurrency turns 10 serial calls into about three rounds. The deadline is the
+    # backstop: past it the reader stops scheduling and keeps what it has, because some
+    # slides read is worth more than a task killed mid-batch. It is well under the soft
+    # limit on purpose -- what follows still has to summarise, tag, label and embed.
+    INSTAGRAM_SLIDE_READ_CONCURRENCY: int = 4
+    INSTAGRAM_SLIDE_READ_SECONDS: int = 120
     # Kept under the worker's job_timeout (120s) so a slow scrape fails as a scrape rather
     # than as an opaque job timeout.
     APIFY_TIMEOUT_SECONDS: float = 90.0

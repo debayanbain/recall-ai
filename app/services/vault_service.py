@@ -90,12 +90,18 @@ class VaultService:
             )
             return existing, False
 
+        metadata = dict(extra_metadata or {})
+        if title:
+            # Provenance, so a later extraction knows what it may overwrite. A title a
+            # person typed is theirs; one the pipeline wrote is a placeholder until a
+            # better extraction exists -- see `ProcessingService._apply`.
+            metadata["title_source"] = "user"
         item = VaultItem(
             user_id=user_id,
             type=ContentType.article,  # refined by worker via extractor detection
             source_url=canonical,
             title=title,
-            item_metadata=dict(extra_metadata or {}),
+            item_metadata=metadata,
             processing_status=ProcessingStatus.pending,
         )
         item = await self.repo.add(item)
