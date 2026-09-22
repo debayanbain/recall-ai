@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: recall-worker
+  namespace: recallai
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels: { app: recall-worker }
+  template:
+    metadata:
+      labels: { app: recall-worker }
+    spec:
+      imagePullSecrets:
+        - name: ecr-pull
+      terminationGracePeriodSeconds: 60
+      containers:
+        - name: worker
+          image: 179793764711.dkr.ecr.ap-south-1.amazonaws.com/recallai-api:__TAG__
+          command: ["celery", "-A", "app.queue.celery_app.celery_app", "worker",
+                    "-B", "--schedule=/tmp/celerybeat-schedule",
+                    "--concurrency=1", "--loglevel=info"]
+          envFrom:
+            - secretRef: { name: recallai-env }
+          resources:
+            requests: { memory: "256Mi", cpu: "100m" }
+            limits:   { memory: "450Mi" }

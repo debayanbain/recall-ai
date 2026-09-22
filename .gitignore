@@ -28,3 +28,4 @@ files/
 
 # Dev log folder written by app/core/log_sink.py (ENV=dev only).
 logs/
+.envrc.local

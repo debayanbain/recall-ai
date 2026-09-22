@@ -24,6 +24,9 @@ def _settings(**overrides: object) -> Settings:
         "SECRET_KEY": STRONG_KEY,
         "COOKIE_SECURE": True,
         "CORS_ORIGINS": SAFE_ORIGINS,
+        # A deployed environment must ask for TLS; the default URL is a local socket.
+        # The guard for that setting is pinned in tests/core/test_database_url.py.
+        "DATABASE_URL": "postgresql://u:pw@db.recallai.example/recall?sslmode=require",
     }
     base.update(overrides)
     return Settings(_env_file=None, **base)  # type: ignore[arg-type]
@@ -199,3 +202,75 @@ def test_the_guard_never_prints_the_secret() -> None:
         )
     assert secret not in str(exc.value)
     assert _BOT["TELEGRAM_BOT_TOKEN"] not in str(exc.value)
+
+
+# --- Object storage ---------------------------------------------------------------
+#
+# Two valid shapes. AWS: bucket + region, no endpoint, no keys -- the instance role
+# answers. Backblaze: bucket + region + endpoint + both keys. Everything in between is
+# a deploy that meant to have a bucket and would find out at the first upload.
+
+_AWS = {"B2_BUCKET": "recallai-uploads-test", "B2_REGION": "ap-south-1"}
+_B2 = {
+    "B2_BUCKET": "recall-test",
+    "B2_REGION": "us-west-004",
+    "B2_ENDPOINT_URL": "https://s3.us-west-004.backblazeb2.com",
+    "B2_KEY_ID": "004stand-in-key-id",
+    "B2_APPLICATION_KEY": "K004stand-in-application-key",
+}
+
+
+def test_storage_is_off_and_boots_when_nothing_is_set() -> None:
+    assert _check(ENV="prod").storage_enabled is False
+
+
+def test_an_unset_endpoint_means_aws_not_backblaze() -> None:
+    """The default must not carry a Backblaze URL: a deploy that drops the line would
+    silently be a keyless Backblaze client, and uploads would be off."""
+    assert _settings().B2_ENDPOINT_URL == ""
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_aws_mode_needs_only_a_bucket_and_a_region(env: str) -> None:
+    assert _check(ENV=env, **_AWS).storage_enabled is True
+
+
+def test_aws_mode_with_static_keys_is_allowed() -> None:
+    keys = {k: _B2[k] for k in ("B2_KEY_ID", "B2_APPLICATION_KEY")}
+    assert _check(**_AWS, **keys).storage_enabled is True
+
+
+def test_backblaze_mode_boots_with_endpoint_and_both_keys() -> None:
+    assert _check(ENV="prod", **_B2).storage_enabled is True
+
+
+@pytest.mark.parametrize("missing", ["B2_KEY_ID", "B2_APPLICATION_KEY"])
+@pytest.mark.parametrize("base", [_AWS, _B2], ids=["aws", "backblaze"])
+def test_half_a_key_pair_is_refused(base: dict[str, str], missing: str) -> None:
+    keys = {"B2_KEY_ID": _B2["B2_KEY_ID"], "B2_APPLICATION_KEY": _B2["B2_APPLICATION_KEY"]}
+    config = {**base, **keys, missing: ""}
+    with pytest.raises(RuntimeError, match=missing):
+        _check(ENV="dev", **config)
+    assert _settings(**config).storage_enabled is False
+
+
+def test_an_endpoint_without_keys_is_refused() -> None:
+    with pytest.raises(RuntimeError, match="B2_ENDPOINT_URL is set"):
+        _check(**_AWS, B2_ENDPOINT_URL=_B2["B2_ENDPOINT_URL"])
+    assert _settings(**_AWS, B2_ENDPOINT_URL=_B2["B2_ENDPOINT_URL"]).storage_enabled is False
+
+
+def test_a_bucket_without_a_region_is_refused() -> None:
+    with pytest.raises(RuntimeError, match="B2_REGION"):
+        _check(B2_BUCKET="recallai-uploads-test")
+
+
+def test_keys_without_a_bucket_are_refused() -> None:
+    with pytest.raises(RuntimeError, match="B2_BUCKET"):
+        _check(B2_KEY_ID=_B2["B2_KEY_ID"], B2_APPLICATION_KEY=_B2["B2_APPLICATION_KEY"])
+
+
+def test_the_storage_guard_never_prints_a_key() -> None:
+    with pytest.raises(RuntimeError) as exc:
+        _check(**_AWS, B2_APPLICATION_KEY=_B2["B2_APPLICATION_KEY"])
+    assert _B2["B2_APPLICATION_KEY"] not in str(exc.value)

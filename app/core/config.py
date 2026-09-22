@@ -631,16 +631,25 @@ class Settings(BaseSettings):
     GEMINI_EMBED_MODEL: str = "text-embedding-004"
     EMBEDDING_DIM: int = 1536
 
-    # --- Storage (Backblaze B2, S3-compatible) ---
+    # --- Storage (S3 API: AWS S3, or Backblaze B2 through its S3-compatible endpoint) ---
     # The bucket is PRIVATE. There is no public-URL setting on purpose: downloads are
     # short-lived presigned GETs minted per request, after the row's owner is checked.
-    # Endpoint and region come from the bucket page in the B2 console and must match --
-    # the region is the `004` in `s3.us-west-004.backblazeb2.com`.
-    B2_ENDPOINT_URL: str = "https://s3.us-west-004.backblazeb2.com"
-    B2_REGION: str = "us-west-004"
+    # The names say B2 for history; the mode is decided by the endpoint:
+    #   * AWS S3 -- endpoint EMPTY, keys EMPTY. boto3 is handed None and walks its
+    #     default credential chain, which on the EC2/k3s node is the instance role via
+    #     IMDS: short-lived keys that rotate themselves, and none stored anywhere.
+    #   * Backblaze -- endpoint AND both keys set. Endpoint and region come from the
+    #     bucket page in the B2 console and must match -- the region is the `004` in
+    #     `s3.us-west-004.backblazeb2.com`.
+    # Both default to empty so that an unset endpoint can only ever mean AWS: a
+    # Backblaze default here comes back the moment a deploy drops the line, and then a
+    # keyless pod is silently a pod whose uploads are off.
+    B2_ENDPOINT_URL: str = ""
+    B2_REGION: str = ""
     B2_BUCKET: str = ""
-    # An *application key* scoped to this one bucket, never the master key: the master
-    # key can create and delete buckets, and it cannot be scoped or rotated per service.
+    # Backblaze: an *application key* scoped to this one bucket, never the master key --
+    # it can create and delete buckets, and it cannot be scoped or rotated per service.
+    # AWS: leave both unset and let the instance role answer.
     B2_KEY_ID: str = ""
     B2_APPLICATION_KEY: str = ""
     # Hard ceiling on one upload. Enforced by reading one byte past it, not by trusting
@@ -733,17 +742,20 @@ class Settings(BaseSettings):
 
     @property
     def storage_enabled(self) -> bool:
-        """True only when every B2 credential is present.
+        """True when a bucket is named and its credentials are complete for its mode.
 
-        All-or-nothing: a half-configured bucket would fail at upload time with a provider
-        error instead of the API simply reporting that uploads are unavailable.
+        A custom endpoint (Backblaze) needs both keys; no endpoint (AWS S3) needs either
+        both keys or neither, the latter meaning the default credential chain. Anything
+        in between would fail at upload time with a provider error instead of the API
+        simply reporting that uploads are unavailable -- and `validate_deployment_config`
+        refuses it at boot, so off here is a second line rather than the only one.
         """
-        return bool(
-            self.B2_BUCKET
-            and self.B2_KEY_ID
-            and self.B2_APPLICATION_KEY
-            and self.B2_ENDPOINT_URL
-        )
+        if not (self.B2_BUCKET and self.B2_REGION):
+            return False
+        has_keys = bool(self.B2_KEY_ID and self.B2_APPLICATION_KEY)
+        if self.B2_ENDPOINT_URL:
+            return has_keys
+        return has_keys or not (self.B2_KEY_ID or self.B2_APPLICATION_KEY)
 
     @property
     def transcription_enabled(self) -> bool:
@@ -808,7 +820,37 @@ class Settings(BaseSettings):
 
     @property
     def database_url_str(self) -> str:
-        return str(self.DATABASE_URL)
+        """The URL every connection is opened with -- API, worker and Alembic alike.
+
+        Normalised in ONE place so those three cannot drift, because what a managed
+        provider hands you is a *libpq* URL that this stack cannot use as it is written:
+
+          * `postgresql://` names the psycopg2 dialect, and psycopg2 is not installed.
+            SQLAlchemy resolves the driver from the URL, not from what the engine is
+            being built for, so a plain scheme fails with `ModuleNotFoundError:
+            psycopg2` -- in `create_async_engine` and in `alembic upgrade` equally.
+          * `sslmode` and `channel_binding` are libpq spellings. Every query parameter
+            is passed through to `asyncpg.connect()`, which has neither keyword and
+            raises `TypeError`. asyncpg's own name is `ssl` and it takes the same modes,
+            so the rename preserves what was asked for; channel binding has no asyncpg
+            equivalent and is dropped.
+
+        TLS is translated, never invented here: a URL that named a mode keeps it, and
+        one that named none is left alone rather than being guessed at from its host --
+        `validate_deployment_config` is where a deployed environment is made to say so.
+        """
+        from sqlalchemy.engine.url import make_url
+
+        url = make_url(str(self.DATABASE_URL))
+        if url.drivername in ("postgresql", "postgres"):
+            url = url.set(drivername="postgresql+asyncpg")
+
+        query = dict(url.query)
+        sslmode = query.pop("sslmode", None)
+        query.pop("channel_binding", None)
+        if sslmode and "ssl" not in query:
+            query["ssl"] = sslmode
+        return url.set(query=query).render_as_string(hide_password=False)
 
     @property
     def redis_url_str(self) -> str:
@@ -896,18 +938,10 @@ def validate_deployment_config(config: Settings) -> None:
         )
 
     # Partial storage config is refused rather than silently disabling uploads: a deploy
-    # that sets two of the three values means to have a bucket, and finding out at the
-    # first user upload is worse than finding out at boot.
-    b2_values = (config.B2_BUCKET, config.B2_KEY_ID, config.B2_APPLICATION_KEY)
-    if any(b2_values) and not all(b2_values):
-        missing = [
-            name
-            for name, value in zip(
-                ("B2_BUCKET", "B2_KEY_ID", "B2_APPLICATION_KEY"), b2_values, strict=True
-            )
-            if not value
-        ]
-        raise RuntimeError(f"Backblaze storage is partly configured; missing: {missing}")
+    # that sets some of these means to have a bucket, and finding out at the first user
+    # upload is worse than finding out at boot. A bucket with no endpoint and no keys is
+    # NOT partial -- it is AWS S3 on the instance role, see the settings above.
+    _validate_storage_config(config)
 
     # Same reasoning for the bot: setting the token means intending to run it, and a
     # missing username or webhook secret only surfaces when a user taps a dead link.
@@ -934,6 +968,21 @@ def validate_deployment_config(config: Settings) -> None:
 
     if config.ENV == "dev":
         return
+    # The database is across a network here, carrying every row the product has, so TLS
+    # is required rather than left to the driver. asyncpg's default is `prefer`, which
+    # negotiates TLS and falls back to PLAINTEXT without saying so -- a downgrade nobody
+    # would notice. `require` is what a provider's own copy-paste URL already carries
+    # (`?sslmode=require`), and it is translated by `database_url_str`. The URL itself is
+    # never interpolated into the error: it contains the password.
+    from sqlalchemy.engine.url import make_url
+
+    ssl_mode = make_url(config.database_url_str).query.get("ssl")
+    if ssl_mode not in ("require", "verify-ca", "verify-full"):
+        raise RuntimeError(
+            f"DATABASE_URL must request TLS when ENV={config.ENV}: add ?sslmode=require "
+            "(or verify-ca / verify-full) to it. asyncpg's default silently falls back "
+            "to an unencrypted connection."
+        )
     # The webhook path segment is the only thing standing between the public internet
     # and a queue producer, so it gets the same length floor as SECRET_KEY. Never print
     # the value itself -- this function exists so secrets stay out of crash logs.
@@ -1028,6 +1077,39 @@ def validate_deployment_config(config: Settings) -> None:
             raise RuntimeError(
                 f"CORS_ORIGINS must be https and non-local in prod; rejected: {unsafe}"
             )
+
+
+def _validate_storage_config(config: Settings) -> None:
+    """Refuse every storage combination that is neither AWS mode nor Backblaze mode.
+
+    Only setting NAMES are ever interpolated, never values -- two of them are secrets.
+    """
+    key_names = ("B2_KEY_ID", "B2_APPLICATION_KEY")
+    keys = (config.B2_KEY_ID, config.B2_APPLICATION_KEY)
+
+    # Half a key pair is always a mistake. Without this, a missing secret in AWS mode
+    # would be read as "no keys" and quietly fall through to whatever the credential
+    # chain finds -- a different identity from the one the operator wrote down.
+    if any(keys) and not all(keys):
+        missing = [name for name, value in zip(key_names, keys, strict=True) if not value]
+        raise RuntimeError(f"Storage is partly configured; missing: {missing}")
+    if all(keys) and not config.B2_BUCKET:
+        raise RuntimeError("Storage is partly configured; missing: ['B2_BUCKET']")
+    if not config.B2_BUCKET:
+        return
+
+    # boto3 builds the endpoint and the SigV4 scope from the region; an empty one fails
+    # on the first upload, and AWS regions such as ap-south-1 accept nothing but SigV4.
+    if not config.B2_REGION:
+        raise RuntimeError("Storage is partly configured; missing: ['B2_REGION']")
+    # A custom endpoint is not AWS, so the instance role means nothing to it: handing it
+    # the default chain signs Backblaze requests with AWS keys, rejected one upload at
+    # a time.
+    if config.B2_ENDPOINT_URL and not all(keys):
+        raise RuntimeError(
+            "B2_ENDPOINT_URL is set, so B2_KEY_ID and B2_APPLICATION_KEY are required. "
+            "Leave all three empty to use AWS S3 with the instance role."
+        )
 
 
 @lru_cache

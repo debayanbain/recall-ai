@@ -1,4 +1,7 @@
-"""Backblaze B2 object storage over the S3-compatible API.
+"""Object storage over the S3 API: AWS S3, or Backblaze B2's S3-compatible endpoint.
+
+The module keeps its B2 name from when Backblaze was the only backend; which one it talks
+to is decided by `settings.B2_ENDPOINT_URL` (empty means AWS -- see `_client`).
 
 The bucket is **private**. Nothing is ever served from a public URL: a download is a
 short-lived presigned GET, minted per request only after the caller's ownership of the
@@ -31,17 +34,24 @@ def _client() -> Any:
     import boto3
     from botocore.config import Config
 
+    custom_endpoint = bool(settings.B2_ENDPOINT_URL)
     return boto3.client(
         "s3",
-        endpoint_url=settings.B2_ENDPOINT_URL,
-        aws_access_key_id=settings.B2_KEY_ID,
-        aws_secret_access_key=settings.B2_APPLICATION_KEY,
+        # `or None`, never the empty string. None tells boto3 "not given": no endpoint
+        # means real AWS S3 for the region, and no keys means the default credential
+        # chain -- on the node, the instance role through IMDS, refreshed by boto3 before
+        # it expires. An empty string is a *value*: "" as an access key is sent, and
+        # answered with InvalidAccessKeyId.
+        endpoint_url=settings.B2_ENDPOINT_URL or None,
+        aws_access_key_id=settings.B2_KEY_ID or None,
+        aws_secret_access_key=settings.B2_APPLICATION_KEY or None,
         region_name=settings.B2_REGION,
-        # B2 speaks SigV4 only, and virtual-host addressing needs the bucket in the
-        # hostname; path style is what its documented S3 endpoint expects.
+        # SigV4 only: B2 speaks nothing else, and neither does ap-south-1. Addressing
+        # differs by mode -- B2's documented S3 endpoint expects path style; AWS's
+        # recommended form puts the bucket in the hostname (virtual-hosted style).
         config=Config(
             signature_version="s3v4",
-            s3={"addressing_style": "path"},
+            s3={"addressing_style": "path" if custom_endpoint else "virtual"},
             retries={"max_attempts": 3, "mode": "standard"},
             connect_timeout=10,
             read_timeout=60,
@@ -67,7 +77,7 @@ def _content_disposition(filename: str) -> str:
 
 
 class B2Storage:
-    """`ObjectStorage` implementation for Backblaze B2."""
+    """`ObjectStorage` implementation for any S3-API bucket (AWS S3 or Backblaze B2)."""
 
     def __init__(self) -> None:
         self.bucket = settings.B2_BUCKET

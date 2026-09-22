@@ -265,6 +265,17 @@ catch-all and must stay last, so new extractors get appended *before* it.
   Editing `.env` needs an API restart, not a `--reload` (the reloader watches `.py` only, and
   `settings` is `lru_cache`d at import). `settings` is an `lru_cache`d singleton imported at module scope, so
   changing env vars mid-test has no effect.
+- **`DATABASE_URL` is normalised by `database_url_str`, and that is the only URL anything
+  connects with** — API, worker and `migrations/env.py` alike, which is why the rewrite
+  lives on the setting rather than beside one engine. A provider's copy-paste URL is
+  *libpq*: `postgresql://` selects psycopg2, which is not installed (SQLAlchemy resolves
+  the driver from the URL, not from `create_async_engine`), and `sslmode` /
+  `channel_binding` are passed through to `asyncpg.connect()`, which has neither keyword.
+  So the scheme becomes `postgresql+asyncpg`, `sslmode` is renamed to asyncpg's `ssl`
+  (same modes, so the mode itself survives) and `channel_binding` is dropped. TLS is
+  translated, **never invented from the host** — instead, outside dev the boot guard
+  refuses a URL that did not ask for it, because asyncpg's default `prefer` falls back to
+  plaintext silently. Nothing may interpolate the URL into an error: it holds the password.
 - **Tenant scoping lives in the repository.** `VaultRepository.get()` takes a `user_id` and returns
   `None` on mismatch; `get_unscoped()` deliberately skips that check and exists *only* for the
   worker, which has no request user. Never reach for `get_unscoped` in an API path.
@@ -785,6 +796,13 @@ catch-all and must stay last, so new extractors get appended *before* it.
   signed URL is the only way in and it is minted per request. `storage_key` is never
   serialized to the browser. `get_storage()` returns None when the bucket is unconfigured
   and uploads degrade to text-only rather than the API failing to boot.
+  **The same client speaks AWS S3 too, and the endpoint picks which.** `B2_ENDPOINT_URL`
+  empty (the default) means AWS: with no keys, `storage/b2.py` hands boto3 `None` and it
+  finds the node's instance role through IMDS. Keep the `or None` -- an empty string is
+  sent as a key and rejected with `InvalidAccessKeyId`. Backblaze needs the endpoint *and*
+  both keys; `_validate_storage_config` refuses every shape in between at boot. Role
+  credentials are short-lived, so a presigned URL can die before its TTL -- harmless for
+  a download minted on the click, not for a 6h thumbnail link.
 - **A card's picture is copied into our bucket; the scraped URL is not kept as the
   answer.** An `og:image` from Instagram or Facebook is a *signed* fbcdn/cdninstagram
   URL with an expiry measured in days -- measured 2026-09-13, eleven of twelve stored

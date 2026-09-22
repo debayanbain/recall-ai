@@ -444,3 +444,65 @@ async def test_delete_falls_back_to_a_plain_delete_when_unversioned(
     await b2.B2Storage().delete("users/u/i/a.png")
 
     assert deleted == [("users/u/i/a.png", None)]
+
+
+# --- Which S3 the client talks to -------------------------------------------------
+
+
+def _client_kwargs(monkeypatch: pytest.MonkeyPatch, **overrides: str) -> dict[str, Any]:
+    """Build the real `_client()` against explicit settings and capture what boto3 got."""
+    import boto3
+
+    from app.core.config import Settings
+    from app.storage import b2
+
+    captured: dict[str, Any] = {}
+
+    def _fake_client(service: str, **kwargs: Any) -> object:
+        captured.update(kwargs, service=service)
+        return object()
+
+    config = Settings(_env_file=None, **overrides)  # type: ignore[arg-type]
+    monkeypatch.setattr(b2, "settings", config)
+    monkeypatch.setattr(boto3, "client", _fake_client)
+    b2._client.cache_clear()
+    try:
+        b2._client()
+    finally:
+        b2._client.cache_clear()
+    return captured
+
+
+def test_aws_mode_hands_boto3_none_so_the_instance_role_is_used(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """None, not "": boto3 sends an empty key as a key and gets InvalidAccessKeyId,
+    where None makes it walk the default chain to the node's instance role."""
+    kwargs = _client_kwargs(monkeypatch, B2_BUCKET="uploads", B2_REGION="ap-south-1")
+
+    assert kwargs["service"] == "s3"
+    assert kwargs["endpoint_url"] is None
+    assert kwargs["aws_access_key_id"] is None
+    assert kwargs["aws_secret_access_key"] is None
+    assert kwargs["region_name"] == "ap-south-1"
+    assert kwargs["config"].signature_version == "s3v4"
+    assert kwargs["config"].s3 == {"addressing_style": "virtual"}
+
+
+def test_backblaze_mode_passes_its_endpoint_and_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    kwargs = _client_kwargs(
+        monkeypatch,
+        B2_BUCKET="recall",
+        B2_REGION="us-west-004",
+        B2_ENDPOINT_URL="https://s3.us-west-004.backblazeb2.com",
+        B2_KEY_ID="key-id",
+        B2_APPLICATION_KEY="app-key",
+    )
+
+    assert kwargs["endpoint_url"] == "https://s3.us-west-004.backblazeb2.com"
+    assert kwargs["aws_access_key_id"] == "key-id"
+    assert kwargs["aws_secret_access_key"] == "app-key"
+    assert kwargs["config"].signature_version == "s3v4"
+    assert kwargs["config"].s3 == {"addressing_style": "path"}
