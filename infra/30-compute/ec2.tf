@@ -34,7 +34,8 @@ resource "aws_instance" "node" {
     # Canonical publishes a new Ubuntu AMI every few weeks.
     # Without this line, the next `terraform plan` after a new AMI
     # would want to DESTROY and REBUILD your server.
-    ignore_changes = [ami]
+    ignore_changes  = [ami]
+    prevent_destroy = true
   }
 
   tags = {

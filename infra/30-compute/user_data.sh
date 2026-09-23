@@ -54,4 +54,52 @@ chown -R ubuntu:ubuntu /home/ubuntu/.kube
 chmod 600 /home/ubuntu/.kube/config
 echo 'export KUBECONFIG=/home/ubuntu/.kube/config' >> /home/ubuntu/.bashrc
 
+
+# ── ECR pull credentials for K3s ────────────────────────────
+# ECR login tokens expire after 12 hours. This timer refreshes the
+# Kubernetes pull secret every 6 hours using the node's IAM role,
+# so no registry password is ever stored on disk.
+cat > /usr/local/bin/ecr-refresh.sh <<'SCRIPT'
+#!/bin/bash
+set -euo pipefail
+REGION=ap-south-1
+REGISTRY="179793764711.dkr.ecr.$REGION.amazonaws.com"
+NS=recallai
+
+k3s kubectl get namespace $NS >/dev/null 2>&1 || k3s kubectl create namespace $NS
+
+TOKEN=$(aws ecr get-login-password --region $REGION)
+
+k3s kubectl create secret docker-registry ecr-pull -n $NS \
+  --docker-server="$REGISTRY" --docker-username=AWS --docker-password="$TOKEN" \
+  --dry-run=client -o yaml | k3s kubectl apply -f -
+
+echo "$(date -Is) ECR pull secret refreshed"
+SCRIPT
+chmod +x /usr/local/bin/ecr-refresh.sh
+
+cat > /etc/systemd/system/ecr-refresh.service <<'UNIT'
+[Unit]
+Description=Refresh ECR pull secret for K3s
+After=k3s.service
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/ecr-refresh.sh
+UNIT
+
+cat > /etc/systemd/system/ecr-refresh.timer <<'UNIT'
+[Unit]
+Description=Run ecr-refresh every 6 hours
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=6h
+Persistent=true
+[Install]
+WantedBy=timers.target
+UNIT
+
+systemctl daemon-reload
+systemctl enable --now ecr-refresh.timer
+systemctl start ecr-refresh.service
+
 echo "=== user-data finished successfully ==="
