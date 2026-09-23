@@ -3,10 +3,20 @@ kind: Ingress
 metadata:
   name: recall-api
   namespace: recallai
+  annotations:
+    # Which issuer asks for the certificate. Staging first, prod after testing.
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    # Send plain HTTP to HTTPS.
+    traefik.ingress.kubernetes.io/router.middlewares: recallai-redirect-https@kubernetescrd
 spec:
   ingressClassName: traefik
+  tls:
+    - hosts:
+        - recall-api.debayanbain.in
+      secretName: recall-api-tls        # cert-manager writes the certificate here
   rules:
-    - http:
+    - host: recall-api.debayanbain.in
+      http:
         paths:
           - path: /api
             pathType: Prefix
@@ -17,3 +27,13 @@ spec:
           - path: /ready
             pathType: Exact
             backend: { service: { name: recall-api, port: { number: 8000 } } }
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: redirect-https
+  namespace: recallai
+spec:
+  redirectScheme:
+    scheme: https
+    permanent: true
