@@ -20,6 +20,21 @@ data "aws_kms_alias" "ssm" {
 }
 
 locals {
+  # "owner/repo", or "owner@id/repo@id" when the account mints immutable-id subjects.
+  repo_claim = (
+    var.github_owner_id != "" && var.github_repo_id != ""
+    ? "${var.github_owner}@${var.github_owner_id}/${var.github_repo}@${var.github_repo_id}"
+    : "${var.github_owner}/${var.github_repo}"
+  )
+
+  # `build` has no environment, so its claim is the ref one; `deploy` names
+  # environment: production, and GitHub then puts THAT in the sub instead of the ref.
+  # Both are needed and neither is a superset of the other.
+  subjects = length(var.allowed_subjects) > 0 ? var.allowed_subjects : [
+    "repo:${local.repo_claim}:ref:refs/heads/${var.github_branch}",
+    "repo:${local.repo_claim}:environment:production",
+  ]
+
   instance_arn = join("", [
     "arn:${data.aws_partition.current.partition}:ec2:${var.region}:",
     "${data.aws_caller_identity.current.account_id}:instance/",

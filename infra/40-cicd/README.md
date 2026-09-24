@@ -27,6 +27,37 @@ Two subjects are listed because a job that names `environment: production` gets
 `repo:owner/repo:environment:production` in the claim instead of the `ref:` one.
 `build` has no environment; `deploy` does.
 
+## When a run cannot assume the role
+
+The action prints ten `Assuming role with OIDC` lines and then one error, and the error
+is not specific enough to act on. CloudTrail is, because it records the claim STS was
+actually handed:
+
+```bash
+aws cloudtrail lookup-events --region ap-south-1 --max-results 1 \
+  --lookup-attributes AttributeKey=EventName,AttributeValue=AssumeRoleWithWebIdentity \
+  --query 'Events[].CloudTrailEvent' --output text | python3 -m json.tool | grep -E 'userName|errorMessage'
+```
+
+`userName` is the `sub` verbatim. Compare it to the trust policy:
+
+```bash
+aws iam get-role --role-name recallai-github-deploy \
+  --query 'Role.AssumeRolePolicyDocument.Statement[0].Condition' --output json
+```
+
+Two failures read almost the same and are not:
+
+| Error | Meaning |
+|---|---|
+| `Request ARN is invalid` | the `AWS_DEPLOY_ROLE_ARN` string is malformed -- a trailing `%` copied out of zsh, a space, a newline |
+| `Not authorized to perform sts:AssumeRoleWithWebIdentity` | the ARN is well-formed; the `sub` or the `aud` does not match |
+
+The second one bit this repository: GitHub mints **immutable-id subjects**, so the claim
+is `repo:owner@91155437/recall-ai@1341938364:ref:refs/heads/main`, not
+`repo:owner/recall-ai:ref:refs/heads/main`. `github_owner_id` and `github_repo_id` are
+what build the long form; set them to `""` for an account still using the short one.
+
 ## What the role deliberately cannot do
 
 Terraform state, IAM, EC2, the uploads bucket, and `/recallai/app/*` — the

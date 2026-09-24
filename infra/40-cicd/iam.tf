@@ -19,11 +19,12 @@ data "aws_iam_policy_document" "trust" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # StringEquals, not StringLike: an exact list, no pattern to get wrong.
+    # StringEquals, not StringLike: an exact list, no pattern to get wrong. It is also
+    # case-sensitive and format-sensitive -- see `local.subjects` and github_owner_id.
     condition {
       test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values   = var.allowed_subjects
+      values   = local.subjects
     }
   }
 }
@@ -33,6 +34,15 @@ resource "aws_iam_role" "deploy" {
   description          = "GitHub Actions: build, push to ECR, roll out on K3s"
   assume_role_policy   = data.aws_iam_policy_document.trust.json
   max_session_duration = 3600
+
+  # The variable's own validation only covers an explicit list; this covers the
+  # derived one too, so no path reaches a trust policy with a wildcard subject.
+  lifecycle {
+    precondition {
+      condition     = alltrue([for s in local.subjects : !strcontains(s, "*")])
+      error_message = "A wildcard subject would let any repository assume this role."
+    }
+  }
 }
 
 # ── What the role may do ───────────────────────────────────
