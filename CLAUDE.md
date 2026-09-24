@@ -1690,6 +1690,25 @@ app/services/telegram/confirm.py                      what a tapped button does
   address became a permanent entry and the limiter was a slow memory leak reachable from
   the internet by rotating IPs. Still keyed by client IP, still exempting
   `/api/v1/webhooks/`, still failing open.
+  **Health probes are exempt too, and that one was paid for in production.** Every
+  kubelet liveness and readiness probe in the cluster arrives from the pod network's
+  bridge (`10.42.0.1`), so all of them share a single limiter key -- and the platform's
+  answer to a 429 on `/health` is to restart the container, which presents as an
+  application that keeps crashing rather than as a rate limit. The first fix was raising
+  `RATE_LIMIT_PER_MINUTE` to 600, which bought the probes headroom by handing the same
+  headroom to every real client; it is back to 60. Two independent exemptions replace it:
+  the two probe **paths** (`_PROBE_PATHS`, not configurable -- they are this app's own
+  routes, and a probe path that has to be configured is one that is eventually configured
+  wrong) and any client inside `RATE_LIMIT_EXEMPT_CIDRS`, the pod network by default,
+  refused at boot in every environment if it does not parse.
+  **The address it trusts is `request.client.host`, never a header.** That is the socket
+  peer unless uvicorn's `--proxy-headers` rewrote it, and uvicorn rewrites it only for
+  peers already inside `--forwarded-allow-ips`, taking the right-most `X-Forwarded-For`
+  entry that is not itself trusted -- so a request from the internet claiming
+  `X-Forwarded-For: 10.42.0.1` is still counted under its own address.
+  **`--forwarded-allow-ips=*` would turn this exemption into a bypass anyone can type**,
+  because uvicorn then takes the header's first entry verbatim; the Deployment pins the
+  pod CIDR for exactly that reason.
   **Consequence for tests:** a live developer Redis now makes this count across tests, so
   `tests/conftest.py`'s autouse `_no_shared_redis_state` stubs it -- without that, the
   sixty-first request in a suite run starts answering 429 to assertions about 401s.

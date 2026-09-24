@@ -274,3 +274,32 @@ def test_the_storage_guard_never_prints_a_key() -> None:
     with pytest.raises(RuntimeError) as exc:
         _check(**_AWS, B2_APPLICATION_KEY=_B2["B2_APPLICATION_KEY"])
     assert _B2["B2_APPLICATION_KEY"] not in str(exc.value)
+
+
+# ── RATE_LIMIT_EXEMPT_CIDRS ──────────────────────────────────────────────────────
+# Checked in every environment, like LOG_RETENTION_DAYS and ENRICHMENT_LANGUAGE: the
+# value is parsed by the middleware at startup, so an unparseable entry has no good
+# failure mode later -- it either raises inside the first request that reaches the
+# limiter, or, if the parse were written to shrug it off, silently counts the health
+# probes again with nothing anywhere naming the setting responsible.
+
+
+@pytest.mark.parametrize("env", ["dev", "staging", "prod"])
+def test_every_env_rejects_an_unparseable_exempt_cidr(env: str) -> None:
+    with pytest.raises(RuntimeError, match="RATE_LIMIT_EXEMPT_CIDRS"):
+        _check(ENV=env, RATE_LIMIT_EXEMPT_CIDRS=["10.42.0.0/16", "not-a-network"])
+
+
+@pytest.mark.parametrize("env", ["dev", "staging", "prod"])
+def test_a_bare_address_is_accepted_as_a_single_host(env: str) -> None:
+    """`strict=False`, so "10.42.0.1" means that one address rather than an error."""
+    assert _check(ENV=env, RATE_LIMIT_EXEMPT_CIDRS=["10.42.0.1"]).RATE_LIMIT_EXEMPT_CIDRS
+
+
+def test_the_default_is_the_k3s_pod_network() -> None:
+    """The deployed cluster's bridge. Changing this is changing where probes come from."""
+    assert _check().RATE_LIMIT_EXEMPT_CIDRS == ["10.42.0.0/16"]
+
+
+def test_the_exemption_can_be_turned_off_entirely() -> None:
+    assert _check(RATE_LIMIT_EXEMPT_CIDRS=[]).RATE_LIMIT_EXEMPT_CIDRS == []

@@ -5,6 +5,7 @@ Single source of truth for settings. Never read os.environ elsewhere.
 from __future__ import annotations
 
 from functools import lru_cache
+from ipaddress import ip_network
 from typing import Literal
 
 from pydantic import Field, PostgresDsn, RedisDsn
@@ -715,6 +716,25 @@ class Settings(BaseSettings):
 
     # --- Rate limiting ---
     RATE_LIMIT_PER_MINUTE: int = 60
+    # Client addresses the per-IP cap does not count, as CIDR blocks. The default is
+    # K3s's pod network, and it is here because the cap and the platform's health
+    # checks disagree about what "a client" is: kubelet's liveness and readiness
+    # probes arrive from the cluster bridge, so every probe of every pod collapses
+    # onto ONE limiter key. That is a standing spend against the cap that grows with
+    # the number of pods, and the platform's response to a 429 on /health is to
+    # restart the container -- so the limiter presents as an app that keeps crashing.
+    # Raising RATE_LIMIT_PER_MINUTE was the first workaround and it bought the probes
+    # headroom by handing the same headroom to every real client.
+    #
+    # Keying this on `request.client.host` is only safe because that value is the
+    # socket peer unless uvicorn's --proxy-headers rewrote it, and uvicorn rewrites it
+    # only for peers inside --forwarded-allow-ips, taking the right-most address in
+    # X-Forwarded-For that is not itself trusted. A request from the internet carrying
+    # "X-Forwarded-For: 10.42.0.1" therefore still arrives as its own address. Setting
+    # --forwarded-allow-ips to "*" breaks exactly that: uvicorn then takes the header's
+    # first entry verbatim and this exemption becomes a bypass anyone can type.
+    # Empty disables the exemption entirely.
+    RATE_LIMIT_EXEMPT_CIDRS: list[str] = Field(default_factory=lambda: ["10.42.0.0/16"])
 
     # --- Centralized log files (development only) ---
     # In dev every structlog event from the API, the worker and beat is appended as a
@@ -886,6 +906,19 @@ def validate_deployment_config(config: Settings) -> None:
         raise RuntimeError(
             f"TRASH_PURGE_BATCH must be >= 1 (got {config.TRASH_PURGE_BATCH})."
         )
+
+    # Every environment. An unparseable CIDR here has no good failure mode later: the
+    # middleware would either raise on the first request that reaches it, or -- if it
+    # were written to shrug the entry off -- silently count the probes again, with
+    # nothing anywhere naming the setting responsible. Refused at boot instead.
+    for cidr in config.RATE_LIMIT_EXEMPT_CIDRS:
+        try:
+            ip_network(cidr, strict=False)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"RATE_LIMIT_EXEMPT_CIDRS contains an invalid network: {cidr!r}. "
+                'Use CIDR notation, e.g. ["10.42.0.0/16"].'
+            ) from exc
 
     # Also every environment. This value is interpolated into the enrichment prompts, so
     # an unrecognised one is not a setting that does nothing -- it is a sentence telling

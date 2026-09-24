@@ -3,11 +3,14 @@ from __future__ import annotations
 
 import time
 import uuid
+from collections.abc import Iterable
+from ipaddress import ip_address, ip_network
 
 import structlog
 from fastapi import Request, Response
 from fastapi.responses import JSONResponse
 from starlette.middleware.base import BaseHTTPMiddleware, RequestResponseEndpoint
+from starlette.types import ASGIApp
 
 from app.core import rate_limit
 from app.core.config import settings
@@ -18,6 +21,11 @@ log = get_logger("http")
 # Secret-gated provider callbacks, exempt from the IP rate limiter. See
 # RateLimitMiddleware.
 _WEBHOOK_PREFIX = f"{settings.API_V1_PREFIX}/webhooks/"
+
+# The platform's liveness and readiness probes (app/api/health.py). Not a setting:
+# these are this application's own routes, so a deployment cannot move them, and a
+# probe path that has to be configured is one that is eventually configured wrong.
+_PROBE_PATHS = frozenset({"/health", "/ready"})
 
 
 class RequestContextMiddleware(BaseHTTPMiddleware):
@@ -85,18 +93,58 @@ class RateLimitMiddleware(BaseHTTPMiddleware):
     turns the limit into a self-amplifying backlog. Those endpoints are gated by a shared
     secret instead, and the real per-user limit lives in the worker where the sender is
     actually known.
+
+    **Health probes are exempt for the same shape of reason, and it is not a courtesy.**
+    Every kubelet probe in the cluster arrives from one address, so they share a single
+    limiter key; the platform answers a 429 on /health by restarting the container, which
+    makes the limiter look like an application that keeps crashing. Two independent
+    exemptions cover it -- the two probe *paths*, and any client inside
+    `RATE_LIMIT_EXEMPT_CIDRS` (the pod network by default, so a sidecar or an in-cluster
+    caller is not throttled either). Both, rather than one: a probe reaching a pod from
+    somewhere unforeseen still must not restart it, and an in-cluster client asking for
+    something other than /health is not the traffic this cap was written for.
+
+    The address is `request.client.host`, which is the socket peer unless uvicorn's
+    --proxy-headers rewrote it -- and uvicorn only does that for peers already inside
+    --forwarded-allow-ips, using the right-most X-Forwarded-For entry that is not itself
+    trusted. A request from the internet claiming `X-Forwarded-For: 10.42.0.1` is
+    therefore still counted under its own address. See RATE_LIMIT_EXEMPT_CIDRS for the
+    one deployment flag that would break that.
     """
 
     #: Seconds. The window this cap has always used; named rather than inlined because it
     #: is also the `Retry-After` the client is told to wait.
     WINDOW = 60
 
+    def __init__(
+        self, app: ASGIApp, exempt_cidrs: Iterable[str] | None = None
+    ) -> None:
+        super().__init__(app)
+        # Parsed once, at startup. Per request this is a handful of integer comparisons
+        # rather than a parse, and a malformed entry is refused at boot by
+        # `validate_deployment_config` before it can raise inside a request.
+        raw = settings.RATE_LIMIT_EXEMPT_CIDRS if exempt_cidrs is None else exempt_cidrs
+        self._exempt_networks = tuple(ip_network(cidr, strict=False) for cidr in raw)
+
+    def _is_exempt_client(self, host: str) -> bool:
+        if not self._exempt_networks:
+            return False
+        try:
+            address = ip_address(host)
+        except ValueError:
+            # "anon", or a unix socket peer. Not an address, so not in any network.
+            return False
+        return any(address in network for network in self._exempt_networks)
+
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
     ) -> Response:
-        if request.url.path.startswith(_WEBHOOK_PREFIX):
+        path = request.url.path
+        if path.startswith(_WEBHOOK_PREFIX) or path in _PROBE_PATHS:
             return await call_next(request)
         client = request.client.host if request.client else "anon"
+        if self._is_exempt_client(client):
+            return await call_next(request)
         if not await rate_limit.consume(
             "ip", client, settings.RATE_LIMIT_PER_MINUTE, window=self.WINDOW
         ):

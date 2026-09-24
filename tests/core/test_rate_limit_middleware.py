@@ -30,9 +30,15 @@ from app.core.middleware import RateLimitMiddleware
 _REAL_CONSUME = rate_limit.consume
 
 
-def _app() -> FastAPI:
+#: What the platform's probes arrive as on K3s: the cluster bridge, not the pod.
+POD_NETWORK_CLIENT = "10.42.0.1"
+#: An ordinary internet client, from the documentation range.
+INTERNET_CLIENT = "203.0.113.9"
+
+
+def _app(exempt_cidrs: list[str] | None = None) -> FastAPI:
     app = FastAPI()
-    app.add_middleware(RateLimitMiddleware)
+    app.add_middleware(RateLimitMiddleware, exempt_cidrs=exempt_cidrs)
 
     @app.get("/thing")
     async def thing() -> dict[str, str]:
@@ -42,11 +48,25 @@ def _app() -> FastAPI:
     async def hook() -> dict[str, str]:
         return {"ok": "yes"}
 
+    # The real ones are app/api/health.py; these stand in for them so this file
+    # tests the middleware rather than the database behind /ready.
+    @app.get("/health")
+    async def health() -> dict[str, str]:
+        return {"status": "ok"}
+
+    @app.get("/ready")
+    async def ready() -> dict[str, str]:
+        return {"status": "ready"}
+
     return app
 
 
-async def _client(app: FastAPI) -> AsyncClient:
-    return AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver")
+async def _client(app: FastAPI, client_host: str = "127.0.0.1") -> AsyncClient:
+    """`client_host` is the socket peer -- what `request.client.host` reads."""
+    return AsyncClient(
+        transport=ASGITransport(app=app, client=(client_host, 51234)),
+        base_url="http://testserver",
+    )
 
 
 def _counting(monkeypatch: pytest.MonkeyPatch) -> list[dict[str, Any]]:
@@ -132,3 +152,89 @@ async def test_an_unreachable_redis_does_not_refuse_every_request(
     client = await _client(_app())
 
     assert (await client.get("/thing")).status_code == 200
+
+
+@pytest.mark.parametrize("path", ["/health", "/ready"])
+async def test_health_probes_are_never_counted(
+    monkeypatch: pytest.MonkeyPatch, path: str
+) -> None:
+    """A 429 on /health is answered by the platform restarting the container.
+
+    Every kubelet probe in the cluster arrives from one address, so they share a single
+    limiter key and spend against the cap continuously -- and the symptom is not a
+    throttled probe, it is a pod that keeps being killed and an app that looks like it
+    keeps crashing. Raising RATE_LIMIT_PER_MINUTE was the first workaround, and it
+    bought the probes headroom by handing the same headroom to every real client.
+    """
+    calls = _counting(monkeypatch)
+    client = await _client(_app())
+
+    response = await client.get(path)
+
+    assert response.status_code == 200
+    assert calls == [], "the limiter must not even be consulted"
+
+
+async def test_a_client_inside_the_exempt_network_is_not_counted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The second, independent half: the pod network, whatever it asks for.
+
+    A probe reaching a pod on a path nobody foresaw still must not restart it.
+    """
+    calls = _counting(monkeypatch)
+    client = await _client(_app(["10.42.0.0/16"]), client_host=POD_NETWORK_CLIENT)
+
+    assert (await client.get("/thing")).status_code == 200
+    assert calls == []
+
+
+async def test_a_client_outside_the_exempt_network_still_counts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The branch that is meant to stay out of the way has to be tested too."""
+    calls = _counting(monkeypatch)
+    client = await _client(_app(["10.42.0.0/16"]), client_host=INTERNET_CLIENT)
+
+    assert (await client.get("/thing")).status_code == 200
+    assert [call["identity"] for call in calls] == [INTERNET_CLIENT]
+
+
+async def test_a_spoofed_forwarded_for_header_does_not_exempt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The exemption reads the socket peer, never a header.
+
+    X-Forwarded-For is written by whoever is calling. uvicorn rewrites `client` from it
+    only for peers already inside --forwarded-allow-ips, and then takes the right-most
+    entry that is not itself trusted -- so the internet cannot claim to be the pod
+    network. This pins the half that lives in this repository: nothing here reads the
+    header, so the claim is ignored whatever the deployment does with proxy headers.
+    """
+    calls = _counting(monkeypatch)
+    client = await _client(_app(["10.42.0.0/16"]), client_host=INTERNET_CLIENT)
+
+    response = await client.get(
+        "/thing", headers={"X-Forwarded-For": f"{POD_NETWORK_CLIENT}, 10.42.0.7"}
+    )
+
+    assert response.status_code == 200
+    assert [call["identity"] for call in calls] == [INTERNET_CLIENT]
+
+
+async def test_an_empty_exempt_list_counts_the_pod_network_too(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The setting can be turned off, and turning it off means off.
+
+    The probe *paths* stay exempt regardless -- they are two of this app's own routes,
+    not a deployment's opinion.
+    """
+    calls = _counting(monkeypatch)
+    client = await _client(_app([]), client_host=POD_NETWORK_CLIENT)
+
+    assert (await client.get("/thing")).status_code == 200
+    assert [call["identity"] for call in calls] == [POD_NETWORK_CLIENT]
+
+    assert (await client.get("/health")).status_code == 200
+    assert len(calls) == 1, "the path exemption does not depend on the CIDR list"
