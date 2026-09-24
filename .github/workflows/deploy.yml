@@ -1,0 +1,279 @@
+# git push to main  ->  checks  ->  ARM64 image in ECR  ->  migrate  ->  rollout.
+#
+# There are no AWS keys in this repository. The build asks GitHub for a short
+# lived OIDC token and trades it for credentials that expire with the job; what
+# that identity may do is infra/40-cicd/iam.tf, and who may assume it is one
+# exact `sub` claim per branch.
+#
+# The cluster has no public API -- port 22 and 6443 are closed on the security
+# group. kubectl reaches it through an SSM port-forward, as a ServiceAccount
+# scoped to the recallai namespace (k8s/70-deploy-rbac.yaml). No kubeconfig,
+# node SSH key or cluster-admin credential exists in GitHub.
+name: deploy
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+      - "infra/**" # terraform is run by a person, never by CI
+  workflow_dispatch:
+    inputs:
+      image_tag:
+        description: "Roll out an image that already exists (default: this commit)"
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+# One deploy at a time, and never cancel one midway: a cancelled job can leave
+# the migration Job applied and the Deployments not yet updated.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: ap-south-1
+  ECR_REPO: recallai-api
+  NAMESPACE: recallai
+  HEALTH_URL: https://recall-api.debayanbain.in/health
+
+jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    permissions:
+      id-token: write # ask GitHub for the OIDC token
+      contents: read
+    outputs:
+      image: ${{ steps.image.outputs.image }}
+      tag: ${{ steps.image.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fail early if the deploy role is not configured
+        env:
+          ROLE_ARN: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+        run: |
+          if [ -z "$ROLE_ARN" ]; then
+            echo "Repository variable AWS_DEPLOY_ROLE_ARN is unset." >&2
+            echo "Run: terraform -chdir=infra/40-cicd output -raw deploy_role_arn" >&2
+            exit 1
+          fi
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-build-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve the registry and tag
+        id: image
+        # Through the environment, never interpolated into the script body: a
+        # workflow_dispatch input is text somebody typed, and `${{ }}` inside a
+        # run block is substituted before bash ever sees a quote. The tag also
+        # becomes a Kubernetes object name below, so its shape is checked here.
+        env:
+          TAG: ${{ inputs.image_tag || github.sha }}
+        run: |
+          set -euo pipefail
+          if ! printf '%s' "$TAG" | grep -Eq '^[a-z0-9][a-z0-9._-]{0,40}$'; then
+            echo "Refusing tag: $TAG" >&2; exit 1
+          fi
+          # Published by 20-data. Nothing here hardcodes the account id.
+          REGISTRY=$(aws ssm get-parameter \
+            --name "/recallai/data/ecr/${ECR_REPO}" \
+            --query Parameter.Value --output text)
+          echo "image=${REGISTRY}" >> "$GITHUB_OUTPUT"
+          echo "tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "Building ${REGISTRY}:${TAG}"
+
+      # ECR repos are IMMUTABLE by design, so re-running a workflow for a commit
+      # whose image already exists must skip the push rather than fail on it.
+      - name: Does this image already exist?
+        id: exists
+        env:
+          TAG: ${{ steps.image.outputs.tag }}
+        run: |
+          set -euo pipefail
+          if aws ecr describe-images --repository-name "${ECR_REPO}" \
+               --image-ids "imageTag=${TAG}" >/dev/null 2>&1; then
+            echo "found=true" >> "$GITHUB_OUTPUT"
+            echo "Image already in ECR -- skipping the build."
+          else
+            echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: aws-actions/amazon-ecr-login@v2
+        if: steps.exists.outputs.found == 'false'
+
+      # The node is a t4g (ARM). Building arm64 under QEMU on an x86 runner takes
+      # a few minutes; if this repo can use GitHub's ARM runners, swapping
+      # `runs-on` to ubuntu-24.04-arm and deleting the QEMU step is ~4x faster.
+      - uses: docker/setup-qemu-action@v3
+        if: steps.exists.outputs.found == 'false'
+        with:
+          platforms: arm64
+
+      - uses: docker/setup-buildx-action@v3
+        if: steps.exists.outputs.found == 'false'
+
+      - name: Build and push
+        if: steps.exists.outputs.found == 'false'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.image.outputs.image }}:${{ steps.image.outputs.tag }}
+          # A single-arch manifest. Attestations would push extra artifacts into
+          # a repo whose lifecycle policy counts images.
+          provenance: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    # Add required reviewers to this environment in repo settings to turn every
+    # deploy into an approval. The OIDC `sub` claim changes to
+    # repo:<owner>/<repo>:environment:production when a job names one, which is
+    # why infra/40-cicd lists both subjects.
+    environment:
+      name: production
+      url: https://recall-api.debayanbain.in
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          role-session-name: gha-deploy-${{ github.run_id }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - uses: azure/setup-kubectl@v4
+
+      - name: Install the SSM session-manager plugin
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/smp.deb \
+            "https://s3.amazonaws.com/session-manager-downloads/plugin/latest/ubuntu_64bit/session-manager-plugin.deb"
+          sudo dpkg -i /tmp/smp.deb
+
+      - name: Open the tunnel to the K3s API
+        run: |
+          set -euo pipefail
+          INSTANCE_ID=$(aws ssm get-parameter --name /recallai/compute/instance_id \
+            --query Parameter.Value --output text)
+          nohup aws ssm start-session --target "$INSTANCE_ID" \
+            --document-name AWS-StartPortForwardingSession \
+            --parameters '{"portNumber":["6443"],"localPortNumber":["6443"]}' \
+            > /tmp/tunnel.log 2>&1 &
+          echo $! > /tmp/tunnel.pid
+          for _ in $(seq 1 30); do
+            nc -z 127.0.0.1 6443 && { echo "tunnel up"; exit 0; }
+            sleep 2
+          done
+          echo "tunnel never opened:" >&2; cat /tmp/tunnel.log >&2; exit 1
+
+      # The kubeconfig is a SecureString holding a namespaced ServiceAccount
+      # token. It goes from Parameter Store to a 0600 file and is never echoed;
+      # nothing below prints it, and no step runs with `set -x`.
+      - name: Fetch the deploy kubeconfig
+        run: |
+          set -euo pipefail
+          umask 077
+          aws ssm get-parameter --name /recallai/cicd/kubeconfig --with-decryption \
+            --query Parameter.Value --output text > "$RUNNER_TEMP/kubeconfig"
+          chmod 600 "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          kubectl -n "$NAMESPACE" get deploy -o name
+
+      - name: Render the image tag into the manifests
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/rendered
+          for f in 20-migrate-job 30-api 40-worker; do
+            sed "s|__TAG__|${TAG}|g" "k8s/${f}.yaml" > "/tmp/rendered/${f}.yaml"
+          done
+          grep -q "${TAG}" /tmp/rendered/30-api.yaml
+
+      # Redis and the Ingress are unchanged by a normal deploy; applying them
+      # keeps the cluster equal to the repo rather than to whoever last ran
+      # kubectl by hand. The namespace and the ClusterIssuers are deliberately
+      # NOT here: they are cluster-scoped bootstrap, and this identity cannot
+      # touch them.
+      - name: Apply the unchanging pieces
+        run: kubectl -n "$NAMESPACE" apply -f k8s/10-redis.yaml -f k8s/50-ingress.yaml
+
+      - name: Migrate
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          set -euo pipefail
+          JOB="migrate-${TAG}"
+          # A Job's pod spec is immutable, so a re-run of the same commit has to
+          # replace it rather than apply over it.
+          kubectl -n "$NAMESPACE" delete job "$JOB" --ignore-not-found --wait=true
+          kubectl -n "$NAMESPACE" apply -f /tmp/rendered/20-migrate-job.yaml
+          for _ in $(seq 1 60); do
+            SUCCEEDED=$(kubectl -n "$NAMESPACE" get job "$JOB" -o jsonpath='{.status.succeeded}' 2>/dev/null || echo "")
+            FAILED=$(kubectl -n "$NAMESPACE" get job "$JOB" -o jsonpath='{.status.failed}' 2>/dev/null || echo "")
+            if [ "${SUCCEEDED:-0}" -ge 1 ]; then
+              kubectl -n "$NAMESPACE" logs "job/$JOB" --tail=30 || true
+              echo "migrations applied"; exit 0
+            fi
+            if [ "${FAILED:-0}" -ge 1 ]; then
+              echo "::error::alembic upgrade head failed"
+              kubectl -n "$NAMESPACE" logs "job/$JOB" --tail=100 || true
+              exit 1
+            fi
+            sleep 5
+          done
+          echo "::error::migration did not finish within 5 minutes"
+          kubectl -n "$NAMESPACE" logs "job/$JOB" --tail=100 || true
+          exit 1
+
+      - name: Roll out the API and the worker
+        run: |
+          set -euo pipefail
+          kubectl -n "$NAMESPACE" apply -f /tmp/rendered/30-api.yaml -f /tmp/rendered/40-worker.yaml
+          kubectl -n "$NAMESPACE" rollout status deploy/recall-api --timeout=300s
+          kubectl -n "$NAMESPACE" rollout status deploy/recall-worker --timeout=300s
+
+      - name: Smoke test the public URL
+        run: |
+          set -euo pipefail
+          for i in $(seq 1 10); do
+            CODE=$(curl -s -o /dev/null -w '%{http_code}' --max-time 15 "$HEALTH_URL" || echo 000)
+            [ "$CODE" = "200" ] && { echo "$HEALTH_URL -> 200"; exit 0; }
+            echo "attempt $i: HTTP $CODE"; sleep 6
+          done
+          echo "::error::$HEALTH_URL never answered 200"; exit 1
+
+      # The API keeps its old pod until the new one is ready, so a bad image is
+      # only ever visible as a failed rollout. The worker is Recreate -- its old
+      # pod is already gone, so undoing it is what puts a working one back.
+      - name: Roll back on failure
+        if: failure()
+        run: |
+          kubectl -n "$NAMESPACE" describe pods -l app=recall-api | tail -40 || true
+          kubectl -n "$NAMESPACE" logs -l app=recall-api --tail=50 --all-containers || true
+          kubectl -n "$NAMESPACE" rollout undo deploy/recall-api || true
+          kubectl -n "$NAMESPACE" rollout undo deploy/recall-worker || true
+
+      - name: Close the tunnel
+        if: always()
+        run: kill "$(cat /tmp/tunnel.pid)" 2>/dev/null || true

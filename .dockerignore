@@ -33,3 +33,10 @@ docker-compose*.yml
 Makefile
 deploy
 k8s
+
+# Terraform, and the provider binaries it caches. Nothing here is ever COPYed,
+# but everything here is uploaded to the daemon as build context -- and
+# infra/*/.terraform alone is several hundred megabytes on a machine that has
+# run `terraform init`.
+infra
+.codegraph

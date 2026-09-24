@@ -1,7 +1,8 @@
 .PHONY: install migrate revision dev dev-tunnel tunnel worker flower beat api openapi lint typecheck test check \
 	redis redis-down redis-logs redis-stats autoscale workers workers-down \
 	telegram-webhook telegram-webhook-info telegram-webhook-delete \
-	reenrich reenrich-apply
+	reenrich reenrich-apply \
+	k8s-tunnel cicd-kubeconfig deploy deploy-logs
 
 install:            ## sync deps incl. dev extras
 	uv sync --extra dev
@@ -199,3 +200,23 @@ test:
 	uv run pytest -q
 
 check: lint typecheck test   ## all gates
+
+# ── Deploying ──────────────────────────────────────────────────────────────────
+# A push to main deploys itself (.github/workflows/deploy.yml). These are the
+# parts a person still does: opening the tunnel, minting CI's credential, and
+# starting or watching a run by hand.
+
+k8s-tunnel:         ## hold the SSM tunnel to the K3s API open (leave it running)
+	./scripts/tunnel.sh
+
+cicd-kubeconfig:    ## one-time: give GitHub Actions a namespaced kubeconfig (needs k8s-tunnel)
+	./scripts/cicd-kubeconfig.sh
+
+# Rolling back is deploying an older tag: ECR tags are immutable and every image
+# is named after its commit, so the build step finds it and skips to the rollout.
+#   make deploy tag=<sha>
+deploy:             ## run the deploy workflow now; tag=<sha> rolls an existing image out
+	gh workflow run deploy.yml $(if $(tag),-f image_tag=$(tag),)
+
+deploy-logs:        ## follow the newest deploy run
+	gh run watch $$(gh run list --workflow=deploy.yml --limit 1 --json databaseId --jq '.[0].databaseId')

@@ -1,0 +1,96 @@
+# The identity GitHub Actions deploys as. Applied ONCE by hand, from a laptop
+# with the SSM tunnel open -- CI is not allowed to grant itself anything, which
+# is the whole point of it living in a manifest a person applies.
+#
+# Why not hand CI the node's own kubeconfig: that file is cluster-admin on every
+# namespace, and it would then sit in Parameter Store as a credential a single
+# leaked GitHub token reaches. This one is namespaced to recallai and holds no
+# verbs outside the deploy.
+#
+# Stated plainly rather than overclaimed: RBAC gates the API, not the kubelet.
+# Anything that can create a Pod in this namespace can mount `recallai-env` and
+# print it. So "CI cannot read the app secrets" is true of the API surface and
+# false of a Pod it deploys -- the real boundary is that only `main` can reach
+# this identity at all.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: github-deploy
+  namespace: recallai
+---
+# Kubernetes 1.24+ stopped minting a Secret per ServiceAccount, and a projected
+# token expires in an hour -- useless for a credential CI reads months later.
+# This asks for the old non-expiring kind on purpose.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: github-deploy-token
+  namespace: recallai
+  annotations:
+    kubernetes.io/service-account.name: github-deploy
+type: kubernetes.io/service-account-token
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: github-deploy
+  namespace: recallai
+rules:
+  # What `kubectl apply` + `rollout status` actually need. No `delete` on
+  # Deployments: a workflow bug must not be able to take the API down, and
+  # removing a Deployment is a human decision.
+  - apiGroups: ["apps"]
+    resources: ["deployments"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["apps"]
+    resources: ["deployments/status", "replicasets"]
+    verbs: ["get", "list", "watch"]
+  # Jobs are delete-able: the migration Job is named after the image tag, and a
+  # re-run of the same commit has to be able to replace the previous attempt.
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["pods", "events"]
+    verbs: ["get", "list", "watch"]
+  # Reading a failed migration's traceback is the difference between a red
+  # workflow and a red workflow that says why.
+  - apiGroups: [""]
+    resources: ["pods/log"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["services", "persistentvolumeclaims", "configmaps"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["networking.k8s.io"]
+    resources: ["ingresses"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # 50-ingress.yaml is two objects: the Ingress and the redirect-https
+  # Middleware beside it. Without this rule `kubectl apply -f` on that file
+  # half-applies and then 403s, which is the worst of both. The old API group
+  # is listed too because a k3s from before Traefik v3 serves that one.
+  - apiGroups: ["traefik.io", "traefik.containo.us"]
+    resources: ["middlewares"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # kubectl describe reads events from whichever of the two groups the cluster
+  # serves them on.
+  - apiGroups: ["events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch"]
+  # Deliberately absent: secrets (any verb), namespaces, clusterissuers,
+  # certificates, and everything cluster-scoped. The ClusterIssuers in
+  # 60-issuers.yaml and the namespace in 00-namespace.yaml are bootstrap, not
+  # deploy -- they are applied by a person, once.
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: github-deploy
+  namespace: recallai
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: github-deploy
+subjects:
+  - kind: ServiceAccount
+    name: github-deploy
+    namespace: recallai

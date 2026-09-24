@@ -1,0 +1,45 @@
+# Quality gates. Runs on every pull request, and is CALLED by deploy.yml so
+# nothing reaches the cluster that has not passed them.
+name: checks
+
+on:
+  pull_request:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen --extra dev
+
+      # Advisory, not blocking: this repo carries 28 pre-existing ruff errors
+      # (26 UP045, 2 E501, all in app/models/). Making them fail the build would
+      # mean every unrelated PR is red, which teaches people to ignore red.
+      # Fix them with `uv run ruff check --fix app tests` and then delete this
+      # continue-on-error line -- that is the only way it ever becomes a gate.
+      - name: ruff (advisory)
+        continue-on-error: true
+        run: uv run ruff check app tests
+
+      - name: mypy
+        run: uv run mypy app
+
+      # No .env, no database and no Redis on the runner, which is by design: the
+      # DB-backed tests skip themselves and tests/conftest.py's autouse fixtures
+      # keep every AI provider and the shared Redis counter off the network.
+      # A green run here therefore does NOT cover the authz suite -- that needs
+      # TEST_DATABASE_URL pointed at a scratch Neon branch.
+      - name: pytest
+        run: uv run pytest -q
