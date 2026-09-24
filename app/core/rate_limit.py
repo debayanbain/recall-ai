@@ -50,9 +50,19 @@ async def consume(
     try:
         pipe = client.pipeline()
         pipe.incr(key)
-        # Fixed window, TTL re-set on every hit so the window slides with use. A true
-        # sliding count needs a sorted set per identity and is not worth it here.
-        pipe.expire(key, window)
+        # NX: set the expiry only when the key has none, which is what makes this a
+        # FIXED window. Re-setting the TTL on every hit -- what this did until a
+        # production incident -- means a key under continuous traffic never expires:
+        # the count is then cumulative since the last full `window` of silence, it
+        # crosses the limit once and stays there, and everything from that identity is
+        # refused permanently rather than for a minute. The traffic that never goes
+        # quiet is the platform's own health probes, so the first thing it took down was
+        # the liveness check, which reads as an app that keeps crashing.
+        #
+        # A true sliding count needs a sorted set per identity and is still not worth it
+        # here; the cost of a fixed window is that a burst on a boundary can spend two
+        # windows' worth, which is bounded and self-correcting.
+        pipe.expire(key, window, nx=True)
         count, _ = await pipe.execute()
         return int(count) <= limit
     except Exception as exc:  # noqa: BLE001 - an abuse control must not become an outage
