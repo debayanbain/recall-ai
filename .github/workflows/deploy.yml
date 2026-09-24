@@ -196,7 +196,16 @@ jobs:
           aws ssm get-parameter --name /recallai/cicd/kubeconfig --with-decryption \
             --query Parameter.Value --output text > "$RUNNER_TEMP/kubeconfig"
           chmod 600 "$RUNNER_TEMP/kubeconfig"
-          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+          test -s "$RUNNER_TEMP/kubeconfig" || {
+            echo "::error::/recallai/cicd/kubeconfig is empty -- run scripts/cicd-kubeconfig.sh"
+            exit 1
+          }
+          # GITHUB_ENV is read between steps, so it does nothing for the kubectl call
+          # below -- without the export it connects to kubectl's built-in default,
+          # localhost:8080, and reports a refused connection that looks like the tunnel
+          # failed rather than like a missing variable.
+          export KUBECONFIG="$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$KUBECONFIG" >> "$GITHUB_ENV"
           kubectl -n "$NAMESPACE" get deploy -o name
 
       - name: Render the image tag into the manifests
