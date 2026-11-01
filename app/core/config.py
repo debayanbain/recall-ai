@@ -72,9 +72,23 @@ class Settings(BaseSettings):
     COOKIE_SECURE: bool = False  # True behind HTTPS in prod
 
     # --- Database ---
+    #: Which database every connection is opened against -- API, worker and Alembic.
+    #: Both URLs stay configured side by side, so switching is this one setting and a
+    #: restart. Switching does NOT move data: the two databases are independent, and a
+    #: memory saved on one is not on the other until `scripts/copy_database.py` copies it.
+    DATABASE_PROVIDER: Literal["neon", "supabase"] = "neon"
+    #: The Neon URL. Kept under its original name so the existing .env.production, the
+    #: SSM parameter /recallai/app/DATABASE_URL and the Kubernetes Secret all keep
+    #: working unchanged while DATABASE_PROVIDER defaults to neon.
     DATABASE_URL: PostgresDsn = (
         "postgresql+asyncpg://recall:recall@localhost:5432/recall"  # type: ignore[assignment]
     )
+    #: The Supabase URL -- the **session** pooler, `aws-0-<region>.pooler.supabase.com:5432`
+    #: with user `postgres.<project-ref>` and `?sslmode=require`. Not the direct host
+    #: (`db.<ref>.supabase.co` is IPv6-only, which neither a typical laptop nor the EC2
+    #: node can reach) and not the transaction pooler on :6543, which the boot guard
+    #: refuses -- see `_validate_database_selection`.
+    SUPABASE_DATABASE_URL: PostgresDsn | None = None
     DB_POOL_SIZE: int = 10
     DB_MAX_OVERFLOW: int = 20
     DB_ECHO: bool = False
@@ -839,10 +853,23 @@ class Settings(BaseSettings):
         return self.ENV != "prod"
 
     @property
-    def database_url_str(self) -> str:
-        """The URL every connection is opened with -- API, worker and Alembic alike.
+    def database_url_setting(self) -> str:
+        """The name of the setting the active URL comes from, for error messages.
 
-        Normalised in ONE place so those three cannot drift, because what a managed
+        Errors name the setting, never the URL: the URL carries the password.
+        """
+        return "SUPABASE_DATABASE_URL" if self.DATABASE_PROVIDER == "supabase" else "DATABASE_URL"
+
+    @property
+    def database_url_str(self) -> str:
+        """The URL every connection is opened with, for the selected DATABASE_PROVIDER."""
+        return self.database_url_for(self.DATABASE_PROVIDER)
+
+    def database_url_for(self, provider: Literal["neon", "supabase"]) -> str:
+        """The normalised URL for one provider -- the active one, or the other side of a copy.
+
+        The API, the worker and Alembic all connect through this, normalised in ONE
+        place so the three cannot drift, because what a managed
         provider hands you is a *libpq* URL that this stack cannot use as it is written:
 
           * `postgresql://` names the psycopg2 dialect, and psycopg2 is not installed.
@@ -861,7 +888,10 @@ class Settings(BaseSettings):
         """
         from sqlalchemy.engine.url import make_url
 
-        url = make_url(str(self.DATABASE_URL))
+        raw = self.SUPABASE_DATABASE_URL if provider == "supabase" else self.DATABASE_URL
+        if raw is None:
+            raise RuntimeError("SUPABASE_DATABASE_URL is not set.")
+        url = make_url(str(raw))
         if url.drivername in ("postgresql", "postgres"):
             url = url.set(drivername="postgresql+asyncpg")
 
@@ -970,6 +1000,11 @@ def validate_deployment_config(config: Settings) -> None:
             f"{config.REFRESH_TOKEN_EXPIRE_DAYS})."
         )
 
+    # Every environment: a selector naming a database with no URL must not fall back to
+    # the other one. Quietly answering from Neon while the operator believes the app is
+    # on Supabase is two diverging vaults and nothing anywhere saying so.
+    _validate_database_selection(config)
+
     # Partial storage config is refused rather than silently disabling uploads: a deploy
     # that sets some of these means to have a bucket, and finding out at the first user
     # upload is worse than finding out at boot. A bucket with no endpoint and no keys is
@@ -1012,7 +1047,8 @@ def validate_deployment_config(config: Settings) -> None:
     ssl_mode = make_url(config.database_url_str).query.get("ssl")
     if ssl_mode not in ("require", "verify-ca", "verify-full"):
         raise RuntimeError(
-            f"DATABASE_URL must request TLS when ENV={config.ENV}: add ?sslmode=require "
+            f"{config.database_url_setting} must request TLS when ENV={config.ENV}: add "
+            "?sslmode=require "
             "(or verify-ca / verify-full) to it. asyncpg's default silently falls back "
             "to an unencrypted connection."
         )
@@ -1110,6 +1146,40 @@ def validate_deployment_config(config: Settings) -> None:
             raise RuntimeError(
                 f"CORS_ORIGINS must be https and non-local in prod; rejected: {unsafe}"
             )
+
+
+#: Supabase's transaction-mode pooler (Supavisor, and the dedicated PgBouncer) listens on
+#: this port; the session pooler and direct connections are on 5432.
+SUPABASE_TRANSACTION_POOLER_PORT = 6543
+
+
+def _validate_database_selection(config: Settings) -> None:
+    """Refuse a DATABASE_PROVIDER that cannot be connected to as configured.
+
+    The transaction pooler is refused rather than accommodated. asyncpg prepares every
+    statement, and a transaction pooler hands consecutive transactions to different
+    server connections, so names collide (`DuplicatePreparedStatementError`) or vanish
+    (`prepared statement does not exist`) -- intermittently, under load, in production.
+    SQLAlchemy's workaround needs NullPool, which would throw away the warmed pool this
+    API's latency budget depends on. The session pooler on 5432 has none of that.
+
+    Never interpolates a URL: it carries the password.
+    """
+    if config.DATABASE_PROVIDER != "supabase":
+        return
+    if config.SUPABASE_DATABASE_URL is None:
+        raise RuntimeError(
+            "DATABASE_PROVIDER=supabase but SUPABASE_DATABASE_URL is not set. Set it, or "
+            "set DATABASE_PROVIDER=neon to keep using DATABASE_URL."
+        )
+    from sqlalchemy.engine.url import make_url
+
+    if make_url(str(config.SUPABASE_DATABASE_URL)).port == SUPABASE_TRANSACTION_POOLER_PORT:
+        raise RuntimeError(
+            "SUPABASE_DATABASE_URL points at the transaction pooler (port "
+            f"{SUPABASE_TRANSACTION_POOLER_PORT}), which breaks asyncpg's prepared "
+            "statements. Use the session pooler: same host, port 5432."
+        )
 
 
 def _validate_storage_config(config: Settings) -> None:

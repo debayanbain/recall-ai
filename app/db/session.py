@@ -30,6 +30,43 @@ engine = create_async_engine(
 )
 
 
+#: Whether this process has completed one round trip to the database since it started.
+#: Readiness is gated on it, and ONLY on it -- see `ensure_database_reached`.
+_database_reached = False
+
+
+def database_reached() -> bool:
+    return _database_reached
+
+
+async def ensure_database_reached() -> None:
+    """Prove the database answers once per process, then never ask again.
+
+    This is what the readiness probe runs. It used to send `SELECT 1` on every probe --
+    every 10 seconds, forever, per pod -- which on a database that bills for awake time
+    (Neon's free plan suspends a compute only after ~5 idle minutes) meant the compute
+    never slept and the monthly quota ran out mid-month, taking production down. The
+    route is also public and exempt from rate limiting, so each anonymous request was a
+    query.
+
+    The one check that matters survives: a pod whose database URL or password is wrong
+    never reaches it, so it never becomes Ready, and a rolling deploy keeps the old pod
+    serving instead of replacing it with one that cannot. What deliberately does NOT
+    survive is flipping Ready back off later. The database is shared by every pod, so a
+    blip would pull all of them out of the Service at once -- Traefik then answers "no
+    available server" for every route, /health included -- where a pod left in rotation
+    still answers what it can and reports the failure on the requests that hit it.
+
+    Raises whatever the driver raises; the caller decides what that means.
+    """
+    global _database_reached
+    if _database_reached:
+        return
+    async with engine.connect() as conn:
+        await conn.execute(text("SELECT 1"))
+    _database_reached = True
+
+
 async def warm_pool(connections: int | None = None) -> int:
     """Open (and return to the pool) a few connections before the first request.
 
@@ -42,6 +79,7 @@ async def warm_pool(connections: int | None = None) -> int:
     situation (it is a separate service, and Neon suspends an idle compute), and it must
     degrade to a slow first request rather than an API that refuses to start.
     """
+    global _database_reached
     count = settings.DB_POOL_WARMUP if connections is None else connections
     if count <= 0:
         return 0
@@ -55,6 +93,10 @@ async def warm_pool(connections: int | None = None) -> int:
         *(_open() for _ in range(count)), return_exceptions=True
     )
     opened = sum(1 for r in results if not isinstance(r, BaseException))
+    if opened:
+        # Each warm-up connection ran SELECT 1, which is the proof readiness waits for,
+        # so a pod that warmed its pool is Ready on its first probe without a query.
+        _database_reached = True
     if opened < count:
         first = next((r for r in results if isinstance(r, BaseException)), None)
         log.warning(

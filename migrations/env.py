@@ -15,7 +15,10 @@ from app.core.config import settings
 import app.models  # noqa: F401,E402
 
 config = context.config
-config.set_main_option("sqlalchemy.url", settings.database_url_str)
+# set_main_option goes through ConfigParser interpolation, so a bare `%` is a syntax
+# error -- and a password with any special character renders percent-encoded (`@` as
+# `%40`). Doubling it is configparser's escape; the value read back is the real URL.
+config.set_main_option("sqlalchemy.url", settings.database_url_str.replace("%", "%%"))
 
 if config.config_file_name:
     fileConfig(config.config_file_name)

@@ -99,3 +99,84 @@ def test_the_tls_guard_never_prints_the_password() -> None:
     with pytest.raises(RuntimeError) as exc:
         _check("prod", "postgresql://u:hunter2-not-in-the-log@db.example.com/recall")
     assert "hunter2" not in str(exc.value)
+
+
+# --- Neon / Supabase selection ------------------------------------------------------
+
+SUPABASE = (
+    "postgresql://postgres.abcdefghijkl:pw@aws-0-ap-south-1.pooler.supabase.com:5432/postgres"
+    "?sslmode=require"
+)
+
+
+def _settings(**values: object) -> Settings:
+    return Settings(_env_file=None, DATABASE_URL=NEON, **values)  # type: ignore[arg-type]
+
+
+def test_neon_is_the_default_and_reads_the_original_setting() -> None:
+    """DATABASE_URL keeps meaning Neon, so existing env files and secrets need no edit."""
+    config = _settings()
+    assert config.DATABASE_PROVIDER == "neon"
+    assert make_url(config.database_url_str).host.endswith(".neon.tech")  # type: ignore[union-attr]
+    assert config.database_url_setting == "DATABASE_URL"
+
+
+def test_supabase_is_selected_and_normalised_the_same_way() -> None:
+    config = _settings(DATABASE_PROVIDER="supabase", SUPABASE_DATABASE_URL=SUPABASE)
+    url = make_url(config.database_url_str)
+    assert url.drivername == "postgresql+asyncpg"
+    assert url.host == "aws-0-ap-south-1.pooler.supabase.com"
+    assert url.username == "postgres.abcdefghijkl"
+    assert url.query["ssl"] == "require"
+    assert config.database_url_setting == "SUPABASE_DATABASE_URL"
+
+
+def test_the_other_database_stays_reachable_by_name() -> None:
+    """The copy script reads one side while the app is pointed at the other."""
+    config = _settings(DATABASE_PROVIDER="supabase", SUPABASE_DATABASE_URL=SUPABASE)
+    assert make_url(config.database_url_for("neon")).database == "neondb"
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_selecting_supabase_without_its_url_is_refused_everywhere(env: str) -> None:
+    """Falling back to Neon would be two diverging vaults and nothing saying so."""
+    with pytest.raises(RuntimeError, match="SUPABASE_DATABASE_URL is not set"):
+        validate_deployment_config(_settings(ENV=env, DATABASE_PROVIDER="supabase", **_SAFE))
+
+
+def test_the_transaction_pooler_is_refused() -> None:
+    """asyncpg's prepared statements break across a transaction pooler's backends."""
+    url = SUPABASE.replace(":5432/", ":6543/").replace(":pw@", ":hunter2-not-in-the-log@")
+    with pytest.raises(RuntimeError, match="session pooler") as exc:
+        validate_deployment_config(
+            _settings(DATABASE_PROVIDER="supabase", SUPABASE_DATABASE_URL=url)
+        )
+    assert "hunter2" not in str(exc.value)
+
+
+@pytest.mark.parametrize("env", ["dev", "prod"])
+def test_the_session_pooler_is_accepted(env: str) -> None:
+    validate_deployment_config(
+        _settings(ENV=env, DATABASE_PROVIDER="supabase", SUPABASE_DATABASE_URL=SUPABASE, **_SAFE)
+    )
+
+
+def test_the_tls_guard_names_the_setting_actually_in_use() -> None:
+    plaintext = SUPABASE.removesuffix("?sslmode=require")
+    with pytest.raises(RuntimeError, match="SUPABASE_DATABASE_URL must request TLS"):
+        validate_deployment_config(
+            _settings(
+                ENV="prod", DATABASE_PROVIDER="supabase", SUPABASE_DATABASE_URL=plaintext, **_SAFE
+            )
+        )
+
+
+def test_a_percent_encoded_password_survives_alembics_config() -> None:
+    """migrations/env.py doubles `%`: ConfigParser reads a bare one as interpolation."""
+    from alembic.config import Config
+
+    url = _url("postgresql://u:p%40ss%23word@db.example.com/recall?sslmode=require")
+    assert "%40" in url
+    config = Config()
+    config.set_main_option("sqlalchemy.url", url.replace("%", "%%"))
+    assert config.get_main_option("sqlalchemy.url") == url

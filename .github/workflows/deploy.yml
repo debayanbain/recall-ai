@@ -255,6 +255,22 @@ jobs:
           kubectl -n "$NAMESPACE" logs "job/$JOB" --tail=100 || true
           exit 1
 
+      # Read-only. The rollback below needs to know what was running BEFORE this run
+      # touched anything: a bare `rollout undo` goes back one revision from whatever is
+      # current, so on a run that failed before the rollout (a migration, say) it would
+      # replace the healthy pods with the release before them. Empty when a Deployment
+      # does not exist yet -- a first deploy has nothing to go back to.
+      - name: Record the running revisions
+        id: before
+        run: |
+          set -euo pipefail
+          for d in recall-api recall-worker; do
+            REV=$(kubectl -n "$NAMESPACE" get deploy "$d" \
+              -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || true)
+            echo "${d#recall-}=${REV}" >> "$GITHUB_OUTPUT"
+            echo "$d is at revision ${REV:-<none>}"
+          done
+
       - name: Roll out the API and the worker
         run: |
           set -euo pipefail
@@ -275,13 +291,33 @@ jobs:
       # The API keeps its old pod until the new one is ready, so a bad image is
       # only ever visible as a failed rollout. The worker is Recreate -- its old
       # pod is already gone, so undoing it is what puts a working one back.
+      #
+      # Only a Deployment whose revision MOVED during this run is undone, and only back
+      # to the revision recorded before it. A failure before the rollout (migration,
+      # tunnel, kubeconfig) moved nothing, so nothing is undone; a re-deploy of the tag
+      # already running creates no revision, so it is left alone too. kubectl's
+      # `--to-revision` is exact where a bare `undo` is relative to whatever is current.
       - name: Roll back on failure
         if: failure()
+        env:
+          API_BEFORE: ${{ steps.before.outputs.api }}
+          WORKER_BEFORE: ${{ steps.before.outputs.worker }}
         run: |
           kubectl -n "$NAMESPACE" describe pods -l app=recall-api | tail -40 || true
           kubectl -n "$NAMESPACE" logs -l app=recall-api --tail=50 --all-containers || true
-          kubectl -n "$NAMESPACE" rollout undo deploy/recall-api || true
-          kubectl -n "$NAMESPACE" rollout undo deploy/recall-worker || true
+          for pair in "recall-api:${API_BEFORE}" "recall-worker:${WORKER_BEFORE}"; do
+            d="${pair%%:*}"; before="${pair#*:}"
+            now=$(kubectl -n "$NAMESPACE" get deploy "$d" \
+              -o jsonpath='{.metadata.annotations.deployment\.kubernetes\.io/revision}' 2>/dev/null || true)
+            if [ -z "$before" ]; then
+              echo "$d: no revision recorded before this run -- nothing to roll back to"
+            elif [ "$now" = "$before" ]; then
+              echo "$d: still at revision $before -- this run did not change it, left alone"
+            else
+              echo "$d: revision $now -> back to $before"
+              kubectl -n "$NAMESPACE" rollout undo "deploy/$d" --to-revision="$before" || true
+            fi
+          done
 
       - name: Close the tunnel
         if: always()

@@ -15,7 +15,8 @@ from app.core.config import settings
 from app.queue import health
 from app.services.telegram import notices, webhook
 
-_URL = "https://example.test/api/v1/webhooks/telegram/a-secret-of-sufficient-length"
+_PATH = "api/v1/webhooks/telegram/a-secret-of-sufficient-length"
+_URL = f"https://example.test/{_PATH}"
 
 
 class FakeClient:
@@ -71,6 +72,7 @@ async def test_a_moved_deployment_re_registers_itself(
     configured: None, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The incident: a stale URL means Telegram 404s and the bot goes quietly dead."""
+    monkeypatch.setattr(settings, "ENV", "prod")
     client = FakeClient(
         {
             "url": "https://old-tunnel.test/api/v1/webhooks/telegram/a-secret-of-sufficient-length",
@@ -78,6 +80,62 @@ async def test_a_moved_deployment_re_registers_itself(
             "last_error_message": "Wrong response from the webhook: 404 Not Found",
         }
     )
+    monkeypatch.setattr(webhook, "TelegramClient", lambda: client)
+
+    assert await webhook.ensure_registered() == "registered"
+    assert client.registered == [_URL]
+
+
+async def test_a_development_boot_does_not_take_the_webhook_from_a_deployment(
+    configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The incident: one laptop boot left production's bot silent until a pod restarted."""
+    monkeypatch.setattr(settings, "ENV", "dev")
+    client = FakeClient({"url": f"https://recall-api.example/{_PATH}"})
+    monkeypatch.setattr(webhook, "TelegramClient", lambda: client)
+
+    assert await webhook.ensure_registered() == "held_elsewhere"
+    assert client.registered == []
+
+
+@pytest.mark.parametrize(
+    "current",
+    [
+        "",
+        f"https://old.ngrok-free.dev/{_PATH}",
+        f"https://old.ngrok-free.app/{_PATH}",
+        f"https://random-words.trycloudflare.com/{_PATH}",
+    ],
+)
+async def test_a_development_boot_still_takes_an_empty_url_or_another_tunnel(
+    configured: None, monkeypatch: pytest.MonkeyPatch, current: str
+) -> None:
+    """A dedicated dev bot has to keep following a tunnel whose URL changed."""
+    monkeypatch.setattr(settings, "ENV", "dev")
+    client = FakeClient({"url": current})
+    monkeypatch.setattr(webhook, "TelegramClient", lambda: client)
+
+    assert await webhook.ensure_registered() == "registered"
+    assert client.registered == [_URL]
+
+
+async def test_a_host_merely_ending_in_a_tunnel_name_is_not_a_tunnel(
+    configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(settings, "ENV", "dev")
+    client = FakeClient({"url": f"https://notngrok.io/{_PATH}"})
+    monkeypatch.setattr(webhook, "TelegramClient", lambda: client)
+
+    assert await webhook.ensure_registered() == "held_elsewhere"
+    assert client.registered == []
+
+
+async def test_a_deployment_takes_the_webhook_back_from_a_tunnel(
+    configured: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The guard is one-way: a pod restart is still what recovers production."""
+    monkeypatch.setattr(settings, "ENV", "prod")
+    client = FakeClient({"url": f"https://old.ngrok-free.dev/{_PATH}"})
     monkeypatch.setattr(webhook, "TelegramClient", lambda: client)
 
     assert await webhook.ensure_registered() == "registered"

@@ -12,16 +12,37 @@ compares what Telegram holds against what this deployment *is* and corrects it o
 they differ -- an unconditional `setWebhook` on every start would drop pending updates on
 every reload.
 
+A development boot is the one exception to correcting a difference. The one URL is per
+*token*, so a laptop sharing production's bot took the webhook on every `make dev`, and
+production only reconciles when a pod restarts: once the laptop's API stopped, the bot was
+dead with nothing in production's logs to say why. So under `ENV=dev` a URL is replaced
+only when it is empty or another tunnel, and `make telegram-webhook` is how someone takes
+it on purpose.
+
 It never raises. A bot that cannot reach Telegram at boot must not stop the API from
 serving HTTP; the failure is logged and the next start retries.
 """
 from __future__ import annotations
+
+from urllib.parse import urlsplit
 
 from app.core.config import settings
 from app.core.logging import get_logger
 from app.services.telegram.client import TelegramClient
 
 log = get_logger("telegram")
+
+# A list of tunnels rather than a test for "production": this process has no way to know
+# production's host, and an unrecognised host is the one a boot must not overwrite. A
+# named tunnel on someone's own domain lands on the safe side and needs the make target.
+_TUNNEL_HOST_SUFFIXES = (
+    ".ngrok-free.dev",
+    ".ngrok-free.app",
+    ".ngrok.dev",
+    ".ngrok.app",
+    ".ngrok.io",
+    ".trycloudflare.com",
+)
 
 
 def webhook_url() -> str:
@@ -58,6 +79,13 @@ def can_register() -> bool:
     )
 
 
+def _held_by_a_deployment(current: str) -> bool:
+    """Whether a development boot would be taking the webhook from a real deployment."""
+    if settings.ENV != "dev" or not current:
+        return False
+    return not (urlsplit(current).hostname or "").endswith(_TUNNEL_HOST_SUFFIXES)
+
+
 async def ensure_registered() -> str:
     """Reconcile Telegram's idea of the delivery URL with this deployment's.
 
@@ -87,6 +115,14 @@ async def ensure_registered() -> str:
                 pending=info.get("pending_update_count"),
             )
             return "unchanged"
+
+        if _held_by_a_deployment(current):
+            log.warning(
+                "telegram_webhook_held_elsewhere",
+                url=redacted(current),
+                hint="this API will not receive Telegram; make telegram-webhook takes it",
+            )
+            return "held_elsewhere"
 
         await client.set_webhook(wanted, settings.TELEGRAM_WEBHOOK_SECRET)
 

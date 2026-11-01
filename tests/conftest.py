@@ -83,13 +83,29 @@ def _assert_not_the_live_database() -> None:
 
     def identity(url: str) -> tuple[str, str]:
         parts = urlsplit(url)
-        return (parts.hostname or "", parts.path)
+        host = parts.hostname or ""
+        # One Supabase project answers on two hostnames: the pooler, which is shared by
+        # every project in a REGION and names the project only in the user
+        # (`postgres.<ref>`), and the direct `db.<ref>.supabase.co`. Keyed on the host
+        # alone, two projects behind one pooler look identical and one project behind
+        # two hosts looks like two -- the second is the one that drops live tables.
+        if host.endswith(".pooler.supabase.com"):
+            user = parts.username or ""
+            return ("supabase:" + user.split(".", 1)[-1], parts.path)
+        if host.startswith("db.") and host.endswith(".supabase.co"):
+            return ("supabase:" + host.removeprefix("db.").removesuffix(".supabase.co"), parts.path)
+        return (host, parts.path)
 
-    if identity(TEST_DATABASE_URL) == identity(settings.database_url_str):
+    # Both are live data, whichever one DATABASE_PROVIDER currently selects -- switching
+    # the selector must not turn the other database into a valid test target.
+    live = [str(settings.DATABASE_URL)]
+    if settings.SUPABASE_DATABASE_URL is not None:
+        live.append(str(settings.SUPABASE_DATABASE_URL))
+    if identity(TEST_DATABASE_URL) in {identity(url) for url in live}:
         raise RuntimeError(
-            "TEST_DATABASE_URL points at the same host and database as DATABASE_URL. "
-            "The test suite drops every table -- point it at a separate database "
-            "(a Neon branch, or a second database on the same instance)."
+            "TEST_DATABASE_URL points at the same database as DATABASE_URL or "
+            "SUPABASE_DATABASE_URL. The test suite drops every table -- point it at a "
+            "separate database (a Neon branch, or a separate Supabase project)."
         )
 
 

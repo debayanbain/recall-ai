@@ -8,7 +8,8 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 uv sync --extra dev                          # install deps (Python >=3.11)
 ```
 
-The database is hosted (Neon), set via `DATABASE_URL` in `.env`. **Redis runs in Docker and
+The database is hosted -- Neon (`DATABASE_URL`) or Supabase (`SUPABASE_DATABASE_URL`),
+both configured, `DATABASE_PROVIDER=neon|supabase` picking one (see "Two databases" below). **Redis runs in Docker and
 only in Docker** (`docker-compose.yml`, container `recall-redis`, host port **6380**) — see
 "The queue's infrastructure" below. The API and worker are two separate processes; the
 worker is only needed for AI processing:
@@ -276,6 +277,43 @@ catch-all and must stay last, so new extractors get appended *before* it.
   translated, **never invented from the host** — instead, outside dev the boot guard
   refuses a URL that did not ask for it, because asyncpg's default `prefer` falls back to
   plaintext silently. Nothing may interpolate the URL into an error: it holds the password.
+- **Two databases, one selector, no sync.** `DATABASE_PROVIDER` chooses which URL
+  `database_url_str` returns; `DATABASE_URL` keeps meaning Neon so `.env.production`, the
+  SSM parameter and the k8s Secret work unchanged. The two hold **independent data** --
+  flipping the selector moves nothing, and `scripts/copy_database.py` (`make db-copy`)
+  is the only thing that does: dry run by default, refuses unless both sides are on the
+  same Alembic revision, and refuses a target holding any row, so it can never merge or
+  delete. `--allow-revision-mismatch` waives the revision check only, for a source that
+  must stay untouched; every column and type must still match, with an unbounded `varchar`
+  counted as `text` (`create_all` writes the first where migrations wrote the second).
+  `--env-file .env.production` (`make db-copy env=.env.production`) targets prod;
+  the file's three database keys are passed explicitly because pydantic-settings would
+  otherwise let an exported shell variable outrank the file. Four rules:
+  * **Selecting supabase with no URL is refused at boot, in every environment** -- falling
+    back to Neon would be two diverging vaults with nothing saying so.
+  * **Supabase means the session pooler (:5432), never the transaction pooler (:6543)**,
+    which the boot guard refuses: asyncpg prepares every statement and a transaction pooler
+    moves consecutive transactions between backends. The direct `db.<ref>.supabase.co`
+    host is IPv6-only. The session pooler's client cap is small, so size `DB_POOL_SIZE` /
+    `DB_MAX_OVERFLOW` to it.
+  * **`0018_lock_supabase_data_api` must stay.** Supabase grants every `public` table to
+    `anon`/`authenticated` and serves it over REST with a *publishable* key; the migration
+    revokes that and enables RLS (the app is the owner, so it bypasses RLS). It is gated on
+    the `anon` role, so Neon is untouched.
+  * **`TEST_DATABASE_URL` is refused if it matches EITHER live database**, and a Supabase
+    pooler URL is identified by the project ref in its user (`postgres.<ref>`): the pooler
+    hostname is shared by every project in a region.
+  `migrations/env.py` doubles `%` before handing the URL to Alembic -- ConfigParser reads a
+  bare one as interpolation, and any special character in a password renders as `%XX`.
+- **`/ready` queries the database until it succeeds once, then never again**
+  (`db.session.ensure_database_reached`; a successful `warm_pool` counts). Pinging on every
+  probe -- 10 s, per pod, forever -- kept Neon's free-plan compute awake 24/7 and spent the
+  month's quota in ~16 days, which took production down; the route is also public and
+  exempt from rate limiting, so each anonymous hit was a query. The rollout guarantee
+  survives (a pod that cannot reach its database is never Ready, so a bad URL never
+  replaces a working pod). Do not make it flip back to NotReady on a later failure: the
+  database is shared, so that pulls every pod at once and Traefik answers `no available
+  server` for every route. `tests/core/test_readiness.py` pins both halves.
 - **Tenant scoping lives in the repository.** `VaultRepository.get()` takes a `user_id` and returns
   `None` on mismatch; `get_unscoped()` deliberately skips that check and exists *only* for the
   worker, which has no request user. Never reach for `get_unscoped` in an API path.
@@ -536,6 +574,18 @@ catch-all and must stay last, so new extractors get appended *before* it.
   limiter keys on client IP, all of Telegram's traffic shares one key, and a 429 is a
   delivery failure it retries. The real cap is per-`telegram_user_id` in Redis
   (`services/telegram/limits.py`), applied in the worker where the sender is known.
+- **A development boot does not take the webhook from a deployment.** Telegram holds one
+  URL per bot *token*, `.env` and `.env.production` share a token, and `ensure_registered`
+  runs on every API start. So one local boot on 2026-10-24 moved delivery to the ngrok URL,
+  and production only reconciles when a pod restarts: when the local API stopped, Telegram
+  got `502` from the tunnel and the bot said nothing, with no line in production's logs.
+  Under `ENV=dev` a URL is now replaced only when it is empty or a known tunnel host
+  (`_TUNNEL_HOST_SUFFIXES`); anything else logs `telegram_webhook_held_elsewhere` and
+  stays. The consequence: **with the shared token a local API receives no Telegram
+  updates** until `make telegram-webhook` takes them on purpose, and
+  `PUBLIC_BASE_URL=https://recall-api.debayanbain.in make telegram-webhook` gives them
+  back. A second bot in `.env` removes that trade entirely. Both commands set
+  `drop_pending_updates`, so whatever is waiting is discarded.
 - **The reply address is re-derived, never read from the item.** `deliver_telegram_result`
   looks the chat up through `telegram_accounts` by `item.user_id`.
   `item_metadata["telegram_chat_id"]` is recorded for debugging only — trusting it would let

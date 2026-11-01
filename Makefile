@@ -2,6 +2,7 @@
 	redis redis-down redis-logs redis-stats autoscale workers workers-down \
 	telegram-webhook telegram-webhook-info telegram-webhook-delete \
 	reenrich reenrich-apply \
+	migrate-neon migrate-supabase db-copy db-copy-apply \
 	k8s-tunnel cicd-kubeconfig deploy deploy-logs
 
 install:            ## sync deps incl. dev extras
@@ -9,6 +10,20 @@ install:            ## sync deps incl. dev extras
 
 migrate:            ## apply migrations
 	uv run alembic upgrade head
+
+# Both databases stay configured; DATABASE_PROVIDER in .env picks the one the app uses.
+# These name one explicitly, so either can be migrated without flipping the selector.
+migrate-neon:       ## apply migrations to Neon (DATABASE_URL)
+	DATABASE_PROVIDER=neon uv run alembic upgrade head
+
+migrate-supabase:   ## apply migrations to Supabase (SUPABASE_DATABASE_URL)
+	DATABASE_PROVIDER=supabase uv run alembic upgrade head
+
+db-copy:            ## dry run: make db-copy from=neon to=supabase [env=.env.production]
+	uv run python scripts/copy_database.py --from $(or $(from),neon) --to $(or $(to),supabase) $(if $(env),--env-file $(env),)
+
+db-copy-apply:      ## copy into an EMPTY target: make db-copy-apply from=neon to=supabase [env=...]
+	uv run python scripts/copy_database.py --from $(or $(from),neon) --to $(or $(to),supabase) $(if $(env),--env-file $(env),) --apply
 
 revision:           ## autogenerate a migration: make revision m="add x"
 	uv run alembic revision --autogenerate -m "$(m)"
