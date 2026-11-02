@@ -53,6 +53,7 @@ from app.schemas.vault import VaultItemRead
 from app.services.chat_engine.engine import ChatEngine, classify, session_id_for
 from app.services.chat_engine.proposals import Action, RedisProposalStore
 from app.services.chat_engine.types import (
+    ConnectionsEvent,
     Delta,
     InboundMessage,
     ItemsEvent,
@@ -156,6 +157,23 @@ def _frame(event: StreamEvent) -> str:
                 "token": event.accept_token,
                 "action": event.action,
                 "preview": event.preview,
+            },
+        )
+    if isinstance(event, ConnectionsEvent):
+        # Named fields rather than a whole card: a suggestion is one line, and the client
+        # builds its own link from the id.
+        return _event(
+            "connections",
+            {
+                "memories": [
+                    {
+                        "id": str(memory.item.id),
+                        "title": memory.item.title or memory.item.source_url or "Untitled",
+                        "phrase": memory.phrase,
+                        "about": memory.about,
+                    }
+                    for memory in event.memories
+                ],
             },
         )
     return _event(
@@ -318,7 +336,8 @@ async def ask(
     """Ask about your own memories.
 
     Server-sent events: `status` while it searches, `delta` as the answer is written,
-    `items` for a listing, and `end`.
+    `items` for a listing, `connections` for the memories linked to what it used, and
+    `end`.
 
     `end` is always sent, including after a provider failure -- a stream that simply
     stops leaves the reader watching a cursor that will never move.

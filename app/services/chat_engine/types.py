@@ -140,7 +140,32 @@ class ProposalBlock:
     action: str = "note"
 
 
-Block: TypeAlias = TextBlock | ItemListBlock | ErrorBlock | QuestionBlock | ProposalBlock
+@dataclass(frozen=True, slots=True)
+class ConnectedMemory:
+    """A memory linked to something the answer was about, and how.
+
+    `phrase` reads with this memory as its subject and `about` as its object: this memory
+    "is expanded by" that one. The row rather than a rendered line, for the reason
+    `ItemListBlock` carries rows: what a link looks like is the surface's decision.
+    """
+
+    item: VaultItem
+    phrase: str
+    #: The title of the memory the answer used, which is what makes this a suggestion
+    #: rather than an unexplained entry in a list.
+    about: str
+
+
+@dataclass(frozen=True, slots=True)
+class ConnectionsBlock:
+    """Memories to offer beside an answer. Chosen by code, never by the model."""
+
+    memories: tuple[ConnectedMemory, ...]
+
+
+Block: TypeAlias = (
+    TextBlock | ItemListBlock | ErrorBlock | QuestionBlock | ProposalBlock | ConnectionsBlock
+)
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +234,13 @@ class ProposalEvent:
 
 
 @dataclass(frozen=True, slots=True)
+class ConnectionsEvent:
+    """The streaming counterpart of `ConnectionsBlock`. Emitted whole, after the prose."""
+
+    memories: tuple[ConnectedMemory, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class StreamEnd:
     """The terminal event. Always sent, including after a failure.
 
@@ -224,5 +256,11 @@ class StreamEnd:
 
 
 StreamEvent: TypeAlias = (
-    Delta | StatusEvent | ItemsEvent | QuestionEvent | ProposalEvent | StreamEnd
+    Delta
+    | StatusEvent
+    | ItemsEvent
+    | QuestionEvent
+    | ProposalEvent
+    | ConnectionsEvent
+    | StreamEnd
 )

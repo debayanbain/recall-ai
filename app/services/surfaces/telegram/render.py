@@ -20,6 +20,7 @@ from typing import assert_never
 
 from app.services.chat_engine.types import (
     Block,
+    ConnectionsBlock,
     ErrorBlock,
     ErrorKind,
     ItemListBlock,
@@ -54,6 +55,8 @@ def render_block(block: Block) -> str:
         return formatting.question(block.question)
     if isinstance(block, ProposalBlock):
         return formatting.proposal(block.preview, block.action)
+    if isinstance(block, ConnectionsBlock):
+        return formatting.connected_memories(block.memories)
     # Exhaustive: a new Block type fails type-checking here rather than rendering as
     # silence at runtime.
     assert_never(block)

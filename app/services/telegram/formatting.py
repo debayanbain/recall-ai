@@ -18,11 +18,14 @@ from typing import Any
 from app.core.config import settings
 from app.models.base import ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine.cards import short_id
+from app.services.chat_engine.cards import memory_link, short_id
 
 _MAX_TITLE = 120
 _MAX_SUMMARY = 400
 _MAX_TAGS = 5
+#: Shorter than `_MAX_TITLE` because two titles share one line of a suggestion.
+_MAX_CONNECTED_TITLE = 80
+_MAX_CONNECTED_ABOUT = 50
 
 
 def escape(value: object) -> str:
@@ -406,6 +409,31 @@ def recent(items: Sequence[VaultItem], total: int) -> str:
         if item.ai_category:
             line += f" — {escape(item.ai_category)}"
         lines.append(line)
+    return "\n".join(lines)
+
+
+def connected_memories(memories: Sequence[Any]) -> str:
+    """Memories connected to what the answer used, as tappable suggestions.
+
+    **Each link goes to the memory's page in the vault, never to `source_url`.** This list
+    is an invitation to tap, and a saved page's address was chosen by whoever wrote that
+    page. Our own page is what a suggestion is offering anyway: the memory, and from there
+    its original.
+
+    An address that is not https is left off rather than linked, the same way
+    `connect_markup` treats one: the local default is not something Telegram can open.
+    """
+    lines = ["🔗 <b>Connected in your vault</b>"]
+    for memory in memories:
+        title = escape(_clip(_title_of(memory.item), _MAX_CONNECTED_TITLE))
+        about = escape(_clip(memory.about, _MAX_CONNECTED_ABOUT))
+        link = memory_link(memory.item)
+        label = (
+            f'<a href="{escape_attr(link)}">{title}</a>'
+            if link and link.startswith("https://")
+            else f"<b>{title}</b>"
+        )
+        lines.append(f"• {label} — {escape(memory.phrase)} <i>{about}</i>")
     return "\n".join(lines)
 
 

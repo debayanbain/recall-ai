@@ -501,6 +501,10 @@ class Settings(BaseSettings):
     # and bounds how much of one memory's page a single scraped page can occupy -- see the
     # injection note in CLAUDE.md.
     CONNECTION_MAX_PER_ITEM: int = 24
+    # How many connected memories a chat answer may offer beside itself. Three reads as a
+    # suggestion, and more starts to compete with the answer. It costs one statement per
+    # answered turn and no model call (`chat_engine/suggestions.py`). Zero turns it off.
+    CHAT_CONNECTION_SUGGESTIONS: int = 3
     # Whether a model may propose *which* relation an edge is -- expands, contradicts,
     # part of. Off by default and deliberately the last thing built, because it is the
     # only part of this feature that can be confidently, fluently wrong in a way a person

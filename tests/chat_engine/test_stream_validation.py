@@ -127,3 +127,42 @@ def test_a_stream_that_produced_nothing_is_a_rejection() -> None:
     checker.feed("   ")
     checker.finish()
     assert checker.rejected
+
+
+# --- several ids in one pair of brackets --------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "chunks",
+    [
+        ["Closely related.", "[aaaaaaaa,bbbbbbbb]"],
+        ["Closely related.[aaaaaaaa,", "bbbbbbbb]"],
+        # The space is the case the whitespace rule alone would get wrong: released at that
+        # boundary, "[aaaaaaaa," is not yet a citation and would be displayed as text.
+        ["Closely related.[aaaaaaaa, ", "bbbbbbbb]"],
+        ["Closely related.[aaaaaaaa ", ", bbbbbbbb]"],
+    ],
+)
+def test_a_group_of_ids_never_reaches_the_reader_however_it_is_split(
+    chunks: list[str],
+) -> None:
+    allowed = ["aaaaaaaa", "bbbbbbbb"]
+
+    text, checker = _drain(chunks, allowed_ids=allowed)
+
+    assert text == "Closely related."
+    assert text == validate_answer("".join(chunks), allowed_ids=allowed).text
+    assert {"id:aaaaaaaa", "id:bbbbbbbb"} <= set(checker.removed)
+
+
+def test_a_group_naming_an_invented_id_is_recorded_as_one() -> None:
+    _text, checker = _drain(["Done. [aaaaaaaa,deadbeef]"], allowed_ids=["aaaaaaaa"])
+
+    assert "unknown-id:deadbeef" in checker.removed
+
+
+def test_a_bracket_that_never_closes_is_not_swallowed() -> None:
+    """Held back while it might still be a citation, and released once it cannot be."""
+    text, _ = _drain(["Look at [aaaaaaaa, ", "which is real."], allowed_ids=["aaaaaaaa"])
+
+    assert text == "Look at [aaaaaaaa, which is real."

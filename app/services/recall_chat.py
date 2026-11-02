@@ -52,6 +52,7 @@ from app.services.chat_engine.retrieval import MemoryFilters, MemoryRetriever
 from app.services.chat_engine.router import wants_detail
 from app.services.chat_engine.toolbox import MemoryToolbox
 from app.services.chat_engine.types import (
+    ConnectedMemory,
     Delta,
     ErrorKind,
     ItemsEvent,
@@ -98,6 +99,9 @@ class RecallAnswer:
     question: QuestionBlock | None = None
     #: Something the assistant is offering to do and will not do unless told.
     proposal: ProposalBlock | None = None
+    #: Memories linked to the ones the answer used. Beside the text and never part of it:
+    #: `text` is what history keeps, and this must not reach a later prompt.
+    connections: tuple[ConnectedMemory, ...] = ()
 
 
 class RecallChatService:

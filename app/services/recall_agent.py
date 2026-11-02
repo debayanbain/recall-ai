@@ -18,10 +18,11 @@ from __future__ import annotations
 
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterable
 
 from app.ai.chat import history
 from app.ai.chat.harness import graph
+from app.ai.chat.harness.schemas import GetConnections
 from app.ai.prompts import CAPABILITY_CARD
 from app.core.config import settings
 from app.core.logging import get_logger
@@ -30,9 +31,12 @@ from app.services.chat_engine import budget as budgets
 from app.services.chat_engine.context import Snapshot, load_snapshot, render_snapshot
 from app.services.chat_engine.guard import guard
 from app.services.chat_engine.proposals import ProposalStore, RedisProposalStore
+from app.services.chat_engine.suggestions import cited_ids, connected_to_answer
 from app.services.chat_engine.toolbox import ConnectionReader, MemoryToolbox
 from app.services.chat_engine.trace import AgentTrace
 from app.services.chat_engine.types import (
+    ConnectedMemory,
+    ConnectionsEvent,
     Delta,
     ErrorKind,
     ProposalBlock,
@@ -94,6 +98,7 @@ class RecallAgentService(RecallChatService):
         memory_ids: tuple[str, ...] = ()
         question_block: QuestionBlock | None = None
         proposal_block: ProposalBlock | None = None
+        connected: tuple[ConnectedMemory, ...] = ()
         failed = False
         async for event in self.stream_agent(
             user_id, question, session_id, store=store
@@ -110,6 +115,8 @@ class RecallAgentService(RecallChatService):
                     accept_token=event.accept_token,
                     action=event.action,
                 )
+            elif isinstance(event, ConnectionsEvent):
+                connected = event.memories
             elif isinstance(event, StreamEnd):
                 memory_ids = event.memory_ids
                 failed = event.error is not None
@@ -121,6 +128,7 @@ class RecallAgentService(RecallChatService):
             memory_ids=memory_ids,
             question=question_block,
             proposal=proposal_block,
+            connections=connected,
         )
 
     async def stream_agent(
@@ -244,6 +252,9 @@ class RecallAgentService(RecallChatService):
             yield Delta(text=checked.text)
             if store:
                 await history.append(session_id, question, checked.text)
+            suggestions = await self._suggestions(toolbox, ending, checked.removed)
+            if suggestions is not None:
+                yield suggestions
             yield StreamEnd(memory_ids=toolbox.allowed_ids, corrected=bool(checked.removed))
             return
 
@@ -262,11 +273,46 @@ class RecallAgentService(RecallChatService):
             return
         if store:
             await history.append(session_id, question, streamed)
+        suggestions = await self._suggestions(toolbox, ending, checker.removed)
+        if suggestions is not None:
+            yield suggestions
         yield StreamEnd(
             memory_ids=toolbox.allowed_ids, corrected=bool(checker.removed)
         )
 
     # --- internals --------------------------------------------------------------------
+
+    @staticmethod
+    async def _suggestions(
+        toolbox: MemoryToolbox, ending: graph.AgentEnd | None, removed: Iterable[str]
+    ) -> ConnectionsEvent | None:
+        """The connected memories to offer after this answer, if this turn deserves any.
+
+        Runs after the history write, so what the person is offered is never replayed into
+        the next prompt. See `chat_engine/suggestions.py`.
+
+        Four kinds of turn get none. A failed one ended early. A question or a proposal
+        ends on a card the person has to act on, and a list beneath it competes with that.
+        A decline said this is not about their vault. And a turn that called
+        `GetConnections` has already told them, so the list would repeat its own prose.
+        """
+        if (
+            ending is None
+            or ending.failed
+            or toolbox.question is not None
+            or toolbox.proposal is not None
+            or GetConnections.__name__ in ending.calls
+        ):
+            return None
+        final = ending.final
+        if final is not None and (final.declined_out_of_scope or final.asked_question):
+            return None
+        memories = await connected_to_answer(
+            toolbox,
+            cited=cited_ids(final.cited_ids if final else (), removed),
+            limit=settings.CHAT_CONNECTION_SUGGESTIONS,
+        )
+        return ConnectionsEvent(memories=memories) if memories else None
 
     async def _snapshot(self, user_id: uuid.UUID) -> Snapshot | None:
         """The newest rows, or `None` when they could not be read.

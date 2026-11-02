@@ -526,7 +526,7 @@ catch-all and must stay last, so new extractors get appended *before* it.
   answers into a window nobody watches type; a web page is the opposite. But "correct it
   afterwards" is not available here -- the whole point of the URL rule is that a
   fabricated link is one a person is invited to *tap*. `validation.StreamValidator` works
-  because both checkable things, `[a3f1c920]` and a URL, contain **no whitespace**: it
+  because both checkable things, `[a3f1c920]` and a URL, contain **no whitespace** (a group written `[a3f1c920, b4e2d031]` is held until it closes): it
   releases only up to the last whitespace it has seen and holds the trailing run back, so
   everything displayed has been seen whole and put through the same `scrub` the finished
   path uses. It also enforces the length cap as it goes and collapses the gap a removal
@@ -586,6 +586,11 @@ catch-all and must stay last, so new extractors get appended *before* it.
   `PUBLIC_BASE_URL=https://recall-api.debayanbain.in make telegram-webhook` gives them
   back. A second bot in `.env` removes that trade entirely. Both commands set
   `drop_pending_updates`, so whatever is waiting is discarded.
+  **Pointing the webhook at the tunnel is not enough on its own.** The tunnel fronts Next,
+  and Next forwards `/api/*` to its own `BACKEND_ORIGIN`. With that set to production in the
+  frontend's `.env.local`, every update passes through the laptop and is answered by
+  production: `getWebhookInfo` looks right, deliveries return 202, and the local worker
+  stays idle. Replies linking to the production domain are the tell.
 - **The reply address is re-derived, never read from the item.** `deliver_telegram_result`
   looks the chat up through `telegram_accounts` by `item.user_id`.
   `item_metadata["telegram_chat_id"]` is recorded for debugging only — trusting it would let
@@ -1325,6 +1330,38 @@ catch-all and must stay last, so new extractors get appended *before* it.
   There is deliberately **no write tool**: connecting from chat would be a `propose_connect`
   minting a token through `chat_engine/proposals.py`, with the surfaced-id check on *both*
   ids, and it is not built.
+- **A chat answer offers the memories connected to what it used, and no model is involved
+  in that.** `chat_engine/suggestions.py` runs after the answer and the history write, reads
+  edges with one statement (`ConnectionRepository.neighbours_of_many`) and adds a
+  `ConnectionsBlock` under the prose: on the bot a "Connected in your vault" list, on
+  `POST /chat/ask` a `connections` event. It is separate from `GetConnections`, which the
+  model has to decide to call, and a person asking about one reel has no way to know three
+  others are linked to it. `CHAT_CONNECTION_SUGGESTIONS` (3) caps it and zero turns it off.
+  **The web `/chat` page is still a mock that searches demo data and never calls this
+  route**, so nothing shows there until it does. Five rules:
+  * **It never enters a prompt or chat history.** That is the point of doing it in code: a
+    neighbour's title is scraped text, and this runs on every answered turn, so routing it
+    through the model would pay tokens per turn to build the relevance attack described
+    above. `tests/chat_engine/test_suggestions.py` pins history. The cost is that a follow-up
+    saying "the first one" cannot resolve to a suggestion; naming it searches normally.
+  * **Confirmed edges only, and the method has no argument to ask for more.** A suggestion
+    is a guess nobody approved, and the tap is the security control. An edge waiting in the
+    review list does not appear until somebody accepts it.
+  * **Anchored on what the answer used, never on the snapshot.** `FinalAnswer.cited_ids` and
+    prose citations first, checked against the surfaced set; failing that, `toolbox.matched`,
+    which only a search with a subject or an opened memory writes to. The snapshot is in every
+    prompt, so anchoring on it would hang the same list under every reply including "hi", and
+    a plain listing has no subject to be connected to. **A weak match does count**: it hedges
+    the wording, and a question using nearly a memory's own title landed in that band.
+  * **The link is the memory's vault page, never `source_url`.** This is an invitation to
+    tap under an answer the person already trusts, and a saved page's address was chosen by
+    whoever wrote that page.
+  * **The phrase has the neighbour as its subject, which flips `direction`.** It is computed
+    relative to the memory asked about, so the stored label reads from that end; printed
+    unflipped, the list says a book is part of its own chapter.
+  It degrades to nothing: a question, a proposal, a decline and a turn that already called
+  `GetConnections` get no list, a failed read costs only the list, and a turn that fell back
+  to `RecallChatService` has none at all.
 - **A model may propose which relation an edge is *on demand*, and that is off by
   default.** Not to be confused with the capture-time judge above, which also labels: this
   one re-labels an edge that already exists, at a person's request, and is the only

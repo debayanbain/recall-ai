@@ -39,8 +39,14 @@ from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 #: The id form the prompt uses: eight hex characters in square brackets. Matched exactly
-#: that narrowly so ordinary bracketed prose in an answer is left alone.
-_ID_RE = re.compile(r"\[([0-9a-f]{8})\]")
+#: that narrowly so ordinary bracketed prose in an answer is left alone. Several ids in one
+#: pair of brackets is the same citation: the prompt shows one, a live model wrote
+#: `[f5c93bb8,342530c2]`, and that reached the person as raw text.
+_ID_RE = re.compile(r"\[([0-9a-f]{8}(?:\s*,\s*[0-9a-f]{8})*)\]")
+
+#: A citation still being written when a fragment ends. The only checkable thing that can
+#: contain whitespace, so releasing up to the last space could otherwise split one.
+_OPEN_CITATION_RE = re.compile(r"\[[0-9a-f]{8}(?:\s*,\s*[0-9a-f]{8})*\s*,?\s*$")
 
 #: Trailing punctuation a model puts *after* a URL rather than in it. Stripped before
 #: comparison, so "…example.com/a." matches the stored "…example.com/a".
@@ -132,13 +138,13 @@ def scrub(
     known_ids = {value.lower() for value in allowed_ids}
     known_urls = {_canonical(url) for url in allowed_urls if url}
 
-    def _drop_unknown_id(match: re.Match[str]) -> str:
-        if match.group(1).lower() in known_ids:
-            # A real id, but the reply is read by a person and "[a3f1c920]" means
+    def _drop_ids(match: re.Match[str]) -> str:
+        for cited in match.group(1).split(","):
+            identifier = cited.strip()
+            # A real id still goes: the reply is read by a person and "[a3f1c920]" means
             # nothing to them. The prompt asks for titles; this enforces it.
-            removed.append(f"id:{match.group(1)}")
-            return ""
-        removed.append(f"unknown-id:{match.group(1)}")
+            kind = "id" if identifier.lower() in known_ids else "unknown-id"
+            removed.append(f"{kind}:{identifier}")
         return ""
 
     def _drop_unknown_url(match: re.Match[str]) -> str:
@@ -150,7 +156,7 @@ def scrub(
         removed.append(f"unknown-url:{trimmed[:120]}")
         return _LINK_REMOVED + tail
 
-    return _URL_RE.sub(_drop_unknown_url, _ID_RE.sub(_drop_unknown_id, text))
+    return _URL_RE.sub(_drop_unknown_url, _ID_RE.sub(_drop_ids, text))
 
 
 #: How much unbroken text may accumulate before it is released without a boundary. A
@@ -171,7 +177,8 @@ class StreamValidator:
     What makes it work is that both checkable things -- `[a3f1c920]` and a URL -- contain
     no whitespace. So the validator emits only up to the last whitespace it has seen and
     holds the trailing run back: whatever is released has been seen whole, and is put
-    through the same `scrub` the non-streaming path uses.
+    through the same `scrub` the non-streaming path uses. The one exception is a group
+    written as `[a3f1c920, b4e2d031]`, which `feed` holds back until its bracket closes.
 
     The length cap is enforced as it goes, and `finish()` closes the stream: it releases
     the last held run and reports whether anything was stripped, which the caller sends
@@ -214,6 +221,9 @@ class StreamValidator:
                 return ""
             boundary = len(self._held) - 1
         ready, self._held = self._held[: boundary + 1], self._held[boundary + 1 :]
+        opened = _OPEN_CITATION_RE.search(ready)
+        if opened is not None:
+            ready, self._held = ready[: opened.start()], ready[opened.start() :] + self._held
         return self._release(ready)
 
     def finish(self) -> str:

@@ -289,6 +289,10 @@ class MemoryToolbox:
         #: looked. What it separates is "searched and found nothing" from "never
         #: searched", which are two different answers and used to be one.
         self.lookups = 0
+        #: What this turn actually found by looking for it, most relevant first. Not the
+        #: same as `surfaced`, which the snapshot seeds: the three newest rows are in every
+        #: prompt whatever was asked, so they say nothing about what an answer was about.
+        self.matched: list[VaultItem] = []
 
     # --- what the answer is allowed to have said --------------------------------------
 
@@ -418,6 +422,9 @@ class MemoryToolbox:
                 "the blocks above, or search first."
             )
         item = await self._with_body(item)
+        # First, because opening one memory in full is the clearest sign of which one the
+        # answer is about.
+        self.matched.insert(0, item)
         return chain.fence_block(
             short_id(item),
             build_detail_card(item),
@@ -569,6 +576,11 @@ class MemoryToolbox:
             blocks = self._render(
                 items, wanted, cap=rows, counts=await self._counts(wanted, items)
             )
+            # Weak matches count. `insufficient` is a hedge on the wording, not a verdict
+            # that the row is wrong: a measured true match on this embedding model scores
+            # 0.37 against a strong line of 0.45, and asking for a memory by nearly its own
+            # title landed there. Everything here has already cleared the relevance floor.
+            self.matched.extend(items)
             if evidence.status is EvidenceStatus.insufficient:
                 return (
                     "These are only a WEAK match. Do not stretch them to fit -- say you "
@@ -1172,8 +1184,12 @@ def _edge_line(neighbour: Any, focus: VaultItem) -> str:
     """
     relation = str(getattr(neighbour, "connection", None) and neighbour.connection.relation)
     direction = str(getattr(neighbour, "direction", "outgoing"))
-    label = _RELATION_WORDS.get((relation, direction), relation.replace("_", " "))
-    return f"[{short_id(focus)}] {label} this memory"
+    return f"[{short_id(focus)}] {relation_words(relation, direction)} this memory"
+
+
+def relation_words(relation: str, direction: str) -> str:
+    """A relation in words, reading from the end `direction` is relative to."""
+    return _RELATION_WORDS.get((relation, direction), relation.replace("_", " "))
 
 
 #: Both readings of every relation, as a table rather than as logic. Kept here because the

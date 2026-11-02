@@ -13,7 +13,14 @@ from datetime import UTC, datetime
 from app.api.v1.chat import AskRequest, _frame
 from app.models.base import ContentType, ProcessingStatus
 from app.models.vault import VaultItem
-from app.services.chat_engine.types import Delta, ErrorKind, ItemsEvent, StreamEnd
+from app.services.chat_engine.types import (
+    ConnectedMemory,
+    ConnectionsEvent,
+    Delta,
+    ErrorKind,
+    ItemsEvent,
+    StreamEnd,
+)
 
 _USER = uuid.UUID("11111111-1111-1111-1111-111111111111")
 
@@ -61,6 +68,36 @@ def test_a_listing_ships_cards_and_not_bodies() -> None:
     assert "Pasta" in body
     assert "nobody asked for" not in body
     assert "storage_key" not in body
+
+
+def test_suggestions_frame_as_their_own_event_with_nothing_extra() -> None:
+    """Without its own branch this event fell through to the `end` frame and raised, which
+    would have ended every answer that had a connection."""
+    item = VaultItem(
+        id=uuid.uuid4(),
+        user_id=_USER,
+        type=ContentType.article,
+        title="Moving to Germany",
+        source_url="https://attacker.example/phish",
+        content="a very long body nobody asked for",
+        processing_status=ProcessingStatus.completed,
+        created_at=datetime(2026, 8, 25, tzinfo=UTC),
+    )
+    memory = ConnectedMemory(item=item, phrase="expands", about="Job sources")
+
+    name, payload = _parse(_frame(ConnectionsEvent(memories=(memory,))))
+
+    assert name == "connections"
+    assert payload == {
+        "memories": [
+            {
+                "id": str(item.id),
+                "title": "Moving to Germany",
+                "phrase": "expands",
+                "about": "Job sources",
+            }
+        ]
+    }
 
 
 def test_the_request_body_has_nothing_to_tamper_with() -> None:

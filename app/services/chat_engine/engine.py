@@ -48,6 +48,8 @@ from app.services.chat_engine.router import Intent, route
 from app.services.chat_engine.status import SaveStatusReader
 from app.services.chat_engine.types import (
     Block,
+    ConnectionsBlock,
+    ConnectionsEvent,
     Delta,
     ErrorBlock,
     ErrorKind,
@@ -354,6 +356,8 @@ def _as_events(reply: OutboundReply) -> list[StreamEvent]:
                     action=block.action,
                 )
             )
+        elif isinstance(block, ConnectionsBlock):
+            events.append(ConnectionsEvent(memories=block.memories))
         else:
             error = block.kind
     events.append(StreamEnd(error=error))
@@ -375,4 +379,7 @@ def _to_reply(answer: RecallAnswer) -> OutboundReply:
         blocks.append(answer.proposal)
     elif answer.question is not None:
         blocks.append(answer.question)
+    # Last, and only when there is an answer for it to sit beside.
+    if answer.connections and blocks:
+        blocks.append(ConnectionsBlock(memories=answer.connections))
     return OutboundReply(blocks or [TextBlock(text="")])

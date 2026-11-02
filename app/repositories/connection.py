@@ -32,7 +32,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any, cast
 
-from sqlalchemy import CursorResult, literal, literal_column
+from sqlalchemy import CursorResult, case, literal, literal_column
 from sqlalchemy import delete as sa_delete
 from sqlalchemy import update as sa_update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
@@ -229,6 +229,93 @@ class ConnectionRepository:
             for row in rows
         ]
         return found, int(rows[0][3])
+
+    async def neighbours_of_many(
+        self,
+        user_id: uuid.UUID,
+        item_ids: Sequence[uuid.UUID],
+        *,
+        exclude: Sequence[uuid.UUID] = (),
+        limit: int = DEFAULT_NEIGHBOUR_LIMIT,
+    ) -> list[tuple[uuid.UUID, Neighbour]]:
+        """What several memories are connected to, as `(asked_about, neighbour)`. ONE statement.
+
+        One statement rather than `list_for_item` in a loop because it runs on every
+        answered chat turn, where each extra statement is another ~290ms the reader waits.
+
+        **Confirmed edges only, with no way to ask for anything else.** A suggestion is a
+        model's guess that nobody has approved, and a page written to look relevant can
+        earn one, so it must not be offered to a person as something they connected.
+
+        Ordered by `item_ids` first, because the caller passes them most relevant first
+        and the `limit` should cut what matters least. A neighbour is not deduplicated
+        here: reached from two memories, it is two rows and two true statements.
+        """
+        if not item_ids:
+            return []
+        hidden = [*item_ids, *exclude]
+
+        def half(mine: Any, theirs: Any, direction: str) -> Any:
+            return select(
+                MemoryConnection,
+                literal(direction).label("direction"),
+                mine.label("asked_about"),
+                theirs.label("neighbour_id"),
+            ).where(
+                MemoryConnection.user_id == user_id,
+                mine.in_(item_ids),
+                # An edge between two memories the answer already used tells the reader
+                # nothing they were not just told.
+                theirs.not_in(hidden),
+                MemoryConnection.status == ConnectionStatus.confirmed.value,
+            )
+
+        edges = (
+            half(
+                col(MemoryConnection.source_item_id),
+                col(MemoryConnection.target_item_id),
+                "outgoing",
+            )
+            .union_all(
+                half(
+                    col(MemoryConnection.target_item_id),
+                    col(MemoryConnection.source_item_id),
+                    "incoming",
+                )
+            )
+            .subquery()
+        )
+        edge = aliased(MemoryConnection, edges)
+        rank = case(
+            {item_id: position for position, item_id in enumerate(item_ids)},
+            value=edges.c.asked_about,
+        )
+
+        query = (
+            select(edge, edges.c.direction, edges.c.asked_about, VaultItem)
+            .join(VaultItem, col(VaultItem.id) == edges.c.neighbour_id)
+            .where(
+                # Stated on the neighbour as well as the edge, as `list_for_item` does,
+                # because this is the last query before these rows reach a person.
+                VaultItem.user_id == user_id,
+                col(VaultItem.deleted_at).is_(None),
+            )
+            .order_by(rank, edges.c.created_at.desc())
+            .limit(limit)
+            .options(load_only(*_card_columns(VaultItem), raiseload=True))
+        )
+        rows = (await self.session.execute(query)).all()
+        return [
+            (
+                cast("uuid.UUID", row[2]),
+                Neighbour(
+                    connection=cast("MemoryConnection", row[0]),
+                    item=cast("VaultItem", row[3]),
+                    direction=str(row[1]),
+                ),
+            )
+            for row in rows
+        ]
 
     async def list_suggestions(
         self, user_id: uuid.UUID, *, limit: int = DEFAULT_NEIGHBOUR_LIMIT
